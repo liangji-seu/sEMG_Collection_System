@@ -237,13 +237,83 @@ def _contains_emg_bin_recursive(base_dir):
     return any(name.endswith('_emg.bin') for _root, name, _path in _iter_non_preview_bin_files(base_dir))
 
 
-def repair_250hz_timestamps_in_h5(h5_path, device_id, log_cb=None):
-    """修复 H5 文件中 250Hz EMG 的时间戳回退
+def _rebuild_time_from_counter(frame_ids, time_base, sd_rate, log_cb, ds_name):
+    """按 sd_frame_id 重建时间戳（旧行为，仅供诊断/历史对照，默认不用）。
 
-    检测 emg{device_id}_250hz_adc 数据集的时间戳是否有回退，
-    如有则用 sd_frame_id 重新计算精确时间戳。
+    与旧实现的区别：把"差值小于 -100000 才算计数器复位"改成"任何减小都算复位"。
+    包计数器重启时的落差可以远小于 100000（实测 38080→0），旧判据会漏判，
+    于是重建出的时间轴在这里倒折一下 —— 这正是历史文件里那些
+    -17.7s / -19.0s 折回的来源。复位处按一个正常步长续接，保证结果严格递增。
+    """
+    ids = frame_ids.astype(np.int64)
+    n = len(ids)
+    step = max(1, sd_rate // 250)  # 该数据集相邻两行对应的计数器步长
+    adjusted = np.empty(n, dtype=np.int64)
+    adjusted[0] = ids[0]
+    n_reset = 0
+    for i in range(1, n):
+        d = ids[i] - ids[i - 1]
+        if d < 0:
+            n_reset += 1
+            d = step
+        adjusted[i] = adjusted[i - 1] + d
+    if log_cb and n_reset:
+        log_cb(f'    [{ds_name}] sd_frame_id 计数器复位 {n_reset} 处，已按正常步长续接')
+    return time_base + (adjusted - adjusted[0]) / float(sd_rate)
 
-    返回: dict {dataset_name: {backward, adjusted, dur_orig, dur_fixed}} 或 None
+
+def _verify_regularized(times, corrected, min_step):
+    """写回前的自检：新序列必须严格递增、步长不小于 min_step、且不小于原序列。"""
+    if not np.all(np.isfinite(corrected)):
+        return False, '存在非有限值'
+    if not np.all(corrected >= times - min_step * 0.01):
+        return False, '出现了比原始时间戳更早的值'
+    d = np.diff(corrected)
+    if len(d) and not np.all(d >= min_step * 0.99):
+        return False, f'仍存在步长不足的点 (min={d.min()*1000:.4f}ms)'
+    span_o = float(times[-1] - times[0])
+    span_n = float(corrected[-1] - corrected[0])
+    if span_n < span_o - 1e-6:
+        return False, f'时长缩短了 ({span_o:.3f}s -> {span_n:.3f}s)'
+    if span_n > span_o + len(times) * min_step + 1.0:
+        return False, f'时长异常膨胀 ({span_o:.3f}s -> {span_n:.3f}s)'
+    return True, ''
+
+
+def _monotone_regularize(times, min_step):
+    """把时间序列整理成"严格递增、步长不小于 min_step"，且尽量贴近原值。
+
+    求满足 g[i] >= times[i] 且 g[i] >= g[i-1] + min_step 的最小序列，闭式解：
+        g[i] = max_{j<=i} (times[j] + (i-j)*min_step)
+             = cummax(times - min_step*arange) + min_step*arange
+    因此时间戳只会被"往后推"，绝不被拉早 —— 采集时记录的墙钟基准被完整保留，
+    只有造成重叠的那些点在原地被顶到前一点之后。
+    """
+    n = len(times)
+    ramp = min_step * np.arange(n, dtype=np.float64)
+    return np.maximum.accumulate(np.asarray(times, np.float64) - ramp) + ramp
+
+
+def repair_250hz_timestamps_in_h5(h5_path, device_id, log_cb=None,
+                                  rebuild_from_counter=False):
+    """消除 H5 中 250Hz EMG 时间戳的重叠（回退），保留采集端记录的墙钟。
+
+    回退的成因在采集端（ble_server.finalize_parsed_packet）：一个 BLE 包里的 9 帧
+    时间戳是按该包的**到达时刻**往前推 4ms 生成的，通知到达一旦成簇，后一个包的
+    起始时刻就会早于前一个包的结束时刻，形成整包（32ms）级别的重叠。
+
+    因此这里只做**单调化**：用 _monotone_regularize 把 time 整理成严格递增
+    （步长下限 = 该数据集自身的采样间隔），时间戳只往后推、不拉早，
+    既消掉重叠，又不动真实墙钟。
+
+    注意**不再默认用 sd_frame_id 重建时间戳**：H5 里的 sd_frame_id 是蓝牙包序号
+    派生的（storage_server: sd_frame_id = ble_frame_id * 8），包计数器中途重启会让
+    它回退；用它重建会把真实墙钟换成一条会在中途折回的计数器时间轴
+    （实测 d001 session6 折回 19.04s、d001 session3 折回 17.68s），
+    且该折回会随 sd_frame_id 一起写入各数据集，无法再还原。
+    rebuild_from_counter=True 保留旧行为的受控入口，仅供诊断/历史对照。
+
+    返回: dict {backward, adjusted, dur_orig, dur_fixed, ...} 或 None
     """
     ds_name = f'emg{device_id}_250hz_adc'
     results = {}
@@ -257,14 +327,12 @@ def repair_250hz_timestamps_in_h5(h5_path, device_id, log_cb=None):
             if ds.shape[0] < 2:
                 return None
 
-            # 检查是否有 sd_frame_id
-            if 'sd_frame_id' not in ds.dtype.names:
+            if 'time' not in ds.dtype.names:
                 if log_cb:
-                    log_cb(f'    [{ds_name}] 无 sd_frame_id 字段，跳过时间戳修复')
+                    log_cb(f'    [{ds_name}] 无 time 字段，跳过时间戳修复')
                 return None
 
             times = ds['time'][:]
-            frame_ids = ds['sd_frame_id'][:]
 
             # 检测回退
             diffs = np.diff(times)
@@ -274,41 +342,37 @@ def repair_250hz_timestamps_in_h5(h5_path, device_id, log_cb=None):
                     log_cb(f'    [{ds_name}] 时间戳无回退，跳过修复')
                 return {'backward': 0, 'adjusted': 0}
 
-            # 验证 sd_frame_id 可用性（允许少量溢出复位点）
-            id_diffs = np.diff(frame_ids.astype(np.int64))
-            n_bad = int(np.sum(id_diffs <= 0))
-            # 允许 ≤5 处非单调（ESP32 计数器溢出复位），仍可精确修复
-            if n_bad > 5 or (n_bad > 0 and not np.any(id_diffs < -100000)):
+            # 本数据集自身的采样间隔（emg*_250hz_adc -> 1/250，emg*_2khz_adc -> 1/2000）
+            ds_rate = 2000 if '2khz' in ds_name else 250
+            min_step = 1.0 / ds_rate
+
+            if rebuild_from_counter:
+                if 'sd_frame_id' not in ds.dtype.names:
+                    if log_cb:
+                        log_cb(f'    [{ds_name}] 无 sd_frame_id 字段，无法按计数器重建')
+                    return None
+                corrected = _rebuild_time_from_counter(
+                    ds['sd_frame_id'][:], times[0], 2000, log_cb, ds_name)
+                if corrected is None:
+                    return None
+                mode = 'counter'
+                sd_rate = 2000
+            else:
+                corrected = _monotone_regularize(times, min_step)
+                mode = 'monotone'
+                sd_rate = ds_rate
+
+            # 写回前先自检：不满足就宁可不写，绝不留下更糟的数据
+            ok, why = _verify_regularized(times, corrected, min_step)
+            if not ok:
                 if log_cb:
-                    log_cb(f'    [{ds_name}] sd_frame_id 严重损坏({n_bad}处异常)，无法精确修复')
+                    log_cb(f'    [{ds_name}] 修复结果未通过自检（{why}），放弃写入')
                 return None
-
-            # sd_frame_id 速率固定为 2000Hz
-            # （ESP32 SD 卡以 2kHz 记录，无论 250Hz 还是 2kHz 数据集都用同一个计数器）
-            # 不自动检测 —— 溢出复位和已修复数据会导致检测错误
-            sd_rate = 2000
-
-            # 处理 sd_frame_id 计数器溢出复位
-            ids_i64 = frame_ids.astype(np.int64).copy()
-            adjusted = np.zeros(len(ids_i64), dtype=np.int64)
-            adjusted[0] = ids_i64[0]
-            overflow = np.int64(0)
-            prev_raw = ids_i64[0]
-            for i in range(1, len(ids_i64)):
-                raw = ids_i64[i]
-                if raw < prev_raw - 100000:
-                    overflow += prev_raw
-                adjusted[i] = raw + overflow
-                prev_raw = raw
-
-            # 精确修复：time_base + (adjusted_id - adjusted_id[0]) / sd_rate
-            time_base = times[0]
-            frame_base = adjusted[0]
-            corrected = time_base + (adjusted.astype(np.float64) - frame_base) / sd_rate
 
             dur_orig = times[-1] - times[0]
             dur_fixed = corrected[-1] - corrected[0]
-            n_adjusted = int(np.sum(np.abs(corrected - times) > (1.0 / sd_rate) * 0.01))
+            n_adjusted = int(np.sum(np.abs(corrected - times) > min_step * 0.01))
+            max_push = float(np.max(corrected - times))
 
             # 写回（h5py compound dtype 字段写入不生效，必须完整替换）
             _data = ds[:]
@@ -327,6 +391,9 @@ def repair_250hz_timestamps_in_h5(h5_path, device_id, log_cb=None):
                                           compression=_comp, compression_opts=_comp_opt)
             for k, v in _attrs.items():
                 _new.attrs[k] = v
+            _new.attrs['time_repair_mode'] = mode
+            _new.attrs['time_repair_backward'] = n_backward
+            _new.attrs['time_repair_max_push_s'] = max_push
 
             results = {
                 'backward': n_backward,
@@ -334,13 +401,15 @@ def repair_250hz_timestamps_in_h5(h5_path, device_id, log_cb=None):
                 'dur_orig': dur_orig,
                 'dur_fixed': dur_fixed,
                 'sd_rate': sd_rate,
+                'mode': mode,
+                'max_push_s': max_push,
             }
 
             if log_cb:
-                log_cb(f'    [{ds_name}] 时间戳修复完成: '
+                log_cb(f'    [{ds_name}] 时间戳修复完成({mode}): '
                        f'回退{n_backward}处, 调整{n_adjusted}帧, '
                        f'时长{dur_orig:.2f}s→{dur_fixed:.2f}s '
-                       f'(sd_frame_id@{sd_rate}Hz)')
+                       f'(最大后移{max_push*1000:.1f}ms, 未改动墙钟基准)')
 
             return results
 
@@ -514,10 +583,12 @@ class SyncWorker(QThread):
                         if imu_bin:
                             self.log.emit(f"    IMU bin: {os.path.basename(imu_bin)}")
 
-                        # 【修复】同步前先修复 250Hz 时间戳回退
-                        # 原因：Windows time.time() 精度不足（~15ms），导致 BLE 通知
-                        # 时间戳重叠，250Hz 帧时间戳回退 ~32ms。用 sd_frame_id
-                        # （ESP32 SD卡帧计数器，严格单调）重新计算精确时间戳。
+                        # 【修复】同步前先消除 250Hz 时间戳重叠
+                        # 原因：采集端按 BLE 包的到达时刻往前推 4ms 生成包内 9 帧的
+                        # 时间戳，通知到达成簇时后一包会早于前一包结束（整包 32ms 重叠）。
+                        # 这里只做单调化（只往后推、不拉早），保留采集端记录的墙钟；
+                        # 不再用 sd_frame_id 重建 —— 它是蓝牙包序号派生的，包计数器重启
+                        # 会让它回退，重建会毁掉真实墙钟。
                         if self.sync_mode == 'one_to_one':
                             repair_250hz_timestamps_in_h5(
                                 h5_file, device_id, log_cb=self.log.emit)
