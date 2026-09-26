@@ -1,0 +1,104 @@
+[bin_sync_tool] ============================================================
+[bin_sync_tool] [one_to_one] 开始同步 (bin_offset=0)
+[bin_sync_tool]   H5: 1_L001_坐姿_(正向)_坐姿_小臂自然抬起-四向_session4_20260709_091509.h5
+[bin_sync_tool]   EMG bin: L001_L_260709_091505_emg.bin
+[bin_sync_tool] ============================================================
+[bin_sync_tool] 警告: 文件已同步，跳过
+[bin_sync_tool] ============================================================
+[bin_sync_tool] [one_to_one_multibin_rescue] 开始相邻 bin 补救同步
+[bin_sync_tool]   H5: 1_L001_坐姿_(正向)_坐姿_小臂自然抬起-四向_session4_20260709_091509.h5
+[bin_sync_tool]   EMG segment: L001_L_260709_091505_emg.bin
+[bin_sync_tool] ============================================================
+[bin_sync_tool] EMG文件信息: 采样率=2000Hz, 增益=12, 位深=24bit
+[bin_sync_tool] 时间戳: L001_L_260709_091505
+[bin_sync_tool] LSB系数: 0.003974 μV/LSB (用于转换)
+[bin_sync_tool] 解析完成: 共 349124 帧, 帧号范围 [0, 349123]
+[bin_sync_tool]   segment matched: L001_L_260709_091505_emg.bin rows=0-18638, matched=18639
+[bin_sync_tool]   partial rescue: only one reliable segment found, coverage=1.000
+[bin_sync_tool]   IMU bin 数据区: 1012726B - 头126B - 尾36B = 1012564B
+[bin_sync_tool]   num_imus=4: 解析 3 帧, 最长递增序列 1/3 (score=33.3%), first=0, last=0
+[bin_sync_tool]   num_imus=3: 解析 100 帧, 最长递增序列 100/100 (score=100.0%), first=0, last=99
+[bin_sync_tool]   num_imus=2: 解析 3 帧, 最长递增序列 1/3 (score=33.3%), first=0, last=4260757027
+[bin_sync_tool]   num_imus=1: 解析 3 帧, 最长递增序列 1/3 (score=33.3%), first=0, last=4294246826
+[bin_sync_tool]   帧解析验证: num_imus=3 (最长连续 100 帧, score=100.0%)
+[bin_sync_tool]   IMU 数量: 3 (bin检测=BLE数据=3，一致)
+[bin_sync_tool] IMU文件信息: 采样率=100Hz, num_imus=3, frame_size=58B
+[bin_sync_tool] 时间戳: L001_L_260709_091505
+[bin_sync_tool] 解析完成: 共 17458 帧
+[bin_sync_tool]   [rescue] 合成基准 base=0, 真实对齐偏移 tbb=-16（逐行匹配 18639 行，残差跨度 0）-> label_offset=-16，sd_frame_id 已回到会话内基准
+[bin_sync_tool] 2kHz 时间基准: 499.993563us/帧 (标称配对 18638, 非标称 0, 夹紧=False)
+[bin_sync_tool] 2kHz bin 连续写入: 149112 帧 (bin 帧号 3656..152767; 旧蓝牙网格会漏掉 0 帧; bin 自身空洞 0 帧)
+[bin_sync_tool] 2kHz prompt coverage extension: +196356 frames to t=1783559881.951 (prompt_end=1783559858.133)
+[bin_sync_tool] 2kHz: 345468 帧来自 bin, 0 帧 bin 自身缺失
+[bin_sync_tool]   WARN: emg1_2khz_adc 容量上限 345108 帧 < 需要的 345468 帧，已重建数据集
+[bin_sync_tool]   IMU BLE anchor: 3000 anchors, frame 0..17457, base_time=1783559707.306190, median_acc_err=0.0000
+[bin_sync_tool]   IMU dataset RESIZED: imu1a_100hz
+[bin_sync_tool]   IMU dataset RESIZED: imu1b_100hz
+[bin_sync_tool]   IMU dataset RESIZED: imu1c_100hz
+[bin_sync_tool]   IMU sensor a [0]: ✓ ACTIVE
+[bin_sync_tool]     non_zero_rate=98.1%, acc_range=[-1.0762, 0.9111], gyr_range=[-71.54, 67.27]
+[bin_sync_tool]   IMU sensor b [1]: ✓ ACTIVE
+[bin_sync_tool]     non_zero_rate=97.8%, acc_range=[-1.0713, 0.5205], gyr_range=[-81.62, 96.67]
+[bin_sync_tool]   IMU sensor c [2]: ✓ ACTIVE
+[bin_sync_tool]     non_zero_rate=98.1%, acc_range=[-1.0664, 0.5518], gyr_range=[-97.58, 81.9]
+[bin_sync_tool] [one_to_one_partial_rescue] 同步完成！2kHz: 345468f, IMU: 17458f filled=17458 [3/3活跃]
+
+### dev1 rescue status=success
+[bin_sync_tool] EMG文件信息: 采样率=2000Hz, 增益=12, 位深=24bit
+[bin_sync_tool] 时间戳: L001_L_260709_091505
+[bin_sync_tool] LSB系数: 0.003974 μV/LSB (用于转换)
+[bin_sync_tool] 解析完成: 共 349124 帧, 帧号范围 [0, 349123]
+  rows=345468 attr bb=-16 | 内容零误差 offset -> -16(bad=0)  -200(bad=201)  -199(bad=201)
+  残差 = 最佳 off - attr = +0 帧 | time monotone=True min_dt=0.5000ms | t0=1783559709.219 tN=1783559881.951 时长=172.733s
+[bin_sync_tool] ============================================================
+[bin_sync_tool] [one_to_one] 开始同步 (bin_offset=0)
+[bin_sync_tool]   H5: 2_L001_坐姿_(正向)_坐姿_小臂自然抬起-四向_session4_20260709_091509.h5
+[bin_sync_tool]   EMG bin: L001_R_260709_091507_emg.bin
+[bin_sync_tool] ============================================================
+[bin_sync_tool] 警告: 文件已同步，跳过
+[bin_sync_tool] ============================================================
+[bin_sync_tool] [one_to_one_multibin_rescue] 开始相邻 bin 补救同步
+[bin_sync_tool]   H5: 2_L001_坐姿_(正向)_坐姿_小臂自然抬起-四向_session4_20260709_091509.h5
+[bin_sync_tool]   EMG segment: L001_R_260709_091507_emg.bin
+[bin_sync_tool] ============================================================
+[bin_sync_tool] EMG文件信息: 采样率=2000Hz, 增益=12, 位深=24bit
+[bin_sync_tool] 时间戳: L001_R_260709_091507
+[bin_sync_tool] LSB系数: 0.003974 μV/LSB (用于转换)
+[bin_sync_tool] 解析完成: 共 347577 帧, 帧号范围 [0, 347576]
+[bin_sync_tool]   segment matched: L001_R_260709_091507_emg.bin rows=7-18566, matched=18560
+[bin_sync_tool]   partial rescue: only one reliable segment found, coverage=1.000
+[bin_sync_tool]   IMU bin 数据区: 1008260B - 头126B - 尾36B = 1008098B
+[bin_sync_tool]   num_imus=4: 解析 3 帧, 最长递增序列 1/3 (score=33.3%), first=0, last=0
+[bin_sync_tool]   num_imus=3: 解析 100 帧, 最长递增序列 100/100 (score=100.0%), first=0, last=99
+[bin_sync_tool]   num_imus=2: 解析 3 帧, 最长递增序列 1/3 (score=33.3%), first=0, last=33816154
+[bin_sync_tool]   num_imus=1: 解析 3 帧, 最长递增序列 1/3 (score=33.3%), first=0, last=65791
+[bin_sync_tool]   帧解析验证: num_imus=3 (最长连续 100 帧, score=100.0%)
+[bin_sync_tool]   IMU 数量: 3 (bin检测=BLE数据=3，一致)
+[bin_sync_tool] IMU文件信息: 采样率=100Hz, num_imus=3, frame_size=58B
+[bin_sync_tool] 时间戳: L001_R_260709_091507
+[bin_sync_tool] 解析完成: 共 17381 帧
+[bin_sync_tool]   [rescue] 合成基准 base=60, 真实对齐偏移 tbb=-50（逐行匹配 18560 行，残差跨度 0）-> label_offset=10，sd_frame_id 已回到会话内基准
+[bin_sync_tool] 2kHz 时间基准: 499.993563us/帧 (标称配对 18566, 非标称 0, 夹紧=False)
+[bin_sync_tool] 2kHz bin 连续写入: 148484 帧 (bin 帧号 8..148543; 旧蓝牙网格会漏掉 0 帧; bin 自身空洞 52 帧)
+[bin_sync_tool] 2kHz prompt coverage extension: +199093 frames to t=1783559882.929 (prompt_end=1783559858.133)
+[bin_sync_tool] 2kHz: 347577 帧来自 bin, 52 帧 bin 自身缺失
+[bin_sync_tool]   WARN: emg2_2khz_adc 容量上限 347289 帧 < 需要的 347577 帧，已重建数据集
+[bin_sync_tool]   IMU BLE anchor: 2979 anchors, frame 3..17383, base_time=1783559709.090367, median_acc_err=0.0020
+[bin_sync_tool]   IMU dataset RESIZED: imu2a_100hz
+[bin_sync_tool]   IMU dataset RESIZED: imu2b_100hz
+[bin_sync_tool]   IMU dataset RESIZED: imu2c_100hz
+[bin_sync_tool]   IMU sensor a [0]: ✓ ACTIVE
+[bin_sync_tool]     non_zero_rate=97.3%, acc_range=[-0.4463, 0.9785], gyr_range=[-158.62, 68.18]
+[bin_sync_tool]   IMU sensor b [1]: ✓ ACTIVE
+[bin_sync_tool]     non_zero_rate=97.5%, acc_range=[-0.7861, 0.998], gyr_range=[-160.16, 145.11]
+[bin_sync_tool]   IMU sensor c [2]: ✓ ACTIVE
+[bin_sync_tool]     non_zero_rate=97.6%, acc_range=[-0.8799, 1.0068], gyr_range=[-165.06, 85.54]
+[bin_sync_tool] [one_to_one_partial_rescue] 同步完成！2kHz: 347577f, IMU: 17381f filled=17381 [3/3活跃]
+
+### dev2 rescue status=success
+[bin_sync_tool] EMG文件信息: 采样率=2000Hz, 增益=12, 位深=24bit
+[bin_sync_tool] 时间戳: L001_R_260709_091507
+[bin_sync_tool] LSB系数: 0.003974 μV/LSB (用于转换)
+[bin_sync_tool] 解析完成: 共 347577 帧, 帧号范围 [0, 347576]
+  rows=347577 attr bb=-50 | 内容零误差 offset -> -50(bad=0)  -200(bad=201)  -199(bad=201)
+  残差 = 最佳 off - attr = +0 帧 | time monotone=True min_dt=0.5000ms | t0=1783559709.142 tN=1783559882.929 时长=173.787s

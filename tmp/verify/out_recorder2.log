@@ -1,0 +1,10 @@
+H5 250Hz rows=5400  与模拟帧数一致: True
+  H5 time   n=5400 back=   0 rewound= -0.000s min_step= 3.9997ms max_step= 204.000ms span=21.7960s
+H5 sd_frame_id back=0 step8=5399/5399 range=[0..43192]
+H5 frame_id    back=0 monotone=True
+  H5 imu     n=1200 back=0 同包内并列=600 (每包 num_imus 行共享同一时刻，属正常) span=21.7640s
+
+hdf5_tool 再跑时间修复: {'backward': 0, 'adjusted': 0}
+  应为无操作(backward=0): True
+
+全部断言: PASS

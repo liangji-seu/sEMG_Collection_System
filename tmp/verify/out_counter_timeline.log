@@ -1,0 +1,22 @@
+=== A 稳定流（每包 36ms 到达）===
+[steady] n=4500 monotone=True min_step=4.0000ms max_step=4.0000ms back=0 span=17.9960s
+    期望时长≈17.9640s 实际=17.9960s 偏差=+0.0320s
+
+=== B 突发到达（每 2 包几乎同时到达：模拟 BLE 通知成簇）===
+[burst] n=4500 monotone=True min_step=4.0000ms max_step=4.0000ms back=0 span=17.9960s
+    期望时长≈17.9640s 实际=17.9960s 偏差=+0.0320s
+
+=== C BLE 丢包（每 10 包丢 3 包）===
+[loss] n=4500 monotone=True min_step=4.0000ms max_step=112.0000ms back=0 span=23.2880s
+    期望时长≈23.2560s 实际=23.2880s 偏差=+0.0320s
+
+=== D 主机时钟前跳 2s（_precise_time 重校准）===
+[clockjump] n=4500 monotone=True min_step=4.0000ms max_step=2004.0000ms back=0 span=19.9960s
+    期望时长≈19.9640s 实际=19.9960s 偏差=+0.0320s
+
+=== E 计数器复位后继续（parse_packet 已把帧号续接，这里直接给跳变后的帧号）===
+[reset] n=4500 monotone=True min_step=4.0000ms max_step=256.0000ms back=0 span=18.2480s
+    期望时长≈18.2160s 实际=18.2480s 偏差=+0.0320s
+
+全部单调: True
+B 突发场景：旧行为会产生 0 处整包重叠；新行为 back= 0

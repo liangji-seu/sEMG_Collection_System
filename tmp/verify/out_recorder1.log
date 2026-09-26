@@ -1,0 +1,19 @@
+[BLE-Server] [Dev1] stream packet counter base: 0
+[BLE-Server] [Dev1] 已收到 900 帧, 丢帧: 0, 原始缓冲区: 0, 解析缓冲区: 99, 原始丢弃: 0
+[BLE-Server] [Dev1] 已收到 1800 帧, 丢帧: 0, 原始缓冲区: 0, 解析缓冲区: 199, 原始丢弃: 0
+[BLE-Server] [Dev1] 已收到 2700 帧, 丢帧: 0, 原始缓冲区: 0, 解析缓冲区: 299, 原始丢弃: 0
+[BLE-Server] [Dev1] 包计数器复位 299→0，帧号续接 +300（累计偏移 300）
+[BLE-Server] [Dev1] 已收到 3600 帧, 丢帧: 0, 原始缓冲区: 0, 解析缓冲区: 399, 原始丢弃: 0
+[BLE-Server] [Dev1] 已收到 4500 帧, 丢帧: 0, 原始缓冲区: 0, 解析缓冲区: 499, 原始丢弃: 0
+[BLE-Server] [Dev1] 已收到 5400 帧, 丢帧: 0, 原始缓冲区: 0, 解析缓冲区: 500, 原始丢弃: 0
+模拟 600 包 (第300包计数器复位, 第450包起卡顿200ms, 通知成簇到达)
+
+250Hz 时间轴:
+  旧行为      n=5400 back= 300 rewound=  9.300s min_step=-31.0001ms max_step= 239.000ms span=21.7610s
+  新行为      n=5400 back=   0 rewound= -0.000s min_step= 3.9997ms max_step= 204.000ms span=21.7960s
+
+frame_ids: monotone=True back=0 range=[0..5399] 帧数=5400
+imu_t:     back=0 同包内并列=600 rows=1200 (每包 num_imus 行共享同一时刻)
+
+已写出 tmp/recorder_sim.npz (raw=(5400, 16))
+旧行为回退 300 处 -> 新行为 0 处；断言 PASS
