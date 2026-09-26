@@ -373,6 +373,12 @@ class DeviceState:
     last_frame_index: int = -1
     last_packet_counter: int = -1  # 上一包 counters，用于检测 BLE 丢包
     packet_counter_base: Optional[int] = None
+    # 固件包计数器复位（重启/回绕）后累加的续接偏移，保证 frame_id 全程单调
+    packet_counter_offset: int = 0
+    # 采样计数时间轴：(样本序号 n_ref, 该样本对应的墙钟 t_ref)。
+    # 帧时间戳 = t_ref + (n - n_ref)/rate，只允许往后推，见 _counter_timeline()
+    sample_clock_ref: Optional[tuple] = None
+    last_emit_time: Optional[float] = None
     last_data_time: float = 0.0  # 【新增】最后收到数据的时间戳
     sd_filename: Optional[str] = None  # 【新增】当前采集的SD卡bin文件名前缀
     stream_mode: str = "idle"  # "idle" | "preview" | "collection" — 当前流模式
@@ -401,6 +407,9 @@ class DeviceState:
         self.last_frame_index = -1
         self.last_packet_counter = -1
         self.packet_counter_base = None
+        self.packet_counter_offset = 0
+        self.sample_clock_ref = None
+        self.last_emit_time = None
         self.raw_buffer.clear()
         self.data_buffer.clear()
         self.raw_dropped_packets = 0
@@ -628,10 +637,20 @@ def parse_packet(data: bytearray, dev: DeviceState) -> Optional[dict]:
         # 包头 4 字节是 ESP32 固件的 ble_frame_counter（包计数器），不是帧号
         # 每个 BLE 包包含 fpkt 个 250Hz EMG 帧，真实帧号 = 包号 × fpkt + 帧内偏移
         packet_counter = struct.unpack('<I', data[0:4])[0]
-        if dev.packet_counter_base is None or packet_counter < dev.packet_counter_base:
+        if dev.packet_counter_base is None:
             dev.packet_counter_base = packet_counter
+            dev.packet_counter_offset = 0
             log(f"[Dev{dev.device_id}] stream packet counter base: {dev.packet_counter_base}")
-        relative_packet_counter = packet_counter - dev.packet_counter_base
+        elif packet_counter < dev.last_packet_counter:
+            # 固件包计数器复位（重启/回绕）。绝不能像以前那样把 base 挪过去、
+            # 让帧号从 0 重新开始：那会让写进 H5 的 frame_id / sd_frame_id 在会话
+            # 中途倒退，后处理会把它当成时间回退去修（实测 38080→0 造出 19s 折叠）。
+            # 这里只累加一个续接偏移，帧号继续往后走。
+            jump = dev.last_packet_counter - packet_counter + 1
+            dev.packet_counter_offset += jump
+            log(f"[Dev{dev.device_id}] 包计数器复位 {dev.last_packet_counter}→{packet_counter}，"
+                f"帧号续接 +{jump}（累计偏移 {dev.packet_counter_offset}）")
+        relative_packet_counter = packet_counter - dev.packet_counter_base + dev.packet_counter_offset
         start_frame = relative_packet_counter * fpkt
 
         # ===== EMG 解析 (物理顺序) =====
@@ -802,6 +821,52 @@ def enqueue_raw_packet(dev: DeviceState, ts: float, data: bytearray):
     dev.raw_buffer.append((ts, bytes(data)))
 
 
+def _counter_timeline(dev: DeviceState, start_frame: int, fpkt: int, arrival_ts: float):
+    """按"采样计数"给出本包 fpkt 帧的时间戳，保证会话内严格单调递增。
+
+    为什么不用"到达时刻往前反推"（旧行为 t = ts - (fpkt-1-i)/250）：
+    一包 9 帧代表 36ms 的采样，但 BLE 通知是突发的 —— 两包可能几乎同时到达。
+    按到达时刻反推会把整包 36ms 叠到前一包上，于是 H5 里出现整包量级的重叠
+    （实测 L001 dev1 有 1713 处回退，最深倒回 54s）。包计数器才是采样时刻的
+    唯一可信来源：丢包时它自己会跳，因此时间轴也跟着跳，不会压缩也不会重叠。
+
+    规则（只会往后推，绝不拉早）：
+      1) 时间轴 time(n) = t_ref + (n - n_ref)/rate；
+      2) 若本包最后一帧的推算时刻早于到达时刻，说明时间轴落后于墙钟（丢包累积
+         或主机时钟被校准过），把整条轴前移补齐 —— 保持与墙钟/相机的时间对齐；
+      3) 最后强制第一帧不早于上一包最后一帧加一个采样间隔（计数器复位等异常兜底）。
+
+    返回 fpkt 个时间戳（严格递增，步长恰为 1/rate）。
+    """
+    frame_interval = 1.0 / BLE_SAMPLE_RATE
+    n_first = int(start_frame)
+    n_last = n_first + fpkt - 1
+
+    if dev.sample_clock_ref is None:
+        # 会话第一包：把最后一个样本对齐到到达时刻
+        dev.sample_clock_ref = (n_last, float(arrival_ts))
+    n_ref, t_ref = dev.sample_clock_ref
+
+    t_first = t_ref + (n_first - n_ref) * frame_interval
+    t_last = t_ref + (n_last - n_ref) * frame_interval
+
+    drift = arrival_ts - t_last
+    if drift > 0:
+        t_ref += drift
+        t_first += drift
+        t_last += drift
+
+    if dev.last_emit_time is not None and t_first <= dev.last_emit_time:
+        push = dev.last_emit_time + frame_interval - t_first
+        t_ref += push
+        t_first += push
+        t_last += push
+
+    dev.sample_clock_ref = (n_ref, t_ref)
+    dev.last_emit_time = t_last
+    return [t_first + i * frame_interval for i in range(fpkt)]
+
+
 def finalize_parsed_packet(dev: DeviceState, parsed: dict, ts: float):
     parsed['t'] = ts
 
@@ -811,14 +876,13 @@ def finalize_parsed_packet(dev: DeviceState, parsed: dict, ts: float):
             f"原始丢弃: {dev.raw_dropped_packets}")
 
     fpkt = parsed.get('n', 9)
-    frame_interval = 1.0 / BLE_SAMPLE_RATE
-    parsed['emg_t'] = [
-        ts - (fpkt - 1 - i) * frame_interval
-        for i in range(fpkt)
-    ]
+    emg_t = _counter_timeline(dev, parsed.get('f', 0), fpkt, ts)
+    parsed['emg_t'] = emg_t
 
     if parsed.get('imu'):
-        parsed['imu_t'] = [ts] * len(parsed['imu'])
+        # IMU 行按包写入（每包每颗 IMU 一行），取本包最后一帧的时刻，
+        # 与 EMG 同一条单调时间轴，避免 IMU 侧再出现墙钟回退
+        parsed['imu_t'] = [emg_t[-1]] * len(parsed['imu'])
 
     dev.data_buffer.append(parsed)
 

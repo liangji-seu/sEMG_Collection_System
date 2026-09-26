@@ -57,7 +57,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_bufferin
 EMG_250HZ_ADC_DTYPE = np.dtype([
     ("channels", "<i4", (16,)),   # 16通道EMG原始ADC值（非μV）
     ("frame_id", "<u4"),          # BLE帧号
-    ("sd_frame_id", "<u4"),       # 对应的SD卡帧号 (= BLE帧号 * 8 + 7)
+    ("sd_frame_id", "<u4"),       # 对应的SD卡帧号 (= BLE帧号 * 8，即该8样本组的组首)
     ("time", "<f8")               # 时间戳
 ])
 
@@ -76,7 +76,7 @@ IMU_BLE_DTYPE = np.dtype([
     ("gyr", "<f4", (3,)),   # 陀螺仪 [gx, gy, gz]
     ("mag", "<f4", (3,)),   # 磁力计 [mx, my, mz]
     ("frame_id", "<u4"),    # BLE帧号
-    ("sd_frame_id", "<u4"), # 对应的SD卡帧号 (= BLE帧号 * 8 + 7)
+    ("sd_frame_id", "<u4"), # 对应 2kHz SD 卡帧号 (= BLE帧号 * 8)，IMU bin 帧号 = 该值 // 20
     ("time", "<f8")         # 时间戳
 ])
 
@@ -100,7 +100,7 @@ IMU_ALL_BLE_DTYPE = np.dtype([
     ("has_mag", "<u1"),      # 是否有磁力计数据 (V1=1, V2=0)
     ("mag", "<f4", (3,)),   # 磁力计 [mx, my, mz] (V2 填充 NaN)
     ("frame_id", "<u4"),    # BLE 帧号
-    ("sd_frame_id", "<u4"), # 对应的 SD 卡帧号
+    ("sd_frame_id", "<u4"), # 对应的 2kHz SD 卡帧号 (= BLE帧号 * 8)
     ("time", "<f8")         # 时间戳
 ])
 
