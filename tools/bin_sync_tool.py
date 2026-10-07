@@ -1399,395 +1399,15 @@ def update_sync_status(h5_file, device_id, *, source_path=None, imu_result=None,
 @_offline_h5_entrypoint
 def sync_h5_with_bin(h5_path, emg_bin_path, imu_bin_path=None, device_id=1, verify=True, set_synced=True,
                      channel_map_name='V2', manual_num_imus=None):
+    """Compatibility entry point for a paired bin; BLE supplies timing only.
+
+    Shared long-bin recordings must use sync_h5_one_to_many_adc_search,
+    which keeps an explicit per-session source interval.
     """
-    将h5文件与bin文件同步
-
-    Args:
-        h5_path: h5文件路径
-        emg_bin_path: EMG bin文件路径
-        imu_bin_path: IMU bin文件路径（可选）
-        device_id: 设备ID（1或2）
-        verify: 是否进行数据校验
-        set_synced: 是否在同步完成后设置sync_status为synced（默认True）
-                    当需要同步多个设备时，应在最后一个设备同步时才设为True
-        channel_map_name: 通道映射名称 ('V1'/'V2'/'physical')，默认 'V2'
-                          H5 attrs 中的 channel_map 优先于此参数
-        manual_num_imus: 手动指定 IMU 数量，bin 自动检测失败时启用（None=自动检测）
-
-    Returns:
-        dict: 同步结果统计
-    """
-    log(f"开始同步: {os.path.basename(h5_path)}")
-    log(f"EMG bin: {os.path.basename(emg_bin_path)}")
-    if imu_bin_path:
-        log(f"IMU bin: {os.path.basename(imu_bin_path)}")
-
-    _num_imus = 2
-    emg_kwargs = {}
-    try:
-        with h5py.File(h5_path, 'r') as _f:
-            _num_imus = _resolve_num_imus(_f, device_id, imu_bin_path, manual_num_imus=manual_num_imus)
-            emg_kwargs = _resolve_emg_parser_kwargs(_f, device_id)
-    except Exception:
-        pass
-    # 解析bin文件
-    emg_parser = EMGBinParser(emg_bin_path, **emg_kwargs).parse()
-    imu_parser = IMUBinParser(imu_bin_path, num_imus=_num_imus).parse() if imu_bin_path else None
-
-    # 打开h5文件
-    with h5py.File(h5_path, 'r+') as f:
-        # 检查sync_status
-        current_status = f.attrs.get('sync_status', 'unknown')
-        if current_status in ('synced', 'unverified') and device_sync_record_valid(f, device_id, emg_bin_path):
-            if not _synced_file_needs_prompt_coverage_resync(f, device_id):
-                log("警告: 文件已同步，跳过")
-                return {'status': 'skipped', 'reason': 'already_synced'}
-            log("[repair] 文件已标记 synced，但 2kHz 不是 full-bin 同步结果，允许重新同步升级")
-
-        # Phase 4: 检查 collection_status，异常中断 segment 提示但不阻止同步
-        coll_status = f.attrs.get('collection_status', 'unknown')
-        if coll_status == 'abnormal_interrupted':
-            log("⚠️ 注意: 这是异常中断 segment，仅同步已采集到的有效前半段数据")
-            log(f"   中断原因: {f.attrs.get('interrupt_reason', '未知')}")
-        elif coll_status == 'manual_stopped':
-            log("ℹ️ 手动停止 segment，同步已采集数据")
-
-        # ==== 新格式检测：stream_format_version & bin_pair_source ====
-        stream_fmt_ver = f.attrs.get('stream_format_version', None)
-        stream_mode = f.attrs.get('stream_mode', 'unknown')
-        bin_pair_source = f.attrs.get('bin_pair_source', 'unknown')
-
-        # 处理 bytes→str
-        if isinstance(stream_mode, bytes):
-            stream_mode = stream_mode.decode('utf-8')
-        if isinstance(bin_pair_source, bytes):
-            bin_pair_source = bin_pair_source.decode('utf-8')
-
-        if stream_fmt_ver is not None and int(stream_fmt_ver) >= 2:
-            log(f"📋 H5 格式: v{stream_fmt_ver} (新格式，一对一 bin 映射)")
-            log(f"   stream_mode: {stream_mode}")
-            log(f"   bin_pair_source: {bin_pair_source}")
-            if bin_pair_source == 'collection_stream':
-                log("   ✅ 使用 collection_stream bin（由 ble_server 切流产生）")
-            elif bin_pair_source == 'preview_stream':
-                log("   ⚠️ 警告: bin_pair_source 为 preview_stream！此 H5 可能错误引用了 preview bin")
-        else:
-            log("📋 H5 格式: v1 (旧格式，可能多 H5 共享同一个长 bin)")
-            log("   将使用兼容模式同步（允许 ADC offset search 等降级策略）")
-
-        # 获取250Hz ADC数据集
-        ds_250hz_name = f"emg{device_id}_250hz_adc"
-        if ds_250hz_name not in f:
-            log(f"错误: 找不到数据集 {ds_250hz_name}")
-            return {'status': 'error', 'reason': f'dataset {ds_250hz_name} not found'}
-
-        ds_250hz = f[ds_250hz_name]
-        num_frames_250hz = ds_250hz.shape[0]
-
-        if num_frames_250hz == 0:
-            log("警告: 250Hz数据集为空")
-            return {'status': 'error', 'reason': 'empty_250hz_dataset'}
-
-        log(f"250Hz数据集: {num_frames_250hz} 帧")
-
-        # ===== 解析通道映射 =====
-        channel_map, resolved_map_name = _resolve_channel_map(f, ds_250hz_name, channel_map_name)
-        log(f"通道映射: {resolved_map_name} {'(1-indexed, 16ch reorder)' if channel_map else '(physical — 恒等映射)'}")
-
-        # 读取250Hz数据和帧号
-        data_250hz = ds_250hz[:]
-        frame_ids = data_250hz['frame_id']
-        channels_250hz = data_250hz['channels']
-        timestamps_250hz = data_250hz['time']
-
-        log(f"BLE帧号范围: [{frame_ids[0]}, {frame_ids[-1]}]")
-
-        # ================================================================
-        # == 防御性校验 1：frame_id 序列健康检查 ==
-        # ================================================================
-        log("=" * 50)
-        log("防御性校验 1/3: frame_id 序列健康检查")
-        validation_report = {
-            'frame_id_check': None,
-            'coverage_check': None,
-            'adc_verify': None,
-            'all_passed': False,
-            'failure_reasons': [],
-            'channel_map_name': resolved_map_name,
-        }
-
-        fid_result = validate_frame_ids(frame_ids)
-        validation_report['frame_id_check'] = fid_result
-        for line in fid_result['report_lines']:
-            log(f"  {line}")
-
-        if not fid_result['passed']:
-            validation_report['failure_reasons'].append(fid_result['reason'])
-            validation_report['all_passed'] = False
-
-        # ================================================================
-        # == 防御性校验 2：SD 覆盖率检查 ==
-        # ================================================================
-        log("防御性校验 2/3: SD 覆盖率检查")
-        cov_result = validate_sd_coverage(frame_ids, DOWNSAMPLE_RATIO)
-        validation_report['coverage_check'] = cov_result
-        for line in cov_result['report_lines']:
-            log(f"  {line}")
-
-        if not cov_result['passed']:
-            validation_report['failure_reasons'].append(cov_result['reason'])
-            validation_report['all_passed'] = False
-
-        # 计算对应的SD卡帧号范围（供后续使用）
-        sd_frame_start = int(frame_ids[0]) * DOWNSAMPLE_RATIO
-        sd_frame_end = int(frame_ids[-1]) * DOWNSAMPLE_RATIO + (DOWNSAMPLE_RATIO - 1)
-
-        # ================================================================
-        # == 防御性校验 3：ADC 一致性校验（强校验，非仅日志）==
-        # ================================================================
-        firmware_mode = 'unverified' if not verify else 'exact'
-        align_model = 'pick'
-        align_tier = 'exact'
-        align_exact_frac = 1.0
-        # bin 帧号 = H5 sd_frame_id + bin_base。默认只有 bin 首帧号 fid0；
-        # 偏移搜索通过后会被改写为 fid0 + k（k 已含 anchor_position）。
-        bin_base = int(getattr(emg_parser, 'fid0', 0))
-        if verify:
-            log(f"防御性校验 3/3: ADC 一致性校验 (通道映射: {resolved_map_name})")
-            adc_result = run_adc_verification(
-                frame_ids, channels_250hz, emg_parser,
-                sample_count=VALIDATION_CONFIG['adc_sample_count'],
-                downsample_ratio=DOWNSAMPLE_RATIO,
-                channel_map=channel_map,
-                channel_map_name=resolved_map_name,
-            )
-            validation_report['adc_verify'] = adc_result
-            for line in adc_result['report_lines']:
-                log(f"  {line}")
-
-            if not adc_result['passed']:
-                # ── 回退：带限相关 + 帧号偏移搜索 ──
-                # 覆盖新固件（BLE 250Hz 抗混叠滤波后抽取）以及 bin 与 H5 帧号
-                # 基准相差未知常量 k 的情形；二者都会让精确匹配失败。
-                log("  ADC 精确匹配未通过，搜索 bin 帧号偏移（双抽取模型）...")
-                _anchors, _ = _get_250hz_anchor_sd_frame_ids(data_250hz, 0)
-                # 搜索网格必须与本路径写入网格一致：本路径按 ble_frame_id*8 成组写入，
-                # 而 _anchors 可能是 sd_frame_id 或 frame_id*8+7，故用 %8 归一化相位。
-                _ap = int(_anchors[0]) % DOWNSAMPLE_RATIO if len(_anchors) else DOWNSAMPLE_RATIO - 1
-                offset_result = _search_bin_offset_by_correlation(
-                    emg_parser, channels_250hz, _anchors, channel_map,
-                    anchor_position=_ap,
-                )
-                validation_report['filtered_verify'] = offset_result
-                for line in offset_result['report_lines']:
-                    log(f"  {line}")
-
-                if offset_result['passed']:
-                    bin_base = int(offset_result['bin_base'])
-                    firmware_mode = _firmware_mode_from_align(offset_result)
-                    align_model = offset_result['model']
-                    align_tier = offset_result['tier']
-                    align_exact_frac = float(offset_result['exact_frac'])
-                    adc_result['passed'] = True
-                    adc_result['filtered_fallback'] = True
-                    adc_result['reason'] = ''
-                    adc_result['match_rate'] = float(offset_result['best_corr'])
-                    log(f"  [PASS] bin_base={bin_base} (k={offset_result['best_k']:+d})，"
-                        f"模型={offset_result['model']}，firmware_mode={firmware_mode}，"
-                        f"命中率={offset_result['exact_frac']:.2%}，继续同步")
-                else:
-                    validation_report['failure_reasons'].append(adc_result['reason'])
-                    validation_report['offset_search_reason'] = offset_result.get('reason', '')
-        else:
-            log("防御性校验 3/3: ADC 一致性校验 [已跳过] (verify=False)")
-            adc_result = {
-                'skipped': True,
-                'reason': 'verify=False, ADC 校验已跳过',
-                'checked': 0, 'matched': 0, 'mismatched': 0, 'missing': 0,
-                'match_rate': 0.0, 'mismatch_rate': 0.0,
-                'mismatch_details': [],
-                'passed': True,  # 跳过不参与失败判定
-                'report_lines': ['[SKIP] ADC 校验已跳过 (verify=False)'],
-                'channel_map_name': resolved_map_name,
-            }
-            validation_report['adc_verify'] = adc_result
-
-        # 汇总校验结果
-        validation_report['all_passed'] = (fid_result['passed'] and
-                                           cov_result['passed'] and
-                                           adc_result['passed'])
-
-        if not validation_report['all_passed']:
-            log("=" * 50)
-            log("[FAIL] 防御性校验未通过，拒绝同步:")
-            for reason in validation_report['failure_reasons']:
-                log(f"  - {reason}")
-            log("=" * 50)
-
-            # 写入失败状态到 H5
-            f.attrs["sync_status"] = "sync_failed"
-            f.attrs["sync_time"] = datetime.now().isoformat()
-            f.attrs["sync_error"] = "; ".join(validation_report['failure_reasons'])
-            f.attrs["sync_validation_report"] = _format_validation_report(validation_report)
-            f.attrs["channel_map_name"] = resolved_map_name
-            append_sync_history(f, action='sync', status='sync_failed',
-                                details={'reasons': validation_report['failure_reasons']})
-            log("sync_status 已设为 'sync_failed'，详细信息已写入 H5 attrs")
-
-            result = {
-                'status': 'validation_failed',
-                'reason': '; '.join(validation_report['failure_reasons']),
-                'frames_250hz': num_frames_250hz,
-                'validation_report': {
-                    'frame_id_duplicates': fid_result['duplicates'],
-                    'frame_id_gaps': fid_result['gap_count'],
-                    'sd_coverage_ratio': cov_result['coverage_ratio'],
-                    'adc_match_rate': adc_result['match_rate']
-                }
-            }
-            if imu_parser is not None:
-                result['imu_status'] = 'skipped'
-            return result
-
-        log("=" * 50)
-        log("[PASS] 所有防御性校验通过，继续同步...")
-        log("=" * 50)
-
-        # 构建2kHz数据
-        log(f"正在构建2kHz数据 (通道顺序: {resolved_map_name})...")
-
-        num_frames_2khz = num_frames_250hz * DOWNSAMPLE_RATIO
-        # 2kHz数据集类型：使用int32存储原始ADC值（与250Hz一致）
-        emg_2khz_dtype = np.dtype([
-            ("channels", "<i4", (16,)),  # 原始ADC值（int32）
-            ("sd_frame_id", "<u4"),      # SD卡帧号
-            ("time", "<f8")
-        ])
-
-        data_2khz = np.empty(num_frames_2khz, dtype=emg_2khz_dtype)
-
-        missing_frames = 0
-        filled_frames = 0
-
-        for i, ble_frame_id in enumerate(frame_ids):
-            # 计算这个BLE帧对应的8个SD卡帧
-            sd_base = int(ble_frame_id) * DOWNSAMPLE_RATIO
-
-            for j in range(DOWNSAMPLE_RATIO):
-                sd_frame_id = sd_base + j
-                idx_2khz = i * DOWNSAMPLE_RATIO + j
-
-                bin_data = emg_parser.get_frame(sd_frame_id + bin_base)
-
-                if bin_data is not None:
-                    # bin 数据是物理顺序 → 映射到 mapped 顺序，与 H5 250Hz 数据集一致
-                    bin_data_mapped = map_physical_to_h5_order(bin_data, channel_map)
-                    data_2khz[idx_2khz]['channels'] = np.array(bin_data_mapped, dtype=np.int32)
-                    data_2khz[idx_2khz]['sd_frame_id'] = sd_frame_id
-                    filled_frames += 1
-                else:
-                    # 帧丢失，使用插值或最近邻填充
-                    # channels_250hz[i] 已经是 mapped 顺序，直接使用
-                    if j == DOWNSAMPLE_RATIO - 1:
-                        # 最后一帧应该和250Hz数据一致
-                        data_2khz[idx_2khz]['channels'] = channels_250hz[i].astype(np.int32)
-                    elif idx_2khz > 0:
-                        # 使用前一帧数据
-                        data_2khz[idx_2khz]['channels'] = data_2khz[idx_2khz - 1]['channels']
-                    else:
-                        data_2khz[idx_2khz]['channels'] = np.zeros(16, dtype=np.int32)
-                    data_2khz[idx_2khz]['sd_frame_id'] = sd_frame_id
-                    missing_frames += 1
-
-                # 插值时间戳
-                if i < len(timestamps_250hz) - 1:
-                    t_start = timestamps_250hz[i]
-                    t_end = timestamps_250hz[i + 1]
-                    data_2khz[idx_2khz]['time'] = t_start + (t_end - t_start) * j / DOWNSAMPLE_RATIO
-                else:
-                    # 最后一组，使用固定间隔
-                    data_2khz[idx_2khz]['time'] = timestamps_250hz[i] + j * (1.0 / 2000.0)
-
-        log(f"2kHz数据构建完成: {filled_frames} 帧来自bin, {missing_frames} 帧插值填充")
-
-        # 写入2kHz ADC数据集（写入已存在的空数据集，而非创建新的）
-        ds_2khz_name = f"emg{device_id}_2khz_adc"
-        # sync_bin_fid0 保持原义（bin 首帧号），实际对齐偏移另存以免混淆：
-        # 新固件下 bin_base = fid0 + k（k 为两套计数器的差值，可为负）。
-        # align_offset_attr 的语义固定为 "真实 bin 帧号 = sd_frame_id + 该值"；
-        # 补救路径的合成键空间带预留基准，故它与读取用的 bin_base 不同。
-        _bin_fid0 = int(getattr(emg_parser, 'fid0', 0))
-        _bin_align = int(bin_base if align_offset_attr is None else align_offset_attr)
-
-        was_present = ds_2khz_name in f
-        ds_2khz = _open_sync_dataset_for_write(f, ds_2khz_name, num_frames_2khz,
-                                               data_2khz, log_fn=log)
-        ds_2khz[:] = data_2khz
-        # 更新属性
-        if not was_present:
-            log(f"警告: 数据集 {ds_2khz_name} 不存在，已创建新数据集")
-            ds_2khz.attrs["device"] = f"device_{device_id}"
-            ds_2khz.attrs["channels"] = 16
-            ds_2khz.attrs["sample_rate"] = 2000
-            ds_2khz.attrs["data_type"] = "raw_adc"
-            ds_2khz.attrs["description"] = "2kHz EMG raw ADC data synced from SD card bin (not uV, multiply by lsb_uv to convert)"
-        ds_2khz.attrs["lsb_uv"] = emg_parser.lsb_uv  # 保存LSB系数，用于转换为μV
-        ds_2khz.attrs["source_bin"] = os.path.basename(emg_bin_path)
-        ds_2khz.attrs["sync_time"] = datetime.now().isoformat()
-        ds_2khz.attrs["filled_frames"] = filled_frames
-        ds_2khz.attrs["missing_frames"] = missing_frames
-        ds_2khz.attrs["sync_bin_fid0"] = _bin_fid0
-        ds_2khz.attrs["sync_bin_align_offset"] = _bin_align
-        ds_2khz.attrs["sync_firmware_type"] = str(firmware_mode)
-        ds_2khz.attrs["sync_align_model"] = str(align_model)
-        ds_2khz.attrs["sync_align_tier"] = str(align_tier)
-        ds_2khz.attrs["sync_align_exact_frac"] = float(align_exact_frac)
-
-        log(f"同步完成！2kHz数据已写入 {ds_2khz_name}")
-
-        # ============================================================
-        # == IMU 100Hz 同步：委托给 _sync_imu_100hz（支持 1-4 动态数量）==
-        # ============================================================
-        imu_result = _sync_imu_100hz(f, emg_parser, imu_parser, data_2khz, device_id)
-
-        # 更新sync_status（仅当set_synced=True时）
-        if set_synced:
-            f.attrs["sync_time"] = datetime.now().isoformat()
-            f.attrs["channel_map_name"] = resolved_map_name
-            f.attrs["sync_firmware_type"] = str(firmware_mode)
-            f.attrs[f"sync_align_model_dev{device_id}"] = str(align_model)
-            f.attrs[f"sync_align_tier_dev{device_id}"] = str(align_tier)
-            f.attrs[f"sync_align_exact_frac_dev{device_id}"] = float(align_exact_frac)
-            f.attrs[f"sync_bin_fid0_dev{device_id}"] = _bin_fid0
-            f.attrs[f"sync_bin_align_offset_dev{device_id}"] = _bin_align
-            # 写入校验报告供后续审计
-            f.attrs["sync_validation_report"] = _format_validation_report(validation_report)
-            append_sync_history(f, action='sync', status='synced',
-                                details={'device_id': device_id, 'frames_2khz': num_frames_2khz})
-            log(f"同步完成！EMG 2kHz: {ds_2khz_name}, IMU: {imu_result.get('imu_status', 'skipped')}, 状态已设为synced")
-        else:
-            log(f"同步完成！EMG 2kHz: {ds_2khz_name}, IMU: {imu_result.get('imu_status', 'skipped')}, 状态保持pending（等待其他设备同步）")
-
-        update_sync_status(f, device_id, source_path=emg_parser.bin_path,
-                           imu_result=imu_result, validation_passed=bool(verify),
-                           set_synced=bool(set_synced))
-
-        result = {
-            'status': 'success',
-            'frames_250hz': num_frames_250hz,
-            'frames_2khz': num_frames_2khz,
-            'filled_frames': filled_frames,
-            'missing_frames': missing_frames,
-            'validation': {
-                'frame_id_duplicates': validation_report['frame_id_check']['duplicates'],
-                'frame_id_gaps': validation_report['frame_id_check']['gap_count'],
-                'sd_coverage_ratio': validation_report['coverage_check']['coverage_ratio'],
-                'adc_match_rate': validation_report['adc_verify']['match_rate'],
-                'all_passed': True
-            }
-        }
-        result.update(imu_result)
-        return result
+    return sync_h5_one_to_one(
+        h5_path, emg_bin_path, imu_bin_path, device_id=device_id,
+        verify=verify, set_synced=set_synced, channel_map_name=channel_map_name,
+        manual_num_imus=manual_num_imus)
 
 
 # ===================== ADC Offset Search (一对多模式) =====================
@@ -2828,6 +2448,7 @@ def sync_h5_one_to_one_multibin_rescue(h5_path, emg_bin_paths, imu_bin_paths=Non
         anchor_position=rescue_anchor_position,
         label_offset=label_offset,
         align_offset_attr=align_offset_attr,
+        full_bin=(len(segments) == 1),
     )
 
     if result.get('status') != 'success':
@@ -3077,31 +2698,19 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
 
 
 def _synced_file_needs_prompt_coverage_resync(h5_file, device_id):
-    """Allow resync for old synced H5 files that were not built from the full SD bin."""
+    """Upgrade every older output, including misleading extended/full-bin tags."""
+    name = f'emg{device_id}_2khz_adc'
+    if name not in h5_file:
+        return True
+    ds = h5_file[name]
     try:
-        ds_name = f'emg{device_id}_2khz_adc'
-        if ds_name not in h5_file:
-            return False
-        ds = h5_file[ds_name]
-        source_mode = ds.attrs.get('sync_source_mode', '')
-        if isinstance(source_mode, bytes):
-            source_mode = source_mode.decode('utf-8', errors='ignore')
-        if source_mode not in ('full_sd_bin', 'ble_anchored_extended'):
-            return True
-        if 'prompts' not in h5_file or 'times' not in h5_file['prompts']:
-            return False
-        if len(ds) == 0 or ds.dtype.names is None or 'time' not in ds.dtype.names:
-            return False
-        prompt_times = h5_file['prompts']['times'][:]
-        if len(prompt_times) == 0:
-            return False
-        prompt_end = float(np.nanmax(prompt_times.astype(np.float64)))
-        data_end = float(ds['time'][-1])
-        if prompt_end > 1e11 or data_end > 1e11:
-            return False
-        return prompt_end > data_end + 1e-3
-    except Exception:
-        return False
+        return not (
+            int(ds.attrs.get('sync_output_contract_version', 0)) >= 2
+            and bool(ds.attrs.get('sync_full_bin_preserved', False))
+            and len(ds) == int(ds.attrs.get('sync_source_frame_count', -1))
+        )
+    except (TypeError, ValueError, OverflowError):
+        return True
 
 
 def _get_prompt_coverage_target_time(h5_path, current_end_time, margin_seconds=0.0):
@@ -3209,100 +2818,6 @@ def _extend_2khz_to_cover_prompts(h5_path, data_2khz, emg_parser, channel_map, r
     return result
 
 
-def _build_full_bin_2khz_from_anchor(emg_parser, channel_map, dtype, timestamps_250hz,
-                                     anchor_sd_frame_ids, bin_offset, anchor_position):
-    """Build full 2kHz bin data while preserving the legacy BLE-anchored time segment.
-
-    The old sync path produced correct prompt alignment for the available BLE
-    250Hz span, but it stopped when BLE data stopped. Keep that proven time
-    axis inside the BLE span, then extend the paired SD bin before/after it at
-    the fixed 2kHz interval.
-    """
-    if not emg_parser.frames or len(timestamps_250hz) == 0:
-        return None
-
-    min_sd = int(min(emg_parser.frames.keys()))
-    max_sd = int(max(emg_parser.frames.keys()))
-    if max_sd < min_sd:
-        return None
-
-    legacy_sd_times = []
-    if anchor_sd_frame_ids is not None:
-        anchor_iter = enumerate(anchor_sd_frame_ids)
-    else:
-        anchor_iter = ((i, int(bin_offset) + i * DOWNSAMPLE_RATIO + int(anchor_position))
-                       for i in range(len(timestamps_250hz)))
-
-    for row_idx, anchor_sd in anchor_iter:
-        if row_idx < 0 or row_idx >= len(timestamps_250hz):
-            continue
-        anchor_sd = int(anchor_sd)
-        if anchor_sd < 0:
-            continue
-        anchor_time = float(timestamps_250hz[row_idx])
-        if not np.isfinite(anchor_time):
-            continue
-        sd_base = anchor_sd - int(anchor_position)
-        for phase in range(DOWNSAMPLE_RATIO):
-            sd_frame_id = sd_base + phase
-            if sd_frame_id < min_sd or sd_frame_id > max_sd:
-                continue
-            t = anchor_time + (phase - int(anchor_position)) / 2000.0
-            legacy_sd_times.append((sd_frame_id, float(t)))
-
-    if not legacy_sd_times:
-        return None
-
-    # Collapse duplicate frame ids, if any, using the median timestamp.
-    by_sd = {}
-    for sd, t in legacy_sd_times:
-        by_sd.setdefault(int(sd), []).append(float(t))
-    known_sd = np.array(sorted(by_sd.keys()), dtype=np.float64)
-    known_time = np.array([float(np.median(by_sd[int(sd)])) for sd in known_sd], dtype=np.float64)
-    if len(known_sd) == 0:
-        return None
-
-    frame_count = max_sd - min_sd + 1
-    data_2khz = np.empty(frame_count, dtype=dtype)
-    full_sd = np.arange(min_sd, max_sd + 1, dtype=np.float64)
-    full_time = np.interp(full_sd, known_sd, known_time)
-    before_mask = full_sd < known_sd[0]
-    after_mask = full_sd > known_sd[-1]
-    if np.any(before_mask):
-        full_time[before_mask] = known_time[0] - (known_sd[0] - full_sd[before_mask]) / 2000.0
-    if np.any(after_mask):
-        full_time[after_mask] = known_time[-1] + (full_sd[after_mask] - known_sd[-1]) / 2000.0
-
-    prev_channels = np.zeros(16, dtype=np.int32)
-    filled_frames = 0
-    missing_frames = 0
-
-    for idx, sd_frame_id in enumerate(range(min_sd, max_sd + 1)):
-        bin_data = emg_parser.get_frame(sd_frame_id)
-        if bin_data is not None:
-            prev_channels = np.array(map_physical_to_h5_order(bin_data, channel_map), dtype=np.int32)
-            filled_frames += 1
-        else:
-            missing_frames += 1
-        data_2khz[idx]['channels'] = prev_channels
-        data_2khz[idx]['sd_frame_id'] = sd_frame_id
-        data_2khz[idx]['time'] = float(full_time[idx])
-
-    return {
-        'data_2khz': data_2khz,
-        'filled_frames': filled_frames,
-        'missing_frames': missing_frames,
-        'min_sd': min_sd,
-        'max_sd': max_sd,
-        'anchor_sd': int(known_sd[0]),
-        'anchor_time': float(known_time[0]),
-        'base_time': float(known_time[0] - known_sd[0] / 2000.0),
-        'legacy_time_min_sd': int(known_sd[0]),
-        'legacy_time_max_sd': int(known_sd[-1]),
-        'legacy_time_anchor_count': int(len(known_sd)),
-        'time_source_mode': 'legacy_ble_250hz_extended',
-    }
-
 
 def _fit_2khz_time_model(x_anchor, timestamps_250hz, probe_count=200):
     """从蓝牙锚点拟合 2kHz 输出的整体时间基准（bin 帧号 → 时间）。
@@ -3356,14 +2871,17 @@ def _fit_2khz_time_model(x_anchor, timestamps_250hz, probe_count=200):
 
 
 def _enumerate_2khz_from_bin(emg_parser, channel_map, x_anchor, bin_base,
-                             slope, intercept, anchor_position, label_offset=None):
+                             slope, intercept, anchor_position, label_offset=None,
+                             full_bin=False, anchor_times=None):
     """按 bin 自己的帧序列连续枚举 2kHz 输出行。
 
     x_anchor: 每个蓝牙锚点对应的会话内 2kHz 帧号（其时间戳为 timestamps_250hz[i]）。
-    对齐区间为 [x_anchor[0] - anchor_position, x_anchor[-1] - anchor_position + 7]。
+    full_bin=True 时输出整个配对 bin；False 仅用于共享长 bin 的明确会话区间，
+    范围为 [x_anchor[0] - anchor_position, x_anchor[-1] - anchor_position + 7]。
 
     bin 里存在的每一帧写一行、且只写一次 —— 蓝牙丢包不再在输出里留下空洞，
-    因为输出长度由 bin 决定，而不是由蓝牙包计数器决定。
+    因为输出长度由 bin 决定，而不是由蓝牙包计数器决定。anchor_times 提供实际
+    BLE 时间锚点，区间内逐锚点插值，首尾按标称 2 kHz 外推。
 
     bin_base    : 把 x_anchor（H5 会话内帧号）换算成 emg_parser.frames 键的偏移。
                   对真实 EMGBinParser 二者同为“真实 bin 帧号”，对合成 parser（多 bin
@@ -3389,7 +2907,11 @@ def _enumerate_2khz_from_bin(emg_parser, channel_map, x_anchor, bin_base,
     bin_lo = sd_lo + int(bin_base)
     bin_hi = sd_hi + int(bin_base)
     clamped_to_bin_start = 0
-    lower_bound = max(fid0, int(label_offset))
+    lower_bound = fid0
+    if full_bin:
+        # BLE is timing evidence, never a mask for a paired SD recording.
+        # Include the prefix and suffix even when no BLE packets survived there.
+        bin_lo, bin_hi = int(min(frames)), int(max(frames))
     if bin_lo < lower_bound:
         clamped_to_bin_start = lower_bound - bin_lo
         bin_lo = lower_bound
@@ -3411,13 +2933,34 @@ def _enumerate_2khz_from_bin(emg_parser, channel_map, x_anchor, bin_base,
     if np.any(x_kept > np.iinfo(np.uint32).max):
         return None, {'reason': 'output frame ids exceed u32; explicit segmentation required'}
 
+    # A positive clock/counter offset puts a real bin prefix before H5 frame 0.
+    # Retain those samples with signed labels rather than clamping or wrapping.
+    id_dtype = '<i8' if np.any(x_kept < 0) else '<u4'
+
     data_2khz = np.empty(len(bin_kept), dtype=np.dtype([
         ("channels", "<i4", (16,)),
-        ("sd_frame_id", "<u4"),
+        ("sd_frame_id", id_dtype),
         ("time", "<f8"),
     ]))
-    data_2khz['sd_frame_id'] = x_kept.astype(np.uint32)
+    data_2khz['sd_frame_id'] = x_kept
     data_2khz['time'] = intercept + slope * x_kept.astype(np.float64)
+    if anchor_times is not None:
+        anchor_ids = np.asarray(x_anchor, dtype=np.int64) + int(bin_base) - int(label_offset)
+        anchor_times = np.asarray(anchor_times, dtype=np.float64)
+        if (len(anchor_times) != len(anchor_ids)
+                or not np.all(np.isfinite(anchor_times))
+                or np.any(np.diff(anchor_times) <= 0)):
+            return None, {'reason': 'BLE anchor timestamps must be finite and strictly increasing'}
+        # Pin every received BLE timestamp to its actual bin coordinate.
+        # Missing BLE packets only enlarge interpolation intervals; no SD
+        # samples are removed. Outside the anchors use the nominal SD clock.
+        times = np.interp(x_kept, anchor_ids, anchor_times)
+        before, after = x_kept < anchor_ids[0], x_kept > anchor_ids[-1]
+        times[before] = anchor_times[0] + (x_kept[before] - anchor_ids[0]) / 2000.0
+        times[after] = anchor_times[-1] + (x_kept[after] - anchor_ids[-1]) / 2000.0
+        data_2khz['time'] = times
+        if not np.all(np.diff(times) > 0):
+            return None, {'reason': 'interpolated SD timestamps are not strictly increasing'}
     for row in range(len(bin_kept)):
         data_2khz[row]['channels'] = np.array(
             map_physical_to_h5_order(frames[int(bin_kept[row])], channel_map),
@@ -3436,6 +2979,8 @@ def _enumerate_2khz_from_bin(emg_parser, channel_map, x_anchor, bin_base,
         'clamped_to_bin_start': int(clamped_to_bin_start),
         'label_offset': int(label_offset),
         'bin_base': int(bin_base),
+        'full_bin': bool(full_bin),
+        'source_frame_count': int(len(frames)),
     }
     return data_2khz, diag
 
@@ -3449,21 +2994,22 @@ def _open_sync_dataset_for_write(h5_file, name, n_rows, data, log_fn=None,
     bin 的帧数（345468），resize 会直接报
     "dimension cannot exceed the existing maximal size"。这里在容量不足时重建该
     数据集（其内容本来就被本次同步全量重写），并把 maxshape 放开为 (None,)，
-    避免以后再次撞上同一个上限。dtype 与既有 attrs 一并保留。
+    避免以后再次撞上同一个上限。保留既有 attrs，dtype 以本次数据为准，
+    防止有符号前缀被旧无符号字段静默转换。
     """
     dtype = data.dtype
     if name in h5_file:
         ds = h5_file[name]
         current = ds.shape[0]
         cap = ds.maxshape[0] if (ds.maxshape is not None and len(ds.maxshape)) else None
-        # cap 为 None -> 可无限扩展；n_rows <= cap -> 装得下；两种情况都只 resize
-        if cap is None or n_rows <= cap:
+        same_dtype = ds.dtype == data.dtype
+        can_resize = ds.chunks is not None and (cap is None or n_rows <= cap)
+        if same_dtype and (n_rows == current or can_resize):
             if n_rows != current:
                 ds.resize(n_rows, axis=0)
             return ds
         # 容量不足：重建
         _attrs = {k: ds.attrs[k] for k in ds.attrs}
-        dtype = ds.dtype
         if ds.chunks is not None:
             chunks = ds.chunks
         if ds.compression is not None:
@@ -3488,7 +3034,7 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
                           anchor_position=DOWNSAMPLE_RATIO - 1,
                           bin_base=0, firmware_mode='exact',
                           align_model='pick', align_tier='exact', align_exact_frac=1.0,
-                          label_offset=None, align_offset_attr=None):
+                          label_offset=None, align_offset_attr=None, full_bin=True):
     """构建并写入 2kHz 数据 + IMU 100Hz 数据到 H5（共享逻辑）。
 
     sync_match_rate: 成功路径写入 sync_offset_match_rate_dev{device_id} 供 UI 展示
@@ -3520,9 +3066,8 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
     invalid_negative_sd_frames = 0
 
     # ── Step 1: 以 bin 为主体的连续写入 ──
-    # 输出长度由 bin 决定：对齐区间内 bin 存在的每一帧写一行、且只写一次。
-    # 蓝牙 250Hz 只用来给出整体时间基准（见 _fit_2khz_time_model）：丢包不再在输出里
-    # 留下空洞，也不再把时间轴按丢包量压扁。
+    # 一对一保留整个配对 bin，一对多仅保留明确会话区间；每个真实样本写一次。
+    # BLE 250Hz 只提供坐标和时间锚点，不参与输出采样的筛选或内容填充。
     if anchor_sd_frame_ids is not None and len(anchor_sd_frame_ids) >= num_frames_250hz:
         x_anchor = np.asarray(anchor_sd_frame_ids[:num_frames_250hz], dtype=np.int64)
     else:
@@ -3539,6 +3084,8 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
     data_2khz, enum_diag = _enumerate_2khz_from_bin(
         emg_parser, channel_map, x_anchor, bin_base, slope, intercept, anchor_position,
         label_offset=label_offset,
+        full_bin=full_bin,
+        anchor_times=timestamps_250hz,
     )
     if data_2khz is None:
         reason = enum_diag.get('reason')
@@ -3555,10 +3102,12 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         f"旧蓝牙网格会漏掉 {enum_diag['grid_omitted_frames']} 帧; "
         f"bin 自身空洞 {enum_diag['bin_gap_frames']} 帧)")
 
-    # ── Step 2: 向外扩展，补全 bin 文件中超出 BLE 范围的数据 ──
-    extension_info = _extend_2khz_to_cover_prompts(
-        h5_path, data_2khz, emg_parser, channel_map, resolved_map_name, lookup_base=label_offset
-    )
+    # ── Step 2: 仅共享长 bin 按 prompt/session 边界受控延伸 ──
+    extension_info = ({'extra_frames': 0, 'extra_filled_frames': 0,
+                       'extra_missing_frames': 0} if full_bin else
+                      _extend_2khz_to_cover_prompts(
+                          h5_path, data_2khz, emg_parser, channel_map, resolved_map_name,
+                          lookup_base=label_offset))
     missing_frames += extension_info['extra_missing_frames']
     if extension_info['extra_frames'] > 0:
         data_2khz = extension_info['data_2khz']
@@ -3579,6 +3128,9 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         ds_2khz = _open_sync_dataset_for_write(f, ds_2khz_name, num_frames_2khz,
                                                data_2khz, log_fn=log)
         ds_2khz[:] = data_2khz
+        for key in list(ds_2khz.attrs):
+            if key.startswith('prompt_coverage_'):
+                del ds_2khz.attrs[key]
         ds_2khz.attrs["lsb_uv"] = emg_parser.lsb_uv
         ds_2khz.attrs["source_bin"] = os.path.basename(emg_parser.bin_path)
         ds_2khz.attrs["sync_time"] = datetime.now().isoformat()
@@ -3586,7 +3138,11 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         ds_2khz.attrs["missing_frames"] = missing_frames
         ds_2khz.attrs["invalid_negative_sd_frames"] = invalid_negative_sd_frames
         ds_2khz.attrs["sample_rate"] = 2000
-        ds_2khz.attrs["sync_source_mode"] = "ble_anchored_extended"
+        ds_2khz.attrs["sync_source_mode"] = "full_sd_bin" if full_bin else "ble_anchored_session"
+        ds_2khz.attrs["sync_output_contract_version"] = 2
+        ds_2khz.attrs["sync_source_frame_count"] = int(enum_diag['source_frame_count'])
+        ds_2khz.attrs["sync_output_frame_count"] = int(num_frames_2khz)
+        ds_2khz.attrs["sync_full_bin_preserved"] = bool(full_bin and num_frames_2khz == len(emg_parser.frames))
         ds_2khz.attrs["sync_ble_anchor_count"] = int(num_frames_250hz)
         # bin 驱动写入的审计信息：旧蓝牙网格漏掉多少帧（= "h5 显示丢帧但 bin 没丢帧"），
         # 以及时间基准拟合参数（斜率只用标称 8 帧配对的中位数，恒为 1/2000）
@@ -3599,6 +3155,7 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         ds_2khz.attrs["sync_time_model_nominal_pairs"] = int(time_diag['nominal_pairs'])
         ds_2khz.attrs["sync_time_model_non_nominal_pairs"] = int(time_diag['non_nominal_pairs'])
         ds_2khz.attrs["sync_time_model_slope_clamped"] = bool(time_diag['slope_clamped'])
+        ds_2khz.attrs["sync_time_source"] = "ble_anchor_interpolation_nominal_extrapolation"
         if len(data_2khz):
             ds_2khz.attrs["sync_2khz_span_seconds"] = float(
                 data_2khz['time'][-1] - data_2khz['time'][0])
@@ -3819,14 +3376,17 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
             f"median_acc_err={anchor_info['median_acc_error']:.4f}"
         )
     else:
-        emg_sd_frame_ids = data_2khz['sd_frame_id']
+        # Full paired-bin output can legitimately start before H5 counter 0.
+        # Such signed EMG labels are not physical unsigned IMU counter IDs.
+        valid_emg_indices = np.flatnonzero(data_2khz['sd_frame_id'] >= 0)
+        emg_sd_frame_ids = data_2khz['sd_frame_id'][valid_emg_indices]
         imu_frame_ids_all = emg_sd_frame_ids // EMG_IMU_RATIO
         imu_frame_ids_unique = np.unique(imu_frame_ids_all)
         imu_time_by_frame = {}
         for emg_idx, imu_fid_raw in enumerate(imu_frame_ids_all):
             imu_fid_int = int(imu_fid_raw)
             if imu_fid_int not in imu_time_by_frame:
-                imu_time_by_frame[imu_fid_int] = float(data_2khz[emg_idx]['time'])
+                imu_time_by_frame[imu_fid_int] = float(data_2khz[valid_emg_indices[emg_idx]]['time'])
         imu_time_alignment = 'emg_time_fallback'
         log("  WARN: no reliable BLE IMU anchor; falling back to EMG-derived IMU time axis")
     num_imu_frames = len(imu_frame_ids_unique)
@@ -4089,6 +3649,7 @@ def sync_h5_one_to_many_adc_search(h5_path, emg_bin_path, imu_bin_path=None, dev
         sync_mode='one_to_many_adc_search', sync_match_rate=search_result['match_rate'], verify_passed=True,
         anchor_sd_frame_ids=anchors, anchor_position=anchor_position,
         sync_frame_id_mode='adc_row_scan' if anchors is not None else 'row_index',
+        full_bin=False,
     )
 
     if result.get('status') != 'success':

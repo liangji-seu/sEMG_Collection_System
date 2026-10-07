@@ -193,7 +193,10 @@ class AlignmentTests(unittest.TestCase):
                 else:
                     result = sync.sync_h5_one_to_one_multibin_rescue(str(hp), [str(bp)], channel_map_name='physical')
                 self.assertEqual(result['status'], 'success')
-                attrs = self.assert_source(hp, rows, [i for i in range(551) if i not in (510, 520)])
+                expected_ids = ([i for i in range(3000) if i not in (510, 520)]
+                                if mode in ('normal', 'rescue')
+                                else [i for i in range(551) if i not in (510, 520)])
+                attrs = self.assert_source(hp, rows, expected_ids)
                 self.assertEqual(attrs['missing_frames'], 2)
 
     def test_enumerator_handles_huge_sparse_span_without_dense_allocation(self):

@@ -39,7 +39,7 @@ python tools/hdf5_tool.py
 | 文件事务 | `tools/file_access.py` | 离线排他修改、工作副本与提交 |
 | 进程与日志 | `lib/service-process.js` / `logger.js` | 就绪、退出、日志轮转和背压 |
 
-从 [项目架构](docs/project/01-architecture.md) 开始阅读。详细功能见 [采集界面](docs/project/04-collection-ui.md)、[数据格式](docs/project/07-data-format.md)、[离线同步](docs/project/08-bin-sync-tool.md)、[HDF5 工具](docs/project/09-hdf5-tool.md)。本轮问题、实现边界和实际验收证据在 [系统审查](docs/project/13-system-review.md)。
+从 [项目架构](docs/project/01-architecture.md) 开始阅读。详细功能见 [采集界面](docs/project/04-collection-ui.md)、[数据格式](docs/project/07-data-format.md)、[离线同步](docs/project/08-bin-sync-tool.md)、[HDF5 工具](docs/project/09-hdf5-tool.md)。本轮问题、实现边界和实际验收证据在 [系统审查](docs/project/13-system-review.md)。后续完整bin与旧配对纠错见 [修复记录](docs/project/14-bin-completion-correction.md)。
 
 ## 验证
 
@@ -53,3 +53,5 @@ npm run test:python
 Python GUI 测试使用离屏模式，不需要显示窗口；测试仅创建临时合成数据。进程就绪测试需要允许本机回环 TCP 通信。真实数据验收只能对工作副本运行，具体清单与逐帧校验方法见系统审查。
 
 `/api/health` 提供服务就绪和降级状态。日志位于 `log/`。异常保存时应先保留故障原因并完成明确的不完整收尾；正常“保存成功”必须有存储确认。硬件断连续采、SD 尾帧和摄像头实际帧率仍需在连接设备后做现场验收。
+
+源码更新不会自动更新此前打包的exe；使用旧exe前应重新打包，或直接运行当前源码的`python tools/hdf5_tool.py`。

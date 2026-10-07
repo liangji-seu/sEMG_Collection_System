@@ -19,3 +19,4 @@ tmp/verify/*.h5
 tmp/verify/*.npz
 tmp/system-validation/
 
+tmp/dropframe-validation/

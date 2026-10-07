@@ -10,6 +10,7 @@ import sys
 import os
 import json
 import glob
+import re
 import shutil
 import subprocess
 import threading
@@ -298,6 +299,122 @@ def _find_named_file_recursive(base_dir, target_name):
     return None
 
 
+_H5_SESSION_NAME_RE = re.compile(
+    r'^(?P<subject>[^_]+).*session\d+_(?P<date>\d{8})_(?P<time>\d{6})$',
+    re.IGNORECASE,
+)
+_BIN_NAME_RE = re.compile(
+    r'^(?P<subject>[^_]+)_(?P<side>[LR])_(?P<date>\d{6})_(?P<time>\d{6})_(?P<kind>emg|imu)\.bin$',
+    re.IGNORECASE,
+)
+
+
+def _parse_h5_session_timestamp(h5_path):
+    match = _H5_SESSION_NAME_RE.match(Path(h5_path).stem)
+    if not match:
+        return None
+    try:
+        return {
+            'subject': match.group('subject'),
+            'date': datetime.strptime(match.group('date'), '%Y%m%d').date(),
+            'timestamp': datetime.strptime(
+                match.group('date') + match.group('time'), '%Y%m%d%H%M%S'),
+        }
+    except ValueError:
+        return None
+
+
+def _parse_bin_filename(path):
+    match = _BIN_NAME_RE.match(Path(path).name)
+    if not match:
+        return None
+    try:
+        return {
+            'subject': match.group('subject'),
+            'side': match.group('side').upper(),
+            'date': datetime.strptime(match.group('date'), '%y%m%d').date(),
+            'timestamp': datetime.strptime(
+                match.group('date') + match.group('time'), '%y%m%d%H%M%S'),
+            'prefix': Path(path).name.rsplit('_', 1)[0],
+            'kind': match.group('kind').lower(),
+            'path': path,
+        }
+    except ValueError:
+        return None
+
+
+def _resolve_time_matched_bin_pair(bin_dir, h5_path, device_id,
+                                   legacy_prefix=None, max_delta_seconds=10.0):
+    """Resolve a one-to-one bin pair from the H5 session timestamp.
+
+    The H5 ``sd_bin_dev*`` attribute is retained as the first choice when its
+    file exists and its timestamp is close to the session timestamp.  A stale
+    or missing reference can be repaired in memory by selecting the unique
+    nearest same-subject, same-side, same-date EMG bin within the small time
+    window.  The H5 attribute itself is never changed.
+    """
+    session = _parse_h5_session_timestamp(h5_path)
+    if session is None:
+        return None, None, {'status': 'unresolved', 'reason': 'h5_session_timestamp_unavailable'}
+
+    side = 'L' if int(device_id) == 1 else 'R' if int(device_id) == 2 else None
+    legacy = _parse_bin_filename(f'{legacy_prefix}_emg.bin') if legacy_prefix else None
+    if legacy is not None and legacy['subject'] == session['subject']:
+        side = legacy['side']
+
+    legacy_emg = (_find_named_file_recursive(bin_dir, f'{legacy_prefix}_emg.bin')
+                  if legacy_prefix else None)
+    legacy_imu = (_find_named_file_recursive(bin_dir, f'{legacy_prefix}_imu.bin')
+                  if legacy_prefix else None)
+    legacy_info = _parse_bin_filename(legacy_emg) if legacy_emg else legacy
+    if (legacy_emg and legacy_info and legacy_info['subject'] == session['subject']
+            and legacy_info['side'] == side and legacy_info['date'] == session['date']):
+        legacy_delta = abs((legacy_info['timestamp'] - session['timestamp']).total_seconds())
+        if legacy_delta <= max_delta_seconds:
+            return legacy_emg, legacy_imu, {
+                'status': 'legacy_valid', 'prefix': legacy_info['prefix'],
+                'delta_seconds': legacy_delta,
+            }
+
+    candidates = []
+    for _root, name, path in _iter_non_preview_bin_files(bin_dir):
+        if not name.lower().endswith('_emg.bin'):
+            continue
+        info = _parse_bin_filename(path)
+        if info is None:
+            continue
+        if (info['subject'] != session['subject'] or info['side'] != side
+                or info['date'] != session['date']):
+            continue
+        info['delta_seconds'] = abs((info['timestamp'] - session['timestamp']).total_seconds())
+        candidates.append(info)
+
+    if not candidates:
+        return None, None, {'status': 'unresolved', 'reason': 'no_same_subject_side_date_emg_candidate'}
+    candidates.sort(key=lambda item: (item['delta_seconds'], str(item['path'])))
+    best_delta = candidates[0]['delta_seconds']
+    ties = [item for item in candidates if abs(item['delta_seconds'] - best_delta) < 1e-6]
+    if len(ties) != 1:
+        return None, None, {
+            'status': 'unresolved', 'reason': 'ambiguous_nearest_emg_candidates',
+            'delta_seconds': best_delta,
+            'candidates': [item['path'] for item in ties],
+        }
+    if best_delta > max_delta_seconds:
+        return None, None, {
+            'status': 'unresolved', 'reason': 'nearest_candidate_outside_time_window',
+            'delta_seconds': best_delta,
+        }
+
+    selected = ties[0]
+    imu_path = _find_named_file_recursive(bin_dir, f"{selected['prefix']}_imu.bin")
+    return selected['path'], imu_path, {
+        'status': 'time_matched_replacement', 'prefix': selected['prefix'],
+        'delta_seconds': best_delta,
+        'legacy_prefix': legacy_prefix,
+    }
+
+
 def _count_bin_files_recursive(base_dir):
     """Return recursive EMG/IMU bin counts for display."""
     emg_count = 0
@@ -528,21 +645,43 @@ class SyncWorker(QThread):
                 attr_name = f'sd_bin_dev{device_id}'
                 bin_prefix = f.attrs.get(attr_name, None)
 
-                if bin_prefix is None:
-                    return None, None
-
                 # 处理字节字符串
                 if isinstance(bin_prefix, bytes):
                     bin_prefix = bin_prefix.decode('utf-8')
 
-                # 在 bin_dir 及子目录中搜索
+                # one-to-one 校验路径可用 H5 会话时间修复过期的 bin 引用。
+                # 长 bin/关闭校验路径继续严格使用历史属性，避免改变旧模式的选源语义。
+                if self.sync_mode == 'one_to_one' and self.validate_data:
+                    exact_emg = (_find_named_file_recursive(
+                        self.bin_dir, f"{bin_prefix}_emg.bin") if bin_prefix else None)
+                    exact_imu = (_find_named_file_recursive(
+                        self.bin_dir, f"{bin_prefix}_imu.bin") if bin_prefix else None)
+                    emg_path, imu_path, resolution = _resolve_time_matched_bin_pair(
+                        self.bin_dir, h5_path, device_id, bin_prefix)
+                    if resolution.get('status') == 'time_matched_replacement':
+                        self.log.emit(
+                            f"    bin引用过期或缺失，按H5会话时间替换: "
+                            f"{bin_prefix or '-'} -> {resolution['prefix']} "
+                            f"(Δt={resolution['delta_seconds']:.1f}s)")
+                    elif resolution.get('status') == 'unresolved':
+                        if exact_emg:
+                            self.log.emit(
+                                f"    时间候选未决 ({resolution.get('reason', 'unknown')})，"
+                                "保留H5属性指定 bin，交由 ADC 校验")
+                            return exact_emg, exact_imu
+                        self.log.emit(
+                            f"    未找到可用的时间匹配 bin ({resolution.get('reason', 'unknown')})")
+                    return emg_path, imu_path
+
+                # 在 bin_dir 及子目录中搜索历史属性指定的文件
+                if bin_prefix is None:
+                    return None, None
                 emg_bin_name = f"{bin_prefix}_emg.bin"
                 imu_bin_name = f"{bin_prefix}_imu.bin"
-
-                emg_path = _find_named_file_recursive(self.bin_dir, emg_bin_name)
-                imu_path = _find_named_file_recursive(self.bin_dir, imu_bin_name)
-
-                return (emg_path, imu_path)
+                return (
+                    _find_named_file_recursive(self.bin_dir, emg_bin_name),
+                    _find_named_file_recursive(self.bin_dir, imu_bin_name),
+                )
 
         except Exception as e:
             self.log.emit(f"    读取H5属性失败: {str(e)}")
