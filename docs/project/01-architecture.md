@@ -1,5 +1,16 @@
 # 01 - 系统架构概览
 
+## 2026-10-07 维护基线
+
+本轮系统性审查与验收以 [系统审查](13-system-review.md) 为准。日常入口保持 `npm start` 与 `python tools/hdf5_tool.py`。
+
+- `lib/service-process.js` 统一子进程拥有权、真实就绪与退出等待；`pythonPath.js` 统一解释器选择。
+- `realtimeEngine.js` 负责采集生命周期与跨服务确认；`storage_server.py` 负责文件token、批次序号、写入及关闭栅栏。
+- 离线共享模块：`file_access.py` 管排他锁和副本提交，`alignment.py` 管计数器规则，`video_timeline.py` 管首尾帧时间映射。
+- 设备与存储故障进入明确失败状态；停止失败保留会话所有权，允许重试或明确保留为不完整采集。后台任务和消息队列均有边界。
+
+以下章节保留原模块背景；旧行号、规模统计和行为描述若与上述审查冲突，以当前源码与验收契约为准。
+
 ## 1. 项目概述
 
 sEMG Collection System 是一个**多模态生理信号采集系统**，支持同步采集表面肌电（sEMG）、惯性测量单元（IMU）、USB摄像头视频和动作捕捉（Mocap）数据。系统采用 **Electron + Node.js + Python** 混合架构，前端基于 Web 技术栈。

@@ -41,6 +41,10 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+try:
+    from video_timeline import VideoTimeline
+except ImportError:  # 作为独立脚本运行时的兼容路径
+    from tools.video_timeline import VideoTimeline
 
 
 # ============== EMG滤波参数（对齐供应商 wband_emg_V3）==============
@@ -139,6 +143,19 @@ class CalibrateWidget(QWidget):
         self.h5_path = None
         self.emg1_data = None
         self.emg2_data = None
+        # EMG remains lazy: keep HDF5 datasets and read only the visible
+        # window.  The legacy ``*_data`` attributes stay for callers that
+        # inspect them, but are intentionally left None for large files.
+        self.emg1_dataset = None
+        self.emg2_dataset = None
+        self.emg1_length = 0
+        self.emg2_length = 0
+        self.emg1_start_time = None
+        self.emg2_start_time = None
+        self.emg1_time_axis = None
+        self.emg2_time_axis = None
+        self.emg1_has_time = False
+        self.emg2_has_time = False
         self.imu1a_data = None
         self.imu1b_data = None
         self.imu1c_data = None
@@ -183,6 +200,7 @@ class CalibrateWidget(QWidget):
         self.video_last_frame_unix = {}   # {'left': unix_ts, 'right': unix_ts}
         self.video_duration = {}        # {'left': dur_sec, 'right': dur_sec}
         self.video_frame_count = {}     # {'left': n_frames, 'right': n_frames}
+        self.video_timelines = {}       # {'left': VideoTimeline, 'right': VideoTimeline}
         # 旧 AVI 的头部可能把 30fps 写成 600fps。OpenCV 对这类文件按帧号
         # 随机 seek 会落到错误位置，需要按校正后的时间轴并带预滚量定位。
         self.video_seek_preroll = {}    # {'left': n_frames, 'right': n_frames}
@@ -257,18 +275,19 @@ class CalibrateWidget(QWidget):
         self.init_ui()
 
     def _active_emg_sample_rate(self):
-        if self.emg1_data is not None and len(self.emg1_data) > 0 and self.emg1_sample_rate:
+        if self.emg1_length > 0 and self.emg1_sample_rate:
             return self.emg1_sample_rate
-        if self.emg2_data is not None and len(self.emg2_data) > 0 and self.emg2_sample_rate:
+        if self.emg2_length > 0 and self.emg2_sample_rate:
             return self.emg2_sample_rate
         return 2000
 
     def _relative_sensor_time(self, times):
         times = np.asarray(times, dtype=np.float64)
-        if self.emg_start_time is None or len(times) == 0:
+        reference = self._ref_time()
+        if reference is None or len(times) == 0:
             return times
-        if float(np.nanmedian(times)) > 1e6:
-            return times - float(self.emg_start_time)
+        if self._time_axis_is_absolute(times):
+            return times - float(reference)
         return times
 
     def init_ui(self):
@@ -861,8 +880,7 @@ class CalibrateWidget(QWidget):
             if self.is_full_playing:
                 self._stop_full_playback()
 
-            if self.h5_file:
-                self.h5_file.close()
+            self._release_loaded_file()
 
             self.h5_file = h5py.File(file_path, 'r')
             self.h5_path = file_path
@@ -898,8 +916,39 @@ class CalibrateWidget(QWidget):
             print(f'[CalibrateTool] 已加载文件: {file_path}')
 
         except Exception as e:
+            self._release_loaded_file()
+            self.lbl_file.setText('未加载文件')
+            self.slider.setMaximum(0)
+            self.lbl_total.setText('/ 0')
             QMessageBox.critical(self, '错误', f'加载文件失败:\n{str(e)}')
             print(f'[CalibrateTool] 加载失败: {e}')
+
+    def _release_loaded_file(self):
+        """Release resources even when loading stops halfway through a file."""
+        self.is_playing = self.is_full_playing = False
+        for timer in (self.playback_timer, self.full_playback_timer, self.update_timer):
+            timer.stop()
+        self.pending_update = False
+        self._close_videos()
+        if self.h5_file is not None:
+            try:
+                self.h5_file.close()
+            finally:
+                self.h5_file = None
+        self.h5_path = None
+        for dev in (1, 2):
+            for suffix in ('data', 'dataset', 'start_time', 'time_axis', 'loaded_name'):
+                setattr(self, f'emg{dev}_{suffix}', None)
+            setattr(self, f'emg{dev}_length', 0)
+            setattr(self, f'emg{dev}_has_time', False)
+            for sensor in ('a', 'b', 'c'):
+                for suffix in ('data', 'gyr_data', 'time'):
+                    setattr(self, f'imu{dev}{sensor}_{suffix}', None)
+        self.prompt_names = self.prompt_times = None
+        self.emg_start_time = self.session_start_unix = None
+        self.calib_offset.clear()
+        self.calib_present = False
+        self._update_playback_buttons(playing=False)
 
     def _load_status_attrs(self):
         """Phase 6: 读取并显示 H5 同步/采集状态 attrs"""
@@ -1045,6 +1094,16 @@ class CalibrateWidget(QWidget):
         """加载 EMG 数据：synced→优先2kHz，未同步→优先250Hz"""
         self.emg1_data = None
         self.emg2_data = None
+        self.emg1_dataset = None
+        self.emg2_dataset = None
+        self.emg1_length = 0
+        self.emg2_length = 0
+        self.emg1_start_time = None
+        self.emg2_start_time = None
+        self.emg1_time_axis = None
+        self.emg2_time_axis = None
+        self.emg1_has_time = False
+        self.emg2_has_time = False
         self.emg1_sample_rate = None
         self.emg2_sample_rate = None
         self.emg_start_time = None
@@ -1069,35 +1128,58 @@ class CalibrateWidget(QWidget):
             emg1_names = ['emg1_250hz_adc', 'emg1_250hz', 'emg1_2khz_adc', 'emg1_2khz', 'emg1']
             emg2_names = ['emg2_250hz_adc', 'emg2_250hz', 'emg2_2khz_adc', 'emg2_2khz', 'emg2']
 
+        for device in (1, 2):
+            names = emg1_names if device == 1 else emg2_names
+            if self.h5_file.attrs.get(f'sync_device_validation_dev{device}', False):
+                target = f'emg{device}_2khz_adc'
+                if target in names: names.insert(0, names.pop(names.index(target)))
+
         for name in emg1_names:
             if name in self.h5_file:
-                raw_data = self.h5_file[name][:]
-                if len(raw_data) == 0:
+                dataset = self.h5_file[name]
+                if len(dataset) == 0:
                     print(f'[CalibrateTool] 跳过空数据集 {name}')
                     continue
-                self.emg1_data = self._extract_emg_channels(raw_data)
+                self.emg1_dataset = dataset
+                self.emg1_length = int(len(dataset))
                 self.emg1_loaded_name = name
-                if raw_data.dtype.names is not None and 'time' in raw_data.dtype.names:
-                    self.emg_start_time = raw_data['time'][0]
+                names = dataset.dtype.names or ()
+                self.emg1_has_time = 'time' in names
+                if self.emg1_has_time:
+                    self.emg1_time_axis = np.asarray(
+                        dataset.fields('time')[:], dtype=np.float64)
+                    if not np.all(np.isfinite(self.emg1_time_axis)) or np.any(np.diff(self.emg1_time_axis) <= 0):
+                        raise ValueError('设备1时间列存在无效值、回退或重复，请先修复时间戳再预览')
+                    self.emg1_start_time = float(self.emg1_time_axis[0])
+                    self.emg_start_time = self.emg1_start_time
                 self.emg1_sample_rate = 250 if '250hz' in name else 2000
                 self.emg1_lsb_uv = self._get_lsb_uv_for_dataset(name)
-                print(f'[CalibrateTool] 已加载 {name}: shape={self.emg1_data.shape}, '
+                print(f'[CalibrateTool] 已加载 {name}: shape={dataset.shape}, '
                       f'rate={self.emg1_sample_rate}, lsb={self.emg1_lsb_uv:.6f}')
                 break
 
         for name in emg2_names:
             if name in self.h5_file:
-                raw_data = self.h5_file[name][:]
-                if len(raw_data) == 0:
+                dataset = self.h5_file[name]
+                if len(dataset) == 0:
                     print(f'[CalibrateTool] 跳过空数据集 {name}')
                     continue
-                self.emg2_data = self._extract_emg_channels(raw_data)
+                self.emg2_dataset = dataset
+                self.emg2_length = int(len(dataset))
                 self.emg2_loaded_name = name
-                if self.emg_start_time is None and raw_data.dtype.names is not None and 'time' in raw_data.dtype.names:
-                    self.emg_start_time = raw_data['time'][0]
+                names = dataset.dtype.names or ()
+                self.emg2_has_time = 'time' in names
+                if self.emg2_has_time:
+                    self.emg2_time_axis = np.asarray(
+                        dataset.fields('time')[:], dtype=np.float64)
+                    if not np.all(np.isfinite(self.emg2_time_axis)) or np.any(np.diff(self.emg2_time_axis) <= 0):
+                        raise ValueError('设备2时间列存在无效值、回退或重复，请先修复时间戳再预览')
+                    self.emg2_start_time = float(self.emg2_time_axis[0])
+                    if self.emg_start_time is None:
+                        self.emg_start_time = self.emg2_start_time
                 self.emg2_sample_rate = 250 if '250hz' in name else 2000
                 self.emg2_lsb_uv = self._get_lsb_uv_for_dataset(name)
-                print(f'[CalibrateTool] 已加载 {name}: shape={self.emg2_data.shape}, '
+                print(f'[CalibrateTool] 已加载 {name}: shape={dataset.shape}, '
                       f'rate={self.emg2_sample_rate}, lsb={self.emg2_lsb_uv:.6f}')
                 break
 
@@ -1156,6 +1238,116 @@ class CalibrateWidget(QWidget):
 
         # 普通数组
         return np.array(data)
+
+    def _emg_dataset_info(self, device):
+        """Return the lazy dataset metadata for device 1 or 2."""
+        prefix = f'emg{int(device)}'
+        return (
+            getattr(self, f'{prefix}_dataset', None),
+            int(getattr(self, f'{prefix}_length', 0) or 0),
+            int(getattr(self, f'{prefix}_sample_rate', None) or 2000),
+            getattr(self, f'{prefix}_start_time', None),
+            bool(getattr(self, f'{prefix}_has_time', False)),
+        )
+
+    def _emg_time_axis(self, device):
+        return getattr(self, f'emg{int(device)}_time_axis', None)
+
+    def _time_axis_is_absolute(self, axis):
+        if axis is None or len(axis) == 0:
+            return False
+        first = float(axis[0])
+        session = getattr(self, 'session_start_unix', None)
+        return abs(first) > 1e6 or (
+            session is not None and abs(first - float(session)) < 60.0)
+
+    def _read_emg_index_window(self, device, start, end):
+        """Read only a bounded structured EMG slice and return channels/time.
+
+        The viewer used to materialize every 16-channel sample during file
+        open.  HDF5 field slicing keeps the memory cost proportional to the
+        visible window and also works with plain (non-structured) datasets.
+        """
+        dataset, length, sample_rate, first_time, has_time = self._emg_dataset_info(device)
+        if dataset is None or length <= 0:
+            return np.empty((0, 16), dtype=np.float32), None
+        lo = max(0, int(start))
+        hi = min(length, max(lo, int(end)))
+        if hi <= lo:
+            return np.empty((0, 16), dtype=np.float32), None
+        names = dataset.dtype.names or ()
+        if 'channels' in names:
+            channels = np.asarray(dataset.fields('channels')[lo:hi])
+        elif names:
+            field = next((n for n in names if 'ch' in n.lower() or 'channel' in n.lower()), None)
+            channels = (np.asarray(dataset.fields(field)[lo:hi])
+                        if field else np.asarray(dataset[lo:hi]))
+        else:
+            channels = np.asarray(dataset[lo:hi])
+        if channels.ndim == 1:
+            channels = channels.reshape(-1, 1) if channels.dtype.names is None else np.asarray([list(row) for row in channels])
+        times = None
+        if has_time:
+            times = np.asarray(dataset.fields('time')[lo:hi], dtype=np.float64)
+        elif first_time is not None:
+            times = float(first_time) + np.arange(lo, hi, dtype=np.float64) / sample_rate
+        else:
+            times = np.arange(lo, hi, dtype=np.float64) / sample_rate
+        return channels, times
+
+    def _read_emg_time_window(self, device, rel_start, rel_end, padding_seconds=0.0):
+        """Read a device window by real time, using bounded searchsorted.
+
+        ``current_pos`` is on the primary device's sample grid; each device
+        gets its own sample-rate/start offset and its own H5 slice.  A small
+        guard region handles timestamp gaps and filtering edge padding.
+        """
+        dataset, length, sample_rate, first_time, has_time = self._emg_dataset_info(device)
+        if dataset is None or length <= 0:
+            return np.empty((0, 16), dtype=np.float32), np.empty(0, dtype=np.float64)
+        reference = self._ref_time()
+        reference = float(reference) if reference is not None else float(first_time or 0.0)
+        axis = self._emg_time_axis(device) if has_time else None
+        if axis is not None and len(axis):
+            absolute = self._time_axis_is_absolute(axis)
+            target_start = ((reference + float(rel_start) - float(padding_seconds))
+                            if absolute else
+                            (float(rel_start) - float(padding_seconds)))
+            target_end = ((reference + float(rel_end) + float(padding_seconds))
+                          if absolute else
+                          (float(rel_end) + float(padding_seconds)))
+            estimate_lo = int(np.searchsorted(axis, target_start, side='left'))
+            estimate_hi = int(np.searchsorted(axis, target_end, side='right'))
+            estimate_lo = max(0, min(length, estimate_lo))
+            estimate_hi = max(estimate_lo, min(length, estimate_hi))
+        else:
+            # No time field: index mapping is the only available contract.
+            if first_time is None:
+                first_time = 0.0
+            estimate_lo = int(np.floor((float(rel_start) - padding_seconds) * sample_rate)) - 4
+            estimate_hi = int(np.ceil((float(rel_end) + padding_seconds) * sample_rate)) + 5
+            estimate_lo = max(0, min(length, estimate_lo))
+            estimate_hi = max(estimate_lo, min(length, estimate_hi))
+        channels, raw_times = self._read_emg_index_window(device, estimate_lo, estimate_hi)
+        if len(channels) == 0:
+            return channels, np.empty(0, dtype=np.float64)
+        if not has_time:
+            rel_times = (np.asarray(raw_times, dtype=np.float64) -
+                         (reference if self._time_axis_is_absolute(
+                             np.asarray([first_time], dtype=np.float64)) else 0.0))
+        else:
+            rel_times = np.asarray(raw_times, dtype=np.float64) - (reference if absolute else 0.0)
+        # Ensure gaps are handled by actual timestamps.  A time field with no
+        # samples in the requested interval remains empty; index fallback is
+        # only used when the field does not exist.
+        if has_time:
+            left = int(np.searchsorted(rel_times, float(rel_start) - padding_seconds, side='left'))
+            right = int(np.searchsorted(rel_times, float(rel_end) + padding_seconds, side='right'))
+            if right <= left:
+                return channels[:0], rel_times[:0]
+            channels = channels[left:right]
+            rel_times = rel_times[left:right]
+        return channels, rel_times
 
     def load_imu_data(self):
         """加载IMU数据（支持 a/b/c、100hz/BLE/legacy、imu*_all_ble 拆分）"""
@@ -1691,7 +1883,17 @@ class CalibrateWidget(QWidget):
                 self.video_seek_preroll[side] = seek_preroll
                 self.video_first_frame_unix[side] = vt_first.get(side, 0)
                 self.video_last_frame_unix[side] = vt_last.get(side, 0)
-                self.video_duration[side] = vt_dur.get(side, frame_count / self.video_fps[side] if fps > 0 else 0)
+                self.video_duration[side] = vt_dur.get(
+                    side, (max(0, frame_count - 1) / self.video_fps[side]
+                           if fps > 0 else 0))
+                self.video_timelines[side] = VideoTimeline.from_timing(
+                    frame_count=frame_count,
+                    reported_fps=self.video_fps[side],
+                    first_time=self.video_first_frame_unix[side],
+                    last_time=(self.video_last_frame_unix[side]
+                               if self.video_last_frame_unix[side] > 0 else None),
+                    duration=self.video_duration[side],
+                )
                 self._video_current_idx[side] = -1
                 self._video_current_frame[side] = None
                 self.video_enabled = True
@@ -1701,8 +1903,9 @@ class CalibrateWidget(QWidget):
                 nominal_fps = self.video_fps[side]
                 first_u = self.video_first_frame_unix[side]
                 last_u = self.video_last_frame_unix[side]
-                actual_dur = last_u - first_u
-                effective_fps = frame_count / actual_dur if actual_dur > 0 else nominal_fps
+                timeline = self.video_timelines[side]
+                actual_dur = timeline.duration
+                effective_fps = timeline.effective_fps
                 vid_ref_offset = first_u - float(ref_time) if ref_time else 0
                 emg_offset = first_u - self.emg_start_time if self.emg_start_time else 0
 
@@ -1748,6 +1951,7 @@ class CalibrateWidget(QWidget):
         self.video_last_frame_unix.clear()
         self.video_duration.clear()
         self.video_frame_count.clear()
+        self.video_timelines.clear()
         self.video_seek_preroll.clear()
         self._video_current_frame.clear()
         self._video_current_idx.clear()
@@ -1816,28 +2020,25 @@ class CalibrateWidget(QWidget):
         if cap is None:
             return None, None
 
-        first_unix = self.video_first_frame_unix.get(side, 0)
-        last_unix = self.video_last_frame_unix.get(side, 0)
         total_frames = self.video_frame_count.get(side, 0)
 
         if total_frames <= 0:
             return None, None
 
-        # 使用视频自身 timing 计算实际帧率（而非 OpenCV 名义值）
-        video_duration = last_unix - first_unix
-        if video_duration > 0:
-            effective_fps = total_frames / video_duration
-        else:
-            effective_fps = self.video_fps.get(side, 30)
-
         # 应用精确对齐标定偏移量
         calib_offset = self.calib_offset.get(side, 0)
         corrected_unix = target_unix + calib_offset
 
-        # 从 Unix 时间戳映射到帧偏移（使用实际帧率消除漂移）
-        time_offset = corrected_unix - first_unix
-        frame_idx = int(round(time_offset * effective_fps))
-        frame_idx = max(0, min(frame_idx, total_frames - 1))
+        timeline = self.video_timelines.get(side)
+        if timeline is None:
+            timeline = VideoTimeline.from_timing(
+                total_frames, self.video_fps.get(side, 30.0),
+                self.video_first_frame_unix.get(side, 0.0),
+                self.video_last_frame_unix.get(side) or None,
+                self.video_duration.get(side, 0.0),
+            )
+        frame_idx = timeline.time_to_frame(corrected_unix)
+        effective_fps = timeline.effective_fps
 
         # 缓存检查：同一帧不需要重新 seek
         if frame_idx == self._video_current_idx.get(side, -1):
@@ -1930,21 +2131,25 @@ class CalibrateWidget(QWidget):
                                            Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 lbl.setPixmap(QPixmap.fromImage(scaled))
 
-                # 更新时间标签（视频帧号 + 视频时间 + EMG相对时间）
-                # 使用实际帧率，与 _seek_video_frame 对齐
-                first_u = self.video_first_frame_unix.get(side, 0)
-                last_u = self.video_last_frame_unix.get(side, 0)
-                total_f = self.video_frame_count.get(side, 1)
-                actual_dur = last_u - first_u
-                eff_fps = total_f / actual_dur if actual_dur > 0 else self.video_fps.get(side, 30)
-                frame_time_sec = frame_idx / eff_fps if eff_fps > 0 else 0
+                # 更新时间标签，时间轴与寻帧共用同一个端点映射。
+                timeline = self.video_timelines.get(side)
+                if timeline is None:
+                    timeline = VideoTimeline.from_timing(
+                        self.video_frame_count.get(side, 0), self.video_fps.get(side, 30),
+                        self.video_first_frame_unix.get(side, 0),
+                        self.video_last_frame_unix.get(side) or None,
+                        self.video_duration.get(side, 0),
+                    )
+                frame_unix = timeline.frame_to_time(frame_idx)
+                eff_fps = timeline.effective_fps
+                frame_time_sec = max(0.0, frame_unix - timeline.first_time)
                 minutes = int(frame_time_sec // 60)
                 seconds = int(frame_time_sec % 60)
                 ms = int((frame_time_sec % 1) * 100)
                 # EMG 相对时间（与 Prompt 时间戳对齐，含标定偏移）
                 if self.emg_start_time is not None:
                     calib = self.calib_offset.get(side, 0)
-                    emg_rel = first_u + frame_idx / eff_fps - float(self.emg_start_time) - calib
+                    emg_rel = frame_unix - float(self._ref_time()) - calib
                     if abs(calib) > 0.001:
                         lbl_time.setText(f'Frame #{frame_idx} | 视频 {minutes:02d}:{seconds:02d}.{ms:02d} | EMG {emg_rel:.2f}s | 标定{calib:+.3f}s')
                     else:
@@ -1968,14 +2173,13 @@ class CalibrateWidget(QWidget):
         self.imu_ylim = None
 
         # 计算EMG1的范围
-        if self.emg1_data is not None and len(self.emg1_data) > 0:
-            data_uv = self.emg1_data * lsb_uv_1
-            # 对滤波后的数据计算范围（采样部分数据以提高速度）
-            sample_size = min(len(data_uv), 50000)
-            sample_indices = np.linspace(0, len(data_uv)-1, sample_size, dtype=int)
-            sampled_data = data_uv[sample_indices]
+        if self.emg1_length > 0:
+            sample_size = min(self.emg1_length, 50000)
+            sampled_data, _ = self._read_emg_index_window(1, 0, sample_size)
+            data_uv = sampled_data * lsb_uv_1
             try:
-                filtered = self.emg_filter_2k.filter(sampled_data)
+                filt = self.emg_filter_2k if self.emg1_sample_rate == 2000 else self.emg_filter_250
+                filtered = filt.filter(data_uv)
                 ymin, ymax = np.min(filtered), np.max(filtered)
                 margin = (ymax - ymin) * 0.1
                 self.emg1_ylim = (ymin - margin, ymax + margin)
@@ -1984,13 +2188,13 @@ class CalibrateWidget(QWidget):
             print(f'[CalibrateTool] EMG1 Y轴范围: {self.emg1_ylim}')
 
         # 计算EMG2的范围
-        if self.emg2_data is not None and len(self.emg2_data) > 0:
-            data_uv = self.emg2_data * lsb_uv_2
-            sample_size = min(len(data_uv), 50000)
-            sample_indices = np.linspace(0, len(data_uv)-1, sample_size, dtype=int)
-            sampled_data = data_uv[sample_indices]
+        if self.emg2_length > 0:
+            sample_size = min(self.emg2_length, 50000)
+            sampled_data, _ = self._read_emg_index_window(2, 0, sample_size)
+            data_uv = sampled_data * lsb_uv_2
             try:
-                filtered = self.emg_filter_2k.filter(sampled_data)
+                filt = self.emg_filter_2k if self.emg2_sample_rate == 2000 else self.emg_filter_250
+                filtered = filt.filter(data_uv)
                 ymin, ymax = np.min(filtered), np.max(filtered)
                 margin = (ymax - ymin) * 0.1
                 self.emg2_ylim = (ymin - margin, ymax + margin)
@@ -2017,14 +2221,12 @@ class CalibrateWidget(QWidget):
 
     def get_max_data_length(self):
         """获取最大数据长度"""
-        lengths = []
-        if self.emg1_data is not None and len(self.emg1_data) > 0:
-            lengths.append(len(self.emg1_data))
-            print(f'[CalibrateTool] EMG1数据长度: {len(self.emg1_data)}')
-        if self.emg2_data is not None and len(self.emg2_data) > 0:
-            lengths.append(len(self.emg2_data))
-            print(f'[CalibrateTool] EMG2数据长度: {len(self.emg2_data)}')
-        result = max(lengths) if lengths else 0
+        _, primary_rate, origin, end = self._emg_session_bounds()
+        result = max(1, int(np.ceil((end - origin) * primary_rate)) + 1) if end is not None else 0
+        if self.emg1_length > 0:
+            print(f'[CalibrateTool] EMG1数据长度: {self.emg1_length}')
+        if self.emg2_length > 0:
+            print(f'[CalibrateTool] EMG2数据长度: {self.emg2_length}')
         print(f'[CalibrateTool] 最大数据长度: {result}')
         return result
 
@@ -2065,6 +2267,38 @@ class CalibrateWidget(QWidget):
         self.slider.setMaximum(max(0, max_len - self.window_size))
         self.update_timer.start(40)
 
+    def _display_time_window(self):
+        """Return the visible interval in the shared session-relative clock."""
+        _, rate, origin, _ = self._emg_session_bounds()
+        rel_start = origin + self.current_pos / float(rate)
+        return rel_start, rel_start + self.window_size / float(rate)
+
+    def _emg_session_bounds(self):
+        """Return primary rate and min/max real time across both EMG devices."""
+        entries = []
+        reference = self._ref_time()
+        reference = float(reference) if reference is not None else 0.0
+        for device in (1, 2):
+            dataset, length, rate, first_time, has_time = self._emg_dataset_info(device)
+            if dataset is None or length <= 0:
+                continue
+            axis = self._emg_time_axis(device) if has_time else None
+            if axis is not None and len(axis):
+                absolute = self._time_axis_is_absolute(axis)
+                first = float(axis[0]) - reference if absolute else float(axis[0])
+                last = float(axis[-1]) - reference if absolute else float(axis[-1])
+            else:
+                first = ((float(first_time) - reference)
+                         if first_time is not None else 0.0)
+                last = first + max(0, length - 1) / float(rate)
+            entries.append((rate, first, last))
+        if not entries:
+            return 0, 2000, 0.0, 0.0
+        primary_rate = int(entries[0][0])
+        origin = min(item[1] for item in entries)
+        end = max(item[2] for item in entries)
+        return 0, primary_rate, origin, end
+
     def update_plots(self):
         """更新所有图表"""
         # 没有打开文件时不绘制
@@ -2075,11 +2309,9 @@ class CalibrateWidget(QWidget):
         self.update_imu_plot(fast_mode)
 
         # 视频帧同步更新
-        if self.video_enabled and self.emg_start_time is not None:
-            sample_rate = self._active_emg_sample_rate()
-            # 取窗口中间位置的时间
-            window_center_offset = (self.current_pos + self.window_size / 2) / sample_rate
-            target_unix = float(self.emg_start_time) + window_center_offset
+        if self.video_enabled and self._ref_time() is not None:
+            time_start, time_end = self._display_time_window()
+            target_unix = float(self._ref_time()) + (time_start + time_end) / 2.0
             self._update_video_frames(target_unix)
 
     def _downsample_for_plot(self, data, max_points):
@@ -2105,27 +2337,20 @@ class CalibrateWidget(QWidget):
         if ax1: ax1.clear()
         if ax2: ax2.clear()
 
-        start = self.current_pos
-        end = start + self.window_size
-        sample_rate = self._active_emg_sample_rate()
-        time_start = start / sample_rate
-        time_end = end / sample_rate
+        time_start, time_end = self._display_time_window()
         use_filter = self.chk_filter.isChecked() and not fast_mode
-        filter_padding = 0 if not use_filter else min(1000, max(50, int(sample_rate * 0.25)))
         max_plot_points = self.max_plot_points_fast if fast_mode else self.max_plot_points_normal
         colors = plt.cm.tab20(np.linspace(0, 1, 16))
         offset = self.offset_uv
         clip_limit = offset * 0.48  # 供应商 clamp 阈值
 
-        def _draw_device(ax, data, lsb, label, invert_channels=False):
-            if ax is None or data is None or len(data) == 0:
+        def _draw_device(ax, device, lsb, label, invert_channels=False):
+            if ax is None or self._emg_dataset_info(device)[1] <= 0:
                 return
-            if use_filter:
-                pad_start = max(0, start - filter_padding)
-                pad_end = min(len(data), end + filter_padding)
-                region = data[pad_start:pad_end]
-            else:
-                region = data[start:end]
+            _, _, sample_rate, _, _ = self._emg_dataset_info(device)
+            filter_padding = 0 if not use_filter else min(0.5, max(0.05, 0.25))
+            region, region_times = self._read_emg_time_window(
+                device, time_start, time_end, filter_padding)
             if len(region) == 0:
                 return
             data_uv = region.astype(np.float64) * lsb
@@ -2135,12 +2360,15 @@ class CalibrateWidget(QWidget):
                     data_uv = filt.filter(data_uv)
                 except Exception as e:
                     print(f'[CalibrateTool] {label} 滤波失败: {e}')
-            if use_filter and filter_padding > 0:
-                actual_start = start - (start - filter_padding if start >= filter_padding else start)
-                actual_end = actual_start + (end - start)
-                data_uv = data_uv[actual_start:actual_end]
+            if filter_padding > 0 and len(region_times) > 0:
+                left = np.searchsorted(region_times, time_start, side='left')
+                right = np.searchsorted(region_times, time_end, side='right')
+                data_uv = data_uv[left:right]
+                region_times = region_times[left:right]
             data_uv, step = self._downsample_for_plot(data_uv, max_plot_points)
-            x = np.linspace(time_start, time_start + len(data_uv) * step / sample_rate, len(data_uv))
+            x = region_times[::step][:len(data_uv)] if len(region_times) else np.empty(0)
+            if len(x) != len(data_uv):
+                x = np.linspace(time_start, time_end, len(data_uv)) if len(data_uv) else x
             num_ch = min(16, data_uv.shape[1] if data_uv.ndim > 1 else 1)
             ch_order = range(num_ch - 1, -1, -1) if invert_channels else range(num_ch)
             for i, ch in enumerate(ch_order):
@@ -2168,8 +2396,8 @@ class CalibrateWidget(QWidget):
             ax.set_title(f'{label} — {title_suffix} (Offset={offset}uV)', fontsize=10, pad=5)
             self.draw_prompt_markers(ax, time_start, time_end, show_text=True)
 
-        _draw_device(ax1, self.emg1_data, self.emg1_lsb_uv, '左手 EMG')
-        _draw_device(ax2, self.emg2_data, self.emg2_lsb_uv, '右手 EMG')
+        _draw_device(ax1, 1, self.emg1_lsb_uv, '左手 EMG')
+        _draw_device(ax2, 2, self.emg2_lsb_uv, '右手 EMG')
         self.canvas_emg.draw_idle()
 
     def _draw_emg_subplots(self, fast_mode=False):
@@ -2183,19 +2411,17 @@ class CalibrateWidget(QWidget):
         lsb_uv_1 = getattr(self, 'emg1_lsb_uv', calculate_lsb_uv())
         lsb_uv_2 = getattr(self, 'emg2_lsb_uv', calculate_lsb_uv())
         use_filter = self.chk_filter.isChecked() and not fast_mode
-        sample_rate = self._active_emg_sample_rate()
-        time_start = start / sample_rate
-        time_end = end / sample_rate
-        filter_padding = 0 if not use_filter else min(1000, max(50, int(sample_rate * 0.25)))
+        time_start, time_end = self._display_time_window()
         max_plot_points = self.max_plot_points_fast if fast_mode else self.max_plot_points_normal
         colors = plt.cm.tab20(np.linspace(0, 1, 16))
 
-        def _draw_channels(data, axes_list, lsb):
-            if data is None or len(data) == 0:
+        def _draw_channels(device, axes_list, lsb):
+            if self._emg_dataset_info(device)[1] <= 0:
                 return
-            pad_start = max(0, start - filter_padding)
-            pad_end = min(len(data), end + filter_padding)
-            data_padded = data[pad_start:pad_end]
+            _, _, sample_rate, _, _ = self._emg_dataset_info(device)
+            filter_padding = 0 if not use_filter else 0.25
+            data_padded, times_padded = self._read_emg_time_window(
+                device, time_start, time_end, filter_padding)
             if len(data_padded) == 0:
                 return
             data_uv_padded = data_padded * lsb
@@ -2205,11 +2431,14 @@ class CalibrateWidget(QWidget):
                     data_uv_padded = filt.filter(data_uv_padded)
                 except Exception as e:
                     print(f'[CalibrateTool] 滤波失败: {e}')
-            actual_start = start - pad_start
-            actual_end = actual_start + (end - start)
-            data_uv = data_uv_padded[actual_start:actual_end]
+            left = np.searchsorted(times_padded, time_start, side='left')
+            right = np.searchsorted(times_padded, time_end, side='right')
+            data_uv = data_uv_padded[left:right]
+            times = times_padded[left:right]
             data_uv, step = self._downsample_for_plot(data_uv, max_plot_points)
-            x = np.linspace(time_start, time_start + len(data_uv) * step / sample_rate, len(data_uv))
+            x = times[::step][:len(data_uv)] if len(times) else np.empty(0)
+            if len(x) != len(data_uv):
+                x = np.linspace(time_start, time_end, len(data_uv)) if len(data_uv) else x
             num_channels = min(16, data_uv.shape[1] if data_uv.ndim > 1 else 1)
             for ch in range(num_channels):
                 ax = axes_list[ch]
@@ -2218,8 +2447,8 @@ class CalibrateWidget(QWidget):
                 else:
                     ax.plot(x, data_uv, color=colors[0], linewidth=0.5)
 
-        _draw_channels(self.emg1_data, self.ax_emg1_channels, lsb_uv_1)
-        _draw_channels(self.emg2_data, self.ax_emg2_channels, lsb_uv_2)
+        _draw_channels(1, self.ax_emg1_channels, lsb_uv_1)
+        _draw_channels(2, self.ax_emg2_channels, lsb_uv_2)
 
         # 设置每个通道的属性
         for i in range(16):
@@ -2272,9 +2501,8 @@ class CalibrateWidget(QWidget):
 
         start = self.current_pos
         emg_sample_rate = self._active_emg_sample_rate()
-        # 显示窗口的绝对时间范围（秒，相对于 EMG 起始）
-        time_start = start / emg_sample_rate
-        time_end = time_start + self.window_size / emg_sample_rate
+        # 显示窗口使用统一会话相对时间；EMG1/EMG2 可有不同采样率和起点。
+        time_start, time_end = self._display_time_window()
         max_plot_points = self.max_plot_points_fast if fast_mode else self.max_plot_points_normal
         imu_sample_rate = 100  # IMU 默认采样率，用于 fallback 时的索引映射
 
@@ -2311,10 +2539,11 @@ class CalibrateWidget(QWidget):
                 indices = np.where(mask)[0]
                 if len(indices) > 0:
                     return indices, imu_time[indices]
-                # 时间字段存在但窗口内无数据 —— 可能是时间未对齐，用 fallback
-            # fallback: 无 time 字段或时间不匹配时，用采样率比例映射
-            imu_start = int(start * imu_sample_rate / emg_sample_rate)
-            imu_end = int((start + self.window_size) * imu_sample_rate / emg_sample_rate)
+                # 有真实时间但窗口为空时保持空，避免把不相邻的数据误画进来。
+                return np.empty(0, dtype=int), np.empty(0, dtype=np.float64)
+            # 只有没有 time 字段时才按采样率比例映射。
+            imu_start = int(time_start * imu_sample_rate)
+            imu_end = int(time_end * imu_sample_rate)
             imu_start = max(0, imu_start)
             imu_end = max(imu_start + 1, imu_end)
             indices = np.arange(imu_start, imu_end)
@@ -2583,7 +2812,8 @@ class CalibrateWidget(QWidget):
 
         # 转换为采样点位置
         sample_rate = self._active_emg_sample_rate()
-        sample_pos = int(prompt_time * sample_rate)
+        _, _, origin, _ = self._emg_session_bounds()
+        sample_pos = int((float(prompt_time) - origin) * sample_rate)
 
         # 将 prompt 放在窗口正中间，视频帧时间与 prompt 时间戳对齐
         target_pos = sample_pos - self.window_size // 2
@@ -2638,24 +2868,18 @@ class CalibrateWidget(QWidget):
         # 直接根据当前数据窗口重新计算起播帧，避免 Prompt/滑块刚跳转时
         # 40ms 防抖刷新尚未执行，误用上一次缓存的视频帧。
         current_idx = self._video_current_idx.get(side, -1)
-        if self.emg_start_time is not None:
-            sample_rate = self._active_emg_sample_rate()
-            window_center_offset = (self.current_pos + self.window_size / 2) / sample_rate
-            target_unix = float(self.emg_start_time) + window_center_offset
+        if self._ref_time() is not None:
+            time_start, time_end = self._display_time_window()
+            target_unix = float(self._ref_time()) + (time_start + time_end) / 2.0
             resolved_idx, _ = self._seek_video_frame(side, target_unix)
             if resolved_idx is not None:
                 current_idx = resolved_idx
         if current_idx < 0:
             return
-        first_u = self.video_first_frame_unix.get(side, 0)
-        last_u = self.video_last_frame_unix.get(side, 0)
         total_frames = self.video_frame_count.get(side, 0)
-        actual_duration = last_u - first_u
-        effective_fps = (
-            total_frames / actual_duration
-            if total_frames > 0 and actual_duration > 0
-            else self.video_fps.get(side, 30.0)
-        )
+        timeline = self.video_timelines.get(side)
+        effective_fps = (timeline.effective_fps if timeline is not None
+                         else self.video_fps.get(side, 30.0))
         self._position_video_capture(side, current_idx, effective_fps)
         # 读取当前帧以校准顺序解码位置，下一次 read() 将得到 current_idx + 1。
         seek_ok, _ = cap.read()
@@ -2770,21 +2994,23 @@ class CalibrateWidget(QWidget):
         lbl_size = lbl.size()
         scaled = qimage.scaled(lbl_size, Qt.KeepAspectRatio, Qt.FastTransformation)
         lbl.setPixmap(QPixmap.fromImage(scaled))
-        fps = self.video_fps.get(side, 30.0)
-        # 使用实际帧率计算视频帧的 Unix 时间（与 _seek_video_frame 对齐）
-        first_u = self.video_first_frame_unix.get(side, 0)
-        last_u = self.video_last_frame_unix.get(side, 0)
-        total_f = self.video_frame_count.get(side, 1)
-        actual_dur = last_u - first_u
-        eff_fps = total_f / actual_dur if actual_dur > 0 else fps
-        frame_time_sec = new_idx / eff_fps if eff_fps > 0 else 0
-        target_unix = first_u + frame_time_sec  # 使用有效 FPS 计算目标时间
+        timeline = self.video_timelines.get(side)
+        if timeline is None:
+            timeline = VideoTimeline.from_timing(
+                self.video_frame_count.get(side, 0), self.video_fps.get(side, 30),
+                self.video_first_frame_unix.get(side, 0),
+                self.video_last_frame_unix.get(side) or None,
+                self.video_duration.get(side, 0),
+            )
+        fps = timeline.effective_fps
+        target_unix = timeline.frame_to_time(new_idx)
+        frame_time_sec = max(0.0, target_unix - timeline.first_time)
         minutes = int(frame_time_sec // 60)
         seconds = int(frame_time_sec % 60)
         # EMG 相对时间（与 Prompt 时间戳对齐，含标定偏移）
         if self.emg_start_time is not None:
             calib = self.calib_offset.get(side, 0)
-            emg_rel = target_unix - float(self.emg_start_time) - calib
+            emg_rel = target_unix - float(self._ref_time()) - calib
             if abs(calib) > 0.001:
                 lbl_time.setText(f'Frame #{new_idx} | 视频 {minutes:02d}:{seconds:02d} | EMG {emg_rel:.2f}s | 标定{calib:+.3f}s')
             else:
@@ -2857,11 +3083,9 @@ class CalibrateWidget(QWidget):
         for side in ('left', 'right'):
             if side not in self.video_caps:
                 continue
-            first = self.video_first_frame_unix.get(side, 0)
-            last = self.video_last_frame_unix.get(side, 0)
-            total = self.video_frame_count.get(side, 0)
-            if total > 1 and last > first:
-                efps = total / (last - first)
+            timeline = self.video_timelines.get(side)
+            if timeline is not None and timeline.frame_count > 1:
+                efps = timeline.effective_fps
                 if fps == 30.0 or efps < fps:
                     fps = efps
         return max(1, int(sr / fps))

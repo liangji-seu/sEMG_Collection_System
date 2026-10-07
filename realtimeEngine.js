@@ -4,13 +4,7 @@
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const zmq = require('zeromq');
-const express = require('express');
-const cors = require('cors');
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-const { discrete_gesture_prompt_name, collection_task_name } = require('./constants.js');
+const { collection_task_name } = require('./constants.js');
 
 const DEFAULT_EMG_GAIN = 1;
 const DEFAULT_EMG_GAIN_INDEX = 0;
@@ -76,6 +70,7 @@ class RealtimeEngine extends EventEmitter {
         // Storage Server
         this.storage_server_socket = new zmq.Request();  // REP socket 用于控制命令
         this.storage_push_socket = new zmq.Push();       // 【新增】PUSH socket 用于数据发送
+        this._configureStorageSockets();
         this.storage_server_host = '127.0.0.1';
         this.storage_server_port = 5555;
         this.storage_data_port = 5556;                   // 【新增】数据端口
@@ -84,6 +79,18 @@ class RealtimeEngine extends EventEmitter {
         this.storageRequestQueue = [];
         this.isStorageRequestPending = false;
         this.h5StorageWarningShown = false;
+        // PUSH sends are serialized so close can establish a precise data
+        // boundary even though control and data use different ZeroMQ sockets.
+        this.storagePushSendChain = Promise.resolve();
+        this.storageDataSequence = 0;
+        this.storageDataLastSentSequence = 0;
+        this.storageDataSendError = null;
+        this.storageFileToken = null;
+        this.collectionCommandChain = Promise.resolve();
+        this.collectionState = 'idle';
+        this.previewDroppedPackets = 0;
+        this.previewByteLimit = 1024 * 1024;
+        this.storagePushPendingCount = 0;
 
         // 采集状态
         this.currentTaskId = null;
@@ -97,6 +104,7 @@ class RealtimeEngine extends EventEmitter {
         this.currentStageName = null;
         this.stageFileOpen = false;
         this.stageFileOpening = false;
+        this.stageFileOpenPromise = null;
         this.stageFileCreateFailed = false;
         this.stage_start_time = 0;
         this.currentStageNeedMocap = false;  // 【新增】当前stage是否需要动捕数据
@@ -138,20 +146,10 @@ class RealtimeEngine extends EventEmitter {
     start(port = 8080) {
         return new Promise((resolve, reject) => {
             try {
-                // 延迟连接BLE服务器，等待ble_server启动完成（包括蓝牙适配器预热）
-                this.connectTimeoutTimer = setTimeout(() => {
-                    this.ble_server_connect();
-                }, 5000);  // 从3秒改为5秒，给ble_server更多启动时间
-
-                // 【新增】延迟连接Mocap服务器
-                setTimeout(() => {
-                    this.mocap_server_connect();
-                }, 5500);
-
-                // 【新增】延迟连接Camera服务器
-                setTimeout(() => {
-                    this.camera_server_connect();
-                }, 6000);
+                this.stopping = false;
+                this.connectTimeoutTimer = setTimeout(() => this.ble_server_connect(), 0);
+                this.mocapConnectTimeoutTimer = setTimeout(() => this.mocap_server_connect(), 0);
+                this.cameraConnectTimeoutTimer = setTimeout(() => this.camera_server_connect(), 0);
 
                 this.websocket_server = new WebSocket.Server({ port });
 
@@ -213,92 +211,74 @@ class RealtimeEngine extends EventEmitter {
         });
     }
 
-    async handleFrontendMessage(rawMessage, ws) {
-        let message = null;
-        try {
-            message = JSON.parse(rawMessage.toString());
-
-            // 【新增】处理客户端自报身份
-            if (message.type === 'client_identify') {
-                if (ws && message.clientName) {
-                    ws.clientName = message.clientName;
-                    console.log(`[realtimeEngine] 客户端 #${ws.clientId} 自报身份: ${message.clientName}`);
-                }
-                return;
-            }
-
-            if (message.type !== 'control_command') return;
-
+    handleFrontendMessage(rawMessage, ws) {
+        let message;
+        try { message = JSON.parse(rawMessage.toString()); }
+        catch (error) { return Promise.resolve(); }
+        if (message.type === 'client_identify') {
+            if (ws && message.clientName) ws.clientName = message.clientName;
+            return Promise.resolve();
+        }
+        if (message.type !== 'control_command') return Promise.resolve();
+        const execute = async () => {
             const { action, data = {}, commandId } = message;
-            // 【修改】打印时包含客户端信息
-            const clientInfo = ws ? `(来自: ${ws.clientName})` : '';
-            console.log(`[realtimeEngine] <<< 收到前端命令: ${action} ${clientInfo}`, data);
-
-            if (action === 'collection_stop_and_wait') {
-                const result = await this.onCollectionStop(data.completed);
-                if (result?.h5_close?.status && result.h5_close.status !== 'success') {
-                    throw new Error(result.h5_close.msg || result.h5_close.error || 'H5 close failed');
+            try {
+                let result;
+                switch (action) {
+                    case 'task_change': result = this.onTaskChange(data.taskId); break;
+                    case 'collection_start': result = await this.onCollectionStart(data); break;
+                    case 'collection_pause': result = this.onCollectionPause(); break;
+                    case 'collection_resume': result = this.onCollectionResume(); break;
+                    case 'collection_stop':
+                    case 'collection_stop_and_wait': result = await this.onCollectionStop(data.completed); break;
+                    case 'finalize_incomplete': result = await this.finalizeIncomplete(data); break;
+                    case 'session_change': result = this.onSessionChange(data.sessionIndex, data.sessionNumber); break;
+                    case 'stage_change': result = this.onStageChange(data.stageIndex, data.stageName); break;
+                    case 'stage_start': result = await this.onStageStart(data.stageName, data.stageIndex, data.timestamp, data.needMocap); break;
+                    case 'stage_end': result = await this.onStageEnd(data.stageName, data.timestamp); break;
+                    case 'prompt_start': result = this.onPromptStart(data.promptName, data.promptIndex); break;
+                    case 'prompt_end': result = this.onPromptEnd(data.promptName, data.promptIndex); break;
+                    case 'prompt': result = this.onPrompt(data.name, data.stageName, data.timestamp); break;
+                    case 'video_recording_started': result = this.onVideoRecordingStarted(data); break;
+                    case 'abnormal_interrupt_freeze': result = this.onAbnormalInterruptFreeze(data); break;
+                    case 'abnormal_interrupt': result = await this.onAbnormalInterrupt(data); break;
+                    case 'camera_set_config': result = await this.onCameraSetConfig(data); break;
+                    case 'mocap_set_channel': result = this.onMocapSetChannel(data.channel); break;
+                    case 'mocap_reset_channel': result = this.onMocapResetChannel(data.channel, data.value); break;
+                    case 'mocap_get_status': result = this.onMocapGetStatus(); break;
+                    case 'mocap_set_save': this.saveMocapData = data.save === true; break;
+                    case 'mocap_sdk_connect': result = this.onMocapSdkConnect(); break;
+                    case 'mocap_sdk_disconnect': result = this.onMocapSdkDisconnect(); break;
+                    case 'mocap_sdk_get_status': result = this.onMocapSdkGetStatus(); break;
+                    default: throw new Error(`未知命令: ${action}`);
                 }
-                if (commandId && ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({
-                        type: 'control_response',
-                        commandId,
-                        action,
-                        status: 'success',
-                        result,
-                        timestamp: Date.now()
-                    }));
-                }
-                return;
+                if (result?.status === 'error') throw new Error(result.msg || result.h5_close?.msg || '采集命令失败');
+                this._sendControlResponse(ws, { commandId, action, status: 'success', result });
+                return result;
+            } catch (error) {
+                console.error(`[realtimeEngine] 命令失败 (${action}):`, error);
+                this._sendControlResponse(ws, { commandId, action, status: 'error', error: error.message });
+                return { status: 'error', msg: error.message };
             }
+        };
+        // Freeze must interrupt data admission even while a slow camera/storage
+        // operation is ahead of us. All other commands share one global order.
+        if (message.action === 'abnormal_interrupt_freeze') return execute();
+        const pending = this.collectionCommandChain.then(execute, execute);
+        this.collectionCommandChain = pending.catch(() => {});
+        return pending;
+    }
 
-            switch (action) {
-                case 'task_change': this.onTaskChange(data.taskId); break;
-                case 'collection_start': this.onCollectionStart(data); break;
-                case 'collection_pause': this.onCollectionPause(); break;
-                case 'collection_resume': this.onCollectionResume(); break;
-                case 'collection_stop': this.onCollectionStop(data.completed); break;
-                case 'session_change': this.onSessionChange(data.sessionIndex, data.sessionNumber); break;
-                case 'stage_change': this.onStageChange(data.stageIndex, data.stageName); break;
-                case 'stage_start': this.onStageStart(data.stageName, data.stageIndex, data.timestamp, data.needMocap); break;
-                case 'stage_end': this.onStageEnd(data.stageName, data.timestamp); break;
-                case 'prompt_start': this.onPromptStart(data.promptName, data.promptIndex); break;
-                case 'prompt_end': this.onPromptEnd(data.promptName, data.promptIndex); break;
-                case 'prompt': this.onPrompt(data.name, data.stageName, data.timestamp); break;
-                case 'video_recording_started': this.onVideoRecordingStarted(data); break; // 【新增】处理视频录制信息
-                case 'abnormal_interrupt_freeze': this.onAbnormalInterruptFreeze(data); break;
-                case 'abnormal_interrupt': this.onAbnormalInterrupt(data); break;
-
-                // 【新增】Camera命令
-                case 'camera_set_config': this.onCameraSetConfig(data); break;
-
-                // 【新增】Mocap命令
-                case 'mocap_set_channel': this.onMocapSetChannel(data.channel); break;
-                case 'mocap_reset_channel': this.onMocapResetChannel(data.channel, data.value); break;
-                case 'mocap_get_status': this.onMocapGetStatus(); break;
-                case 'mocap_set_save':
-                    this.saveMocapData = data.save === true;
-                    console.log(`[realtimeEngine] 动捕数据存储: ${this.saveMocapData ? '开启' : '关闭'}`);
-                    break;
-                case 'mocap_sdk_connect': this.onMocapSdkConnect(); break;
-                case 'mocap_sdk_disconnect': this.onMocapSdkDisconnect(); break;
-                case 'mocap_sdk_get_status': this.onMocapSdkGetStatus(); break;
-
-                default: console.log(`[realtimeEngine] 未知命令: ${action}`);
-            }
-
+    _sendControlResponse(ws, response) {
+        if (!response.commandId || !ws) return;
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try {
+            ws.send(JSON.stringify({ type: 'control_response', ...response, timestamp: Date.now() }), error => {
+                if (error) { console.error('[realtimeEngine] 控制应答发送失败:', error); ws.terminate?.(); }
+            });
         } catch (error) {
-            console.error('[realtimeEngine] 解析前端消息失败:', error);
-            if (message?.commandId && ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'control_response',
-                    commandId: message.commandId,
-                    action: message.action || null,
-                    status: 'error',
-                    error: error.message,
-                    timestamp: Date.now()
-                }));
-            }
+            console.error('[realtimeEngine] 控制应答发送失败:', error);
+            ws.terminate?.();
         }
     }
 
@@ -323,14 +303,23 @@ class RealtimeEngine extends EventEmitter {
 
     async onCollectionStart(data) {
         console.log(`[realtimeEngine] ========== 开始采集会话 ==========`);
+        if (this.isCollecting || this.collectionState === 'starting' || this.stageFileOpen || this.stageFileOpening || this.isClosingStageFile ||
+            this.stageFileOpenPromise || this.stageFileCreateFailed || this.storageDataSendError) {
+            throw new Error('上一Stage仍未安全收尾，拒绝开始新的collection');
+        }
         const { taskId, stageName, userId, config, sessionIndex, sessionNumber, sessionCount, isTestMode, recordingSessionId, isMultiSession } = data;
         const effectiveTaskId = taskId || config?.task_id || this.currentTaskId || 'discrete_gesture';
 
         this.currentTaskId = effectiveTaskId;
         this.currentUser = { id: userId, ...config?.subject };
         this.collectionConfig = config ? { ...config, task_id: effectiveTaskId } : { task_id: effectiveTaskId };
+        this.collectionState = 'starting';
         this.isCollecting = true;
         this.collectionPaused = false;
+        this.abortFreezeActive = false;
+        this.storageFileToken = null;
+        this.videoStopResults = {};
+        this.videoStopOperationId = `video_stop_${Date.now()}_${Math.random().toString(36).slice(2)}`;
         this.h5StorageWarningShown = false;
         this.stageFileOpening = false;
         this.stageFileCreateFailed = false;
@@ -346,31 +335,6 @@ class RealtimeEngine extends EventEmitter {
         if (this.isTestMode) {
             console.log(`[realtimeEngine] ★★★ 测试模式：不会创建H5文件 ★★★`);
         }
-        // 【统一时钟】获取 Python time.time() 作为会话起始时间基准
-        // 与 EMG 数据时间戳（ble_server.py）和视频时间戳（camera_server.py）同源，
-        // 消除 Node.js Date.now() 与 Python time.time() 之间的潜在时钟偏差
-        let sessionStartUnix;
-        try {
-            if (this.camera_connected) {
-                const timeResult = await this.sendCameraCommand('get_server_time', {});
-                sessionStartUnix = timeResult.server_time;
-                console.log('[realtimeEngine] 🕐 Python统一时钟: session_start_unix =', sessionStartUnix);
-            } else {
-                sessionStartUnix = Date.now() / 1000;
-                console.log('[realtimeEngine] ⚠️ Camera未连接，使用JS时钟作为备选');
-            }
-        } catch (e) {
-            console.warn('[realtimeEngine] ⚠️ 获取Python时钟失败，回退到JS时钟:', e.message);
-            sessionStartUnix = Date.now() / 1000;
-        }
-        this.collectionDataStartTs = sessionStartUnix;
-        this.collectionDroppedStaleBlePackets = 0;
-        this.realtimeDataBuffer = [];
-        if (this.realtimeDataTimer) {
-            clearTimeout(this.realtimeDataTimer);
-            this.realtimeDataTimer = null;
-        }
-
         // 【新增】保存录像会话信息
         this.recordingSessionId = recordingSessionId || null;
         this.isMultiSession = isMultiSession || false;
@@ -381,11 +345,14 @@ class RealtimeEngine extends EventEmitter {
 
         // 【新增】重置视频录制标志
         this.videoRecordingStarted = false;
+        this.videoFileNames = null;
         this.videoTimingLeft = null;
         this.videoTimingRight = null;
         this.videoPathLeft = null;
         this.videoPathRight = null;
         this.collectionBins = null;
+        this.collectionBinFilenames = { dev1: null, dev2: null };
+        this.collectionStreamId = null;
 
         // 【Phase 2】保存续采模式元数据
         this.isResume = data.isResume || false;
@@ -428,116 +395,131 @@ class RealtimeEngine extends EventEmitter {
 
         // sd_filenames_updated 事件作为兜底（见 onSdFilenamesUpdated）
 
+        // 【统一时钟】获取 Python time.time() 作为会话起始时间基准
+        // 与 EMG 数据时间戳（ble_server.py）和视频时间戳（camera_server.py）同源，
+        // 消除 Node.js Date.now() 与 Python time.time() 之间的潜在时钟偏差
+        let sessionStartUnix;
+        try {
+            if (this.camera_connected) {
+                const timeResult = await this.sendCameraCommand('get_server_time', {});
+                sessionStartUnix = timeResult.server_time;
+                console.log('[realtimeEngine] 🕐 Python统一时钟: session_start_unix =', sessionStartUnix);
+            } else {
+                sessionStartUnix = Date.now() / 1000;
+                console.log('[realtimeEngine] ⚠️ Camera未连接，使用JS时钟作为备选');
+            }
+        } catch (e) {
+            console.warn('[realtimeEngine] ⚠️ 获取Python时钟失败，回退到JS时钟:', e.message);
+            sessionStartUnix = Date.now() / 1000;
+        }
+        this.collectionDataStartTs = sessionStartUnix;
+        this.collectionDroppedStaleBlePackets = 0;
+        this.realtimeDataBuffer = [];
+        if (this.realtimeDataTimer) {
+            clearTimeout(this.realtimeDataTimer);
+            this.realtimeDataTimer = null;
+        }
+
         // 自动启动摄像头录制（无需按空格触发）
         // 使用 collectionDataStartTs（采集会话起始时间），与 EMG 共用同一时间基准
         if (!this.isTestMode && !this.videoRecordingStarted) {
             const startTs = this.collectionDataStartTs;
             console.log('[realtimeEngine] 🎥 自动启动摄像头录制（t=', startTs, '）...');
-            this._markVideoRecordingStart(startTs, stageName).catch(err => {
-                console.error('[realtimeEngine] 自动启动摄像头录制失败:', err);
-            });
-            this.videoRecordingStarted = true;
+            try { await this._markVideoRecordingStart(startTs, stageName); }
+            catch (error) {
+                this.onTransportFault({ source: 'camera', error: error.message });
+                throw error;
+            }
+            this.videoRecordingStarted = !!(this.videoFileNames?.left || this.videoFileNames?.right);
         }
     }
 
     onCollectionPause() { this.collectionPaused = true; }
     onCollectionResume() { this.collectionPaused = false; }
 
-    async onCollectionStop(completed) {
-        // Freeze H5 append immediately at the logical collection boundary.
-        this.isCollecting = false;
-        this.collectionPaused = true;
-
-        // 停止视频录制并保存 AVI
-        if (this.videoRecordingStarted && this.camera_connected) {
-            console.log('[realtimeEngine] 🎥 停止视频录制并保存 AVI...');
-
-            // 停止左手摄像头并保存
-            if (this.videoFileNames?.left) {
-                try {
-                    const saveResult = await this.sendCameraCommand('stop_and_save', {
-                        side: 'left'
-                    });
-                    if (saveResult.success) {
-                        console.log('[realtimeEngine] ✅ 左手摄像头 AVI 已保存:', saveResult.output_path || this.videoFileNames.left);
-                        if (saveResult.timing) {
-                            console.log('[realtimeEngine] ⏱️ 左手时间戳:', JSON.stringify(saveResult.timing));
-                            this.videoTimingLeft = saveResult.timing;
-                        }
-                        // 保存视频文件名（供 closeStageFile 写入 H5）
-                        if (saveResult.output_path) {
-                            this.videoPathLeft = saveResult.output_path;
-                        }
-                    } else {
-                        console.error('[realtimeEngine] ❌ 保存左手 AVI 失败:', saveResult.error);
-                        this.videoFileNames.left = null;
-                    }
-                } catch (err) {
-                    console.error('[realtimeEngine] 保存左手 AVI 异常:', err);
-                    this.videoFileNames.left = null;
+    async _saveCollectionVideos(incomplete = false) {
+        if (!this.videoRecordingStarted) return;
+        this.videoStopResults = this.videoStopResults || {};
+        for (const side of ['left', 'right']) {
+            if (!this.videoFileNames?.[side]) continue;
+            if (this.videoStopResults[side]) {
+                if (!this.videoStopResults[side].success && !incomplete) {
+                    throw new Error(this.videoStopResults[side].error || `${side} 视频保存失败`);
                 }
+                continue;
             }
-
-            // 停止右手摄像头并保存
-            if (this.videoFileNames?.right) {
-                try {
-                    const saveResult = await this.sendCameraCommand('stop_and_save', {
-                        side: 'right'
-                    });
-                    if (saveResult.success) {
-                        console.log('[realtimeEngine] ✅ 右手摄像头 AVI 已保存:', saveResult.output_path || this.videoFileNames.right);
-                        if (saveResult.timing) {
-                            console.log('[realtimeEngine] ⏱️ 右手时间戳:', JSON.stringify(saveResult.timing));
-                            this.videoTimingRight = saveResult.timing;
-                        }
-                        // 保存视频文件名（供 closeStageFile 写入 H5）
-                        if (saveResult.output_path) {
-                            this.videoPathRight = saveResult.output_path;
-                        }
-                    } else {
-                        console.error('[realtimeEngine] ❌ 保存右手 AVI 失败:', saveResult.error);
-                        this.videoFileNames.right = null;
-                    }
-                } catch (err) {
-                    console.error('[realtimeEngine] 保存右手 AVI 异常:', err);
-                    this.videoFileNames.right = null;
-                }
-            }
-
-            this.videoRecordingStarted = false;
-            this.videoFileNames = null;
-        }
-
-        let closeResponse = { status: 'success', msg: 'no_open_file' };
-        if (this.stageFileOpen || this.isClosingStageFile) {
-            // 显式传 collection_status：
-            // completed === true  → "completed"（Stage 正常完成）
-            // completed === false → "manual_stopped"（工作人员手动点停止）
-            closeResponse = await this.closeStageFile({
-                collection_status: completed ? 'completed' : 'manual_stopped',
-                video_timing: {
-                    left: this.videoTimingLeft || null,
-                    right: this.videoTimingRight || null
-                },
-                video_left: this.videoPathLeft || null,
-                video_right: this.videoPathRight || null
+            const result = await this.sendCameraCommand('stop_and_save', {
+                side, operation_id: `${this.videoStopOperationId || this.storageFileToken}_${side}`,
+                recording_id: `${this.videoStopOperationId}_${side}`
             });
+            if (result.pending) throw new Error(result.error || `${side} 视频保存结果尚未确认`);
+            this.videoStopResults[side] = result;
+            if (!result.success) {
+                if (!incomplete) throw new Error(result.error || `${side} 视频保存失败`);
+                continue;
+            }
+            const suffix = side === 'left' ? 'Left' : 'Right';
+            if (result.timing) this[`videoTiming${suffix}`] = result.timing;
+            if (result.output_path) this[`videoPath${suffix}`] = result.output_path;
         }
+        this.videoRecordingStarted = false;
+    }
+
+    _videoCloseParams() {
+        return {
+            video_timing: { left: this.videoTimingLeft || null, right: this.videoTimingRight || null },
+            video_left: this.videoPathLeft || this.videoFileNames?.left || null,
+            video_right: this.videoPathRight || this.videoFileNames?.right || null
+        };
+    }
+
+    _releaseCollection(state = 'idle') {
+        this.collectionState = state;
+        this.isCollecting = false;
         this.collectionPaused = false;
-        // 【新增】重置测试模式标志
         this.isTestMode = false;
-        // 【新增】重置 collection stream 状态（新 collection 需要新 stream）
-        // 注意：collectionBinFilenames 在新 collection stream 就绪时会更新
+        this.abortFreezeActive = false;
+        this.pendingAbortFreeze = null;
         this.collectionStreamId = null;
         this.collectionBinFilenames = { dev1: null, dev2: null };
-        this.collectionBins = null;  // 【新增】重置collectionBins
+        this.collectionBins = null;
         this.collectionDataStartTs = 0;
-        // 【修复】不在 stop 时清空 sd_filenames（由 sd_filenames_updated 事件管理）
-        return {
-            status: 'success',
-            h5_close: closeResponse,
-            collection_status: completed ? 'completed' : 'manual_stopped'
-        };
+        this.stageFileCreateFailed = false;
+        this.storageDataSendError = null;
+    }
+
+    async _finishCollection(params, incomplete = false) {
+        this.isCollecting = false;
+        this.collectionPaused = true;
+        this.collectionState = 'stopping';
+        try {
+            if (!incomplete && this.storageDataSendError) throw this.storageDataSendError;
+            // Unknown camera outcomes (disconnect/timeout) keep ownership.
+            // A terminal negative save reply may be preserved as incomplete.
+            await this._saveCollectionVideos(incomplete);
+            if (incomplete) {
+                const videoErrors = Object.values(this.videoStopResults || {}).filter(r => !r.success).map(r => r.error || '视频保存失败');
+                params.error_reason = [params.error_reason, ...videoErrors].filter(Boolean).join('; ');
+            }
+            const response = await this.closeStageFile({ ...this._videoCloseParams(), ...params }, incomplete);
+            if (response.status !== 'success') throw new Error(response.msg || 'H5关闭失败');
+            this._releaseCollection(params.collection_status === 'abnormal_interrupted' ? 'interrupted' : 'idle');
+            return { status: 'success', h5_close: response, collection_status: params.collection_status };
+        } catch (error) {
+            this.collectionState = 'save_failed';
+            return { status: 'error', msg: error.message, h5_close: { status: 'error', msg: error.message } };
+        }
+    }
+
+    onCollectionStop(completed) {
+        return this._finishCollection({ collection_status: completed ? 'completed' : 'manual_stopped' });
+    }
+
+    finalizeIncomplete(data = {}) {
+        return this._finishCollection({
+            collection_status: 'incomplete',
+            error_reason: data.reason || this.storageDataSendError?.message || '操作员选择按不完整采集收尾'
+        }, true);
     }
 
     // 【新增】异常中断冻结 — 立即停止 append，不关闭 H5
@@ -559,99 +541,16 @@ class RealtimeEngine extends EventEmitter {
     // 【新增】异常中断处理 — 关闭 H5 并标记 abnormal_interrupted
     async onAbnormalInterrupt(data) {
         const { reason, interruptedAt, progress, breakpointState } = data || {};
-        console.log(`[realtimeEngine] ========== 异常中断 ==========`);
-        console.log(`[realtimeEngine] 原因: ${reason || '未知'}`);
-        console.log(`[realtimeEngine] 时间: ${interruptedAt || '未知'}`);
-
-        // 【修复】异常中断时也要停止摄像头录制并保存 AVI，传递 video 信息到 closeStageFile
-        if (this.videoRecordingStarted && this.camera_connected) {
-            console.log('[realtimeEngine] 🎥 异常中断：停止视频录制并保存 AVI...');
-
-            if (this.videoFileNames?.left) {
-                try {
-                    const saveResult = await this.sendCameraCommand('stop_and_save', { side: 'left' });
-                    if (saveResult.success) {
-                        console.log('[realtimeEngine] ✅ 左手摄像头 AVI 已保存:', saveResult.output_path);
-                        if (saveResult.timing) {
-                            this.videoTimingLeft = saveResult.timing;
-                        }
-                        if (saveResult.output_path) {
-                            this.videoPathLeft = saveResult.output_path;
-                        }
-                    } else {
-                        console.error('[realtimeEngine] ❌ 保存左手 AVI 失败:', saveResult.error);
-                        this.videoFileNames.left = null;
-                    }
-                } catch (err) {
-                    console.error('[realtimeEngine] 保存左手 AVI 异常:', err);
-                    this.videoFileNames.left = null;
-                }
-            }
-
-            if (this.videoFileNames?.right) {
-                try {
-                    const saveResult = await this.sendCameraCommand('stop_and_save', { side: 'right' });
-                    if (saveResult.success) {
-                        console.log('[realtimeEngine] ✅ 右手摄像头 AVI 已保存:', saveResult.output_path);
-                        if (saveResult.timing) {
-                            this.videoTimingRight = saveResult.timing;
-                        }
-                        if (saveResult.output_path) {
-                            this.videoPathRight = saveResult.output_path;
-                        }
-                    } else {
-                        console.error('[realtimeEngine] ❌ 保存右手 AVI 失败:', saveResult.error);
-                        this.videoFileNames.right = null;
-                    }
-                } catch (err) {
-                    console.error('[realtimeEngine] 保存右手 AVI 异常:', err);
-                    this.videoFileNames.right = null;
-                }
-            }
-
-            this.videoRecordingStarted = false;
-            this.videoFileNames = null;
-        }
-
-        if (this.stageFileOpen && !this.isClosingStageFile) {
-            // 关闭当前 H5，写入异常中断标记
-            // 注意：不传 segment_index，保留 create_file 写入的值
-            // （续采 H5 的 segment_index 由 create_file 写入，close 不覆盖）
-            // 【修复】传递 video_left/video_right 确保 H5 属性不丢失
-            await this.closeStageFile({
-                collection_status: 'abnormal_interrupted',
-                interrupted_at: interruptedAt || new Date().toISOString(),
-                interrupt_reason: reason || '未知',
-                resume_progress: progress ? JSON.stringify(progress) : null,
-                breakpoint_state: breakpointState ? JSON.stringify(breakpointState) : null,
-                video_timing: {
-                    left: this.videoTimingLeft || null,
-                    right: this.videoTimingRight || null
-                },
-                video_left: this.videoPathLeft || null,
-                video_right: this.videoPathRight || null
-            });
-        } else {
-            console.log('[realtimeEngine] 没有打开的 H5 文件，跳过关闭');
-        }
-
-        // 重置采集状态（但不改变 sd_filenames）
-        this.isCollecting = false;
-        this.collectionPaused = false;
-        this.isTestMode = false;
-        // 清理 freeze 状态
-        this.abortFreezeActive = false;
-        this.pendingAbortFreeze = null;
-        // 【新增】清理 collection stream 状态
-        this.collectionStreamId = null;
-        this.collectionBinFilenames = { dev1: null, dev2: null };
-        this.collectionDataStartTs = 0;
-        this.streamMode = 'idle';
-        // 注意：不调用 onCollectionStop，避免覆盖 H5 标记
+        this.onAbnormalInterruptFreeze(data);
+        return this._finishCollection({
+            collection_status: 'abnormal_interrupted',
+            interrupted_at: interruptedAt || new Date().toISOString(),
+            interrupt_reason: reason || '未知',
+            resume_progress: progress ? JSON.stringify(progress) : null,
+            breakpoint_state: breakpointState ? JSON.stringify(breakpointState) : null
+        });
     }
 
-    // 【新增】处理SD卡文件名和设备名称更新事件
-    // 此事件由ble_server.py在start_all成功后发送，包含当前实际连接设备的文件名和设备名称
     onSdFilenamesUpdated(sd_filenames, device_names, stream_mode, collection_stream_id, device_configs = null) {
         // 完全替换，只保存当前实际连接设备的文件名
         this.sd_filenames = {
@@ -715,66 +614,31 @@ class RealtimeEngine extends EventEmitter {
         // 【新增】保存当前stage是否需要动捕数据
         this.currentStageNeedMocap = needMocap;
         console.log(`[realtimeEngine] Stage开始: ${stageName}, needMocap: ${needMocap}`);
+        if (this.abortFreezeActive) throw new Error('采集已冻结');
         await this.openStageFile(stageName, stageIndex);
+        if (this.stageFileCreateFailed) throw new Error('H5文件创建失败');
+        if (this.abortFreezeActive) throw new Error('采集已冻结，等待异常收尾');
+        this.collectionState = 'collecting';
     }
 
     async onStageEnd(stageName, timestamp) {
-        // 如果正在录像，不关闭文件 — 交给 onCollectionStop 统一处理（视频保存 + H5写入）
-        if (this.videoRecordingStarted) return;
-        if (this.stageFileOpen && !this.isClosingStageFile) {
-            await this.closeStageFile();
-        }
+        // Collection stop owns finalization, including video and final status.
+        // Closing here used to race the subsequent stop/abort command.
+        return { status: 'success' };
     }
 
     onPromptStart(promptName, promptIndex) {}
     onPromptEnd(promptName, promptIndex) {}
 
-    onPrompt(name, stageName, timestamp) {
-        // 摄像头录制已改为采集开始时自动触发，不再通过空格键
-
-        // 【新增】异常中断冻结状态下跳过 prompt
-        if (this.abortFreezeActive) {
-            console.log(`[realtimeEngine] 冻结状态：跳过保存 prompt (${name})`);
-            return;
-        }
-        // 【新增】测试模式下不保存 prompt
-        if (this.isTestMode) {
-            console.log(`[realtimeEngine] 测试模式：跳过保存 prompt (${name})`);
-            return;
-        }
-
-        const promptTime = timestamp || Date.now();
-        // 【修复】不再设置 pending_prompt，直接保存
-        // 之前的问题：设置了 pending_prompt 后立即保存，但没有清除
-        // 导致 saveDataToStorage() 又保存了一次，造成重复
-
-        // 立即保存 prompt 到 storage，不等待 EMG 数据
-        // 如果文件还没打开，等待一小段时间后重试
-        let retryCount = 0;
-        const savePrompt = () => {
-            if (this.stageFileOpen && !this.isClosingStageFile) {
-                this.sendStorageCommand('append', {
-                    data: {
-                        prompt_name: name,
-                        prompt_time: promptTime,
-                        prompt_stage: stageName || this.currentStageName
-                    }
-                }).catch(err => {
-                    console.error('[realtimeEngine] 保存 prompt 失败:', err);
-                });
-            } else {
-                // 文件还没打开，100ms 后重试（最多重试 5 次）
-                retryCount++;
-                if (retryCount <= 5) {
-                    console.log(`[realtimeEngine] 文件未打开，100ms 后重试保存 prompt (${retryCount}/5)`);
-                    setTimeout(savePrompt, 100);
-                } else {
-                    console.warn('[realtimeEngine] 保存 prompt 失败：文件未打开（已重试 5 次）');
-                }
-            }
-        };
-
-        savePrompt();
+    async onPrompt(name, stageName, timestamp) {
+        if (this.abortFreezeActive || this.isTestMode) return;
+        const token = this.storageFileToken;
+        if (this.stageFileOpenPromise) await this.stageFileOpenPromise;
+        if (token !== this.storageFileToken || !this.isCollecting ||
+            !this.stageFileOpen || this.isClosingStageFile) throw new Error('当前采集文件未就绪，提示事件未保存');
+        await this.saveDataToStorage({ prompt_name: name,
+            prompt_time: timestamp || Date.now(), prompt_stage: stageName || this.currentStageName });
+        if (this.storageDataSendError) throw this.storageDataSendError;
     }
 
     // 【新增】处理视频录制信息
@@ -873,10 +737,14 @@ class RealtimeEngine extends EventEmitter {
             const videoFileName = `${binFileNameLeft}.avi`;
             console.log(`[realtimeEngine] ${cameraSide}侧摄像头 ← 左手bin: ${videoFileName}`);
 
+            this.videoFileNames = this.videoFileNames || {};
+            this.videoFileNames[cameraSide] = videoFileName;
+            this.videoRecordingStarted = true;
             try {
                 const startResult = await this.sendCameraCommand('start_continuous_recording', {
                     side: cameraSide,
                     output_filename: videoFileName,
+                    recording_id: `${this.videoStopOperationId}_${cameraSide}`,
                     start_timestamp: timestamp
                 });
                 if (startResult.success) {
@@ -885,50 +753,42 @@ class RealtimeEngine extends EventEmitter {
                     // 标记该摄像头已被使用（避免同一摄像头被两个 bin 重复使用）
                     availableSides = availableSides.filter(s => s !== cameraSide);
                 } else {
-                    console.error(`[realtimeEngine] ❌ ${cameraSide}侧录制启动失败:`, startResult.error);
+                    throw new Error(startResult.error || `${cameraSide}侧录像启动失败`);
                 }
             } catch (error) {
                 console.error(`[realtimeEngine] ${cameraSide}侧录制请求失败:`, error);
+                throw error;
             }
         }
 
         // 右手 bin → 摄像头
-        if (binFileNameRight) {
+        if (binFileNameRight && availableSides.length > 0) {
             const cameraSide = mapBinToCamera('right');
             const videoFileName = `${binFileNameRight}.avi`;
             console.log(`[realtimeEngine] ${cameraSide}侧摄像头 ← 右手bin: ${videoFileName}`);
 
+            this.videoFileNames = this.videoFileNames || {};
+            this.videoFileNames[cameraSide] = videoFileName;
+            this.videoRecordingStarted = true;
             try {
                 const startResult = await this.sendCameraCommand('start_continuous_recording', {
                     side: cameraSide,
                     output_filename: videoFileName,
+                    recording_id: `${this.videoStopOperationId}_${cameraSide}`,
                     start_timestamp: timestamp
                 });
                 if (startResult.success) {
                     console.log(`[realtimeEngine] ✅ ${cameraSide}侧录制已启动`);
                     this.videoFileNames[cameraSide] = videoFileName;
                 } else {
-                    console.error(`[realtimeEngine] ❌ ${cameraSide}侧录制启动失败:`, startResult.error);
+                    throw new Error(startResult.error || `${cameraSide}侧录像启动失败`);
                 }
             } catch (error) {
                 console.error(`[realtimeEngine] ${cameraSide}侧录制请求失败:`, error);
+                throw error;
             }
         }
 
-        // 【修复】录制启动成功后，立即通知 storage_server 写入 video_left/video_right 到 H5
-        // 避免因后续异常中断流程不传 video 信息导致 H5 属性缺失
-        if (this.videoFileNames && (this.videoFileNames.left || this.videoFileNames.right)) {
-            this.sendStorageCommand('video_recording_started', {
-                video_left: this.videoFileNames.left || null,
-                video_right: this.videoFileNames.right || null,
-                video_start_timestamp: timestamp,
-                h5_file_name: null
-            }).then(() => {
-                console.log('[realtimeEngine] ✅ 视频信息已写入H5（录制启动时）');
-            }).catch(err => {
-                console.error('[realtimeEngine] ❌ 写入视频信息到H5失败:', err);
-            });
-        }
     }
 
     // 【新增】Camera命令处理
@@ -1020,7 +880,21 @@ class RealtimeEngine extends EventEmitter {
         }
     }
 
-    async openStageFile(stageName, stageIndex) {
+    openStageFile(stageName, stageIndex) {
+        if (this.stageFileOpen) return Promise.resolve();
+        if (this.stageFileOpenPromise) return this.stageFileOpenPromise;
+
+        const openPromise = this._openStageFile(stageName, stageIndex);
+        this.stageFileOpenPromise = openPromise;
+        openPromise.finally(() => {
+            if (this.stageFileOpenPromise === openPromise) {
+                this.stageFileOpenPromise = null;
+            }
+        }).catch(() => {});
+        return openPromise;
+    }
+
+    async _openStageFile(stageName, stageIndex) {
         console.log(`[realtimeEngine] 尝试打开Stage文件: ${stageName}`);
         console.log(`[realtimeEngine] storage_connected = ${this.storage_connected}`);
         this.stageFileCreateFailed = false;
@@ -1034,6 +908,7 @@ class RealtimeEngine extends EventEmitter {
         }
 
         this.stageFileOpening = true;
+        this.storageFileToken = this.storageFileToken || `h5_${Date.now()}_${Math.random().toString(36).slice(2)}`;
         if (!this.storage_connected) {
             console.warn('[realtimeEngine] ⚠️ Storage未连接，尝试立即重连...');
             try {
@@ -1085,6 +960,7 @@ class RealtimeEngine extends EventEmitter {
 
             const emgConfig = this.getActiveEmgConfig();
             const createParams = {
+                _storage_file_token: this.storageFileToken,
                 filename,
                 subdirectory,
                 task_id: taskIdForFolder,  // 使用中文任务名称
@@ -1138,18 +1014,29 @@ class RealtimeEngine extends EventEmitter {
                 parent_segment_index: this.resumeParentSegmentIndex || null
             };
 
-            let response = await this.sendStorageCommand('create', createParams);
-            if (response.status !== 'success') {
-                console.warn('[realtimeEngine] H5创建失败，300ms后重试一次:', response);
-                await new Promise(resolve => setTimeout(resolve, 300));
-                response = await this.sendStorageCommand('create', createParams);
+            let response;
+            try { response = await this.sendStorageCommand('create', createParams); }
+            catch (error) {
+                const status = await this.sendStorageCommand('get_file_status');
+                if (status.status !== 'success' || status.file_token !== this.storageFileToken || !status.open || status.create_failed) throw error;
+                response = { status: 'success' };
             }
 
             if (response.status === 'success') {
                 this.stageFileOpen = true;
                 this.stageFileOpening = false;
                 this.stageFileCreateFailed = false;
+                this.storageDataSequence = 0;
+                this.storageDataLastSentSequence = 0;
+                if (!this.abortFreezeActive) this.storageDataSendError = null;
                 this.h5StorageWarningShown = false;
+                if (this.videoFileNames?.left || this.videoFileNames?.right) {
+                    const videoResponse = await this.sendStorageCommand('video_recording_started', {
+                        video_left: this.videoFileNames.left || null, video_right: this.videoFileNames.right || null,
+                        video_start_timestamp: this.collectionDataStartTs
+                    });
+                    if (videoResponse.status !== 'success') throw new Error(videoResponse.msg || '视频关联写入失败');
+                }
                 console.log(`[realtimeEngine] ✅ 文件已打开: ${filename}`);
             } else {
                 console.error(`[realtimeEngine] ❌ 打开文件失败:`, response);
@@ -1180,9 +1067,32 @@ class RealtimeEngine extends EventEmitter {
         });
     }
 
-    async closeStageFile(extraParams = {}) {
+    async closeStageFile(extraParams = {}, incomplete = false) {
         if (this.isClosingStageFile && this.activeCloseStageFilePromise) {
             return this.activeCloseStageFilePromise;
+        }
+        if (this.stageFileOpening && this.stageFileOpenPromise) {
+            try {
+                await this.stageFileOpenPromise;
+            } catch (error) {
+                console.warn('[realtimeEngine] 等待Stage文件打开完成失败:', error.message);
+                this.stageFileCreateFailed = true;
+            }
+        }
+        // Another caller may have started closing while we waited for create.
+        if (this.isClosingStageFile && this.activeCloseStageFilePromise) {
+            return this.activeCloseStageFilePromise;
+        }
+        if (this.stageFileCreateFailed) {
+            if (!incomplete) return { status: 'error', msg: 'H5文件创建失败，无法关闭Stage' };
+            const status = await this.sendStorageCommand('get_file_status');
+            if (status.status !== 'success' || typeof status.open !== 'boolean') {
+                return { status: 'error', msg: status.msg || '无法核对Storage文件状态' };
+            }
+            if (status.open && status.file_token !== this.storageFileToken) {
+                return { status: 'error', msg: 'Storage正在处理其他文件，不能恢复当前会话' };
+            }
+            this.stageFileOpen = !!status.open;
         }
         if (!this.stageFileOpen) {
             return { status: 'success', msg: 'no_open_file' };
@@ -1191,38 +1101,74 @@ class RealtimeEngine extends EventEmitter {
         this.isClosingStageFile = true;
 
         this.activeCloseStageFilePromise = (async () => {
-            const params = { end_time: Date.now() / 1000, ...extraParams };
-            const response = await this.sendStorageCommand('close', params);
-            this.stageFileOpen = false;
+            // Wait until every PUSH send accepted by this process has been
+            // issued, then let storage_server drain the same data channel up
+            // to this sequence before it closes the H5 file.
+            if (incomplete) await this.storagePushSendChain;
+            else await this.flushStorageData();
+            const params = {
+                end_time: Date.now() / 1000,
+                _storage_data_seq: this.storageDataLastSentSequence,
+                _storage_file_token: this.storageFileToken,
+                ...extraParams
+            };
+            const response = await this.sendStorageCommand(incomplete ? 'finalize_incomplete' : 'close', params);
             if (response.status === 'success') {
+                this.stageFileOpen = false;
                 const status = params.collection_status || 'completed';
                 console.log(`[realtimeEngine] ✅ 文件已关闭 (collection_status: ${status})`);
+            } else {
+                console.error('[realtimeEngine] ❌ Storage拒绝关闭文件:', response);
             }
             return response;
-        })();
+        })().catch(error => {
+            console.error('[realtimeEngine] 关闭Stage文件失败:', error);
+            return { status: 'error', msg: error.message || String(error) };
+        });
 
         try {
             return await this.activeCloseStageFilePromise;
-        } catch (error) {
-            console.error('[realtimeEngine] 关闭Stage文件失败:', error);
-            return { status: 'error', msg: error.message };
         } finally {
             this.isClosingStageFile = false;
             this.activeCloseStageFilePromise = null;
         }
     }
 
+    onTransportFault(packet) {
+        const error = new Error(`${packet.source || 'device'} 数据传输失败: ${packet.error || '数据丢失'} (dropped=${packet.dropped || 0})`);
+        if (this.isCollecting || this.stageFileOpening || this.stageFileOpen) {
+            this.storageDataSendError = this.storageDataSendError || error;
+            this.onAbnormalInterruptFreeze({});
+            this.collectionState = 'save_failed';
+            this.broadcastToClients({ type: 'collection_fault', error: error.message, source: packet.source });
+        } else {
+            this.broadcastToClients({ ...packet, type: 'transport_fault' });
+        }
+    }
+
     broadcastToClients(dataPacket) {
         const message = JSON.stringify(dataPacket);
-        this.clients.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) {
-                try { client.send(message); } 
-                catch (error) { this.clients.delete(client); }
+        const bytes = Buffer.byteLength(message);
+        const preview = ['realtime_data', 'realtime_data_batch', 'mocap_data'].includes(dataPacket.type);
+        for (const client of this.clients) {
+            if (client.readyState !== WebSocket.OPEN) continue;
+            if ((client.bufferedAmount || 0) + bytes > this.previewByteLimit) {
+                if (!preview) {
+                    console.error('[realtimeEngine] 可靠通知无法发送，断开慢客户端:', dataPacket.type);
+                    client.terminate?.(); this.clients.delete(client); continue;
+                }
+                this.previewDroppedPackets++;
+                client.slowPreviewCount = (client.slowPreviewCount || 0) + 1;
+                if (client.slowPreviewCount >= 20) { client.terminate?.(); this.clients.delete(client); }
+                continue;
             }
-        });
+            client.slowPreviewCount = 0;
+            try { client.send(message); } catch (error) { this.clients.delete(client); client.terminate?.(); }
+        }
     }
 
     ble_server_connect() {
+        if (this.stopping) return;
         // 【修复】清理旧连接时先清除事件处理器，避免触发重连
         if (this.ble_client) {
             this.ble_client.onopen = null;
@@ -1249,6 +1195,7 @@ class RealtimeEngine extends EventEmitter {
                     const packet = JSON.parse(event.data);
 
                     // 调试：打印收到的数据类型
+                    if (packet.type === 'transport_fault') { this.onTransportFault(packet); return; }
                     if (packet.type === 'data') {
                         this.handleBleDataPacket(packet);
                         return;
@@ -1294,6 +1241,7 @@ class RealtimeEngine extends EventEmitter {
     }
 
     handleReconnect(reason = '连接断开') {
+        if (this.stopping) return;
         if (this.currentReconnectTimes >= this.maxReconnectTimes) return;
         this.currentReconnectTimes++;
         this.reconnectTimer = setTimeout(() => { this.ble_server_connect(); }, this.reconnectInterval);
@@ -1301,6 +1249,7 @@ class RealtimeEngine extends EventEmitter {
 
     // 【新增】Mocap Server连接
     mocap_server_connect() {
+        if (this.stopping) return;
         // 【修复】清理旧连接时先清除事件处理器，避免触发重连
         if (this.mocap_client) {
             this.mocap_client.onopen = null;
@@ -1331,6 +1280,7 @@ class RealtimeEngine extends EventEmitter {
             this.mocap_client.onmessage = (event) => {
                 try {
                     const packet = JSON.parse(event.data);
+                    if (packet.type === 'transport_fault') { this.onTransportFault(packet); return; }
                     if (packet.type === 'mocap') { this.handleMocapDataPacket(packet); }
                     // 【新增】转发SDK状态响应给前端
                     else if (packet.type === 'response' && packet.cmd && packet.cmd.startsWith('sdk_')) {
@@ -1361,6 +1311,7 @@ class RealtimeEngine extends EventEmitter {
     }
 
     handleMocapReconnect(reason = '连接断开') {
+        if (this.stopping) return;
         if (this.mocap_currentReconnectTimes >= this.mocap_maxReconnectTimes) return;
         this.mocap_currentReconnectTimes++;
         this.mocap_reconnectTimer = setTimeout(() => { this.mocap_server_connect(); }, this.mocap_reconnectInterval);
@@ -1369,6 +1320,7 @@ class RealtimeEngine extends EventEmitter {
     // ==================== Camera Server 连接管理 ====================
 
     camera_server_connect() {
+        if (this.stopping) return;
         // 清理旧连接
         if (this.camera_client) {
             this.camera_client.onopen = null;
@@ -1421,6 +1373,7 @@ class RealtimeEngine extends EventEmitter {
     }
 
     handleCameraReconnect(reason = '连接断开') {
+        if (this.stopping) return;
         if (this.camera_currentReconnectTimes >= this.camera_maxReconnectTimes) {
             console.log('[realtimeEngine] Camera服务器重连次数已达上限，停止重连');
             return;
@@ -1436,37 +1389,31 @@ class RealtimeEngine extends EventEmitter {
      * 发送命令到Camera服务器（带 request_id 匹配）
      */
     async sendCameraCommand(command, data = {}) {
+        const socket = this.camera_client;
+        if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error('Camera服务器未连接');
         return new Promise((resolve, reject) => {
-            if (!this.camera_client || this.camera_client.readyState !== WebSocket.OPEN) {
-                reject(new Error('Camera服务器未连接'));
-                return;
-            }
-
             const requestId = `rt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-            const payload = { command, request_id: requestId, ...data };
-
-            // 设置超时
-            const timeout = setTimeout(() => {
-                this.camera_client.removeEventListener('message', messageHandler);
-                reject(new Error('Camera命令超时'));
-            }, 15000);
-
-            // 发送命令并等待匹配 request_id 的响应
-            const messageHandler = (event) => {
-                try {
-                    const response = JSON.parse(event.data);
-                    // 只匹配带相同 request_id 的响应（忽略预览帧等推送消息）
-                    if (response.request_id !== requestId) return;
-                    clearTimeout(timeout);
-                    this.camera_client.removeEventListener('message', messageHandler);
-                    resolve(response);
-                } catch (error) {
-                    // 非JSON消息，忽略
-                }
+            const cleanup = () => {
+                clearTimeout(timeout);
+                socket.removeEventListener('message', onMessage);
+                socket.removeEventListener('close', onDisconnect);
+                socket.removeEventListener('error', onDisconnect);
             };
-
-            this.camera_client.addEventListener('message', messageHandler);
-            this.camera_client.send(JSON.stringify(payload));
+            const fail = error => { cleanup(); reject(error); };
+            const onDisconnect = () => fail(new Error('Camera连接已断开；保存结果待核对'));
+            const onMessage = event => {
+                let response;
+                try { response = JSON.parse(event.data); } catch (_) { return; }
+                if (response.request_id !== requestId) return;
+                cleanup(); resolve(response);
+            };
+            const timeout = setTimeout(() => fail(new Error('Camera命令超时；保存结果待核对')),
+                command === 'stop_and_save' ? 1860000 : 15000);
+            socket.addEventListener('message', onMessage);
+            socket.addEventListener('close', onDisconnect);
+            socket.addEventListener('error', onDisconnect);
+            try { socket.send(JSON.stringify({ command, request_id: requestId, ...data })); }
+            catch (error) { fail(error); }
         });
     }
 
@@ -1731,8 +1678,34 @@ class RealtimeEngine extends EventEmitter {
         }
     }
 
+    _configureStorageSockets() {
+        this.storage_server_socket.sendTimeout = 5000;
+        this.storage_server_socket.receiveTimeout = 10000;
+        this.storage_server_socket.linger = 0;
+        this.storage_push_socket.sendTimeout = 5000;
+        this.storage_push_socket.linger = 0;
+    }
+
+    async _reconnectStorageControlSocket() {
+        try { this.storage_server_socket.close(); } catch (e) {}
+        this.storage_server_socket = new zmq.Request();
+        this._configureStorageSockets();
+        const address = `tcp://${this.storage_server_host}:${this.storage_server_port}`;
+        await this.storage_server_socket.connect(address);
+        this.storage_connected = true;
+    }
+
     async sendStorageCommand(cmd, params = {}) {
+        if (!['create', 'get_file_status', 'stats', 'tree'].includes(cmd)) {
+            params = { _storage_file_token: this.storageFileToken, ...params };
+        }
         return new Promise((resolve, reject) => {
+            if (this.storageRequestQueue.length >= 1000) {
+                const error = new Error('Storage控制命令队列已满');
+                console.error('[realtimeEngine] ❌', error.message);
+                reject(error);
+                return;
+            }
             this.storageRequestQueue.push({ cmd, params, resolve, reject });
             if (!this.isStorageRequestPending) this._processStorageQueue();
         });
@@ -1752,10 +1725,19 @@ class RealtimeEngine extends EventEmitter {
                 const response = JSON.parse(responseBuffer.toString('utf8'));
                 resolve(response);
             } catch (err) {
-                reject(new Error(`Storage命令失败(${cmd}): ${err.message}`));
+                this.storage_connected = false;
+                try { await this._reconnectStorageControlSocket(); } catch (reconnectError) {
+                    console.error('[realtimeEngine] Storage控制socket重建失败:', reconnectError.message);
+                }
+                const storageError = new Error(`Storage命令失败(${cmd}): ${err.message}`);
+                reject(storageError);
+                while (this.storageRequestQueue.length > 0) {
+                    const queued = this.storageRequestQueue.shift();
+                    queued.reject(new Error(`Storage命令因前序失败而取消: ${storageError.message}`));
+                }
+                break;
             }
         }
-        
         this.isStorageRequestPending = false;
     }
 
@@ -1765,18 +1747,43 @@ class RealtimeEngine extends EventEmitter {
             return;
         }
         if (this.isClosingStageFile || !this.stageFileOpen) return;
-
+        if (this.storageDataSendError) return;
+        if (this.storagePushPendingCount >= 1000) {
+            this.storageDataSendError = new Error('Storage数据发送队列已满');
+            this.notifyH5StorageWarning(this.storageDataSendError.message);
+            return;
+        }
+        this.storagePushPendingCount++;
         try {
-            // 【优化】使用 PUSH socket 发送数据，非阻塞，不等待响应
-            if (this.storage_push_connected) {
-                const request = JSON.stringify({ cmd: 'append', params: { data: sensorData } });
-                await this.storage_push_socket.send(request);
-            } else {
-                // 回退到 REP socket（如果 PUSH 未连接）
-                await this.sendStorageCommand('append', { data: sensorData });
-            }
+            const sequence = ++this.storageDataSequence;
+            const params = { data: sensorData, _storage_seq: sequence,
+                             _storage_file_token: this.storageFileToken };
+            // Both transports use the same ordering, identity and close barrier.
+            const sendOperation = this.storagePushSendChain.then(async () => {
+                if (this.storageDataSendError) throw this.storageDataSendError;
+                if (this.storage_push_connected) {
+                    await this.storage_push_socket.send(JSON.stringify({ cmd: 'append', params }));
+                } else {
+                    const response = await this.sendStorageCommand('append', params);
+                    if (response.status !== 'success') throw new Error(response.msg || 'Storage append failed');
+                }
+                this.storageDataLastSentSequence = sequence;
+            });
+            this.storagePushSendChain = sendOperation.catch(() => {});
+            await sendOperation;
         } catch (error) {
-            // 静默失败，不阻塞主流程
+            this.storageDataSendError = error;
+            console.error('[realtimeEngine] ❌ PUSH数据发送失败:', error.message || error);
+            this.notifyH5StorageWarning(`H5数据写入失败：${error.message || error}；当前文件不会标记为完成`);
+        } finally {
+            this.storagePushPendingCount = Math.max(0, this.storagePushPendingCount - 1);
+        }
+    }
+
+    async flushStorageData() {
+        if (this.storagePushSendChain) await this.storagePushSendChain;
+        if (this.storageDataSendError) {
+            throw new Error(`Storage数据发送失败: ${this.storageDataSendError.message || this.storageDataSendError}`);
         }
     }
 
@@ -1810,6 +1817,8 @@ class RealtimeEngine extends EventEmitter {
         });
 
         return {
+            collectionState: this.collectionState, previewDroppedPackets: this.previewDroppedPackets,
+            storageFileToken: this.storageFileToken, storageError: this.storageDataSendError?.message || null,
             isRunning: this.isRunning, isCollecting: this.isCollecting, collectionPaused: this.collectionPaused,
             currentTaskId: this.currentTaskId, currentStageName: this.currentStageName, stageFileOpen: this.stageFileOpen,
             clientCount: this.clients.size, packetCount: this.emg_packet_count, mocapPacketCount: this.mocap_packet_count,
@@ -1821,26 +1830,40 @@ class RealtimeEngine extends EventEmitter {
     }
 
     stop() {
-        return new Promise(async (resolve) => {
+        return this._stopInternal();
+    }
+
+    async _stopInternal() {
+            this.stopping = true;
+            for (const name of ['connectTimeoutTimer', 'mocapConnectTimeoutTimer',
+                'cameraConnectTimeoutTimer', 'reconnectTimer', 'mocap_reconnectTimer', 'camera_reconnectTimer']) {
+                clearTimeout(this[name]); this[name] = null;
+            }
             this.isRunning = false;
-            
-            if (this.stageFileOpen && !this.isClosingStageFile) await this.closeStageFile();
             this.isCollecting = false;
+            this.collectionPaused = true;
+
+            await this.collectionCommandChain;
+            if (this.stageFileOpen || this.stageFileOpening || this.stageFileOpenPromise || this.isClosingStageFile || this.stageFileCreateFailed || this.videoRecordingStarted) {
+                const result = await this.onCollectionStop(false);
+                if (result.status !== 'success') throw new Error(result.msg || '采集收尾失败');
+            }
 
             this.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) client.close(1001, '服务器关闭');
             });
             this.clients.clear();
 
-            if (this.websocket_server) {
-                const closeTimeout = setTimeout(() => resolve(), 3000);
+            if (this.websocket_server) await new Promise(resolve => {
+                const closeTimeout = setTimeout(resolve, 3000);
                 this.websocket_server.close(() => { clearTimeout(closeTimeout); resolve(); });
-            } else {
-                resolve();
-            }
+            });
 
             if (this.ble_client) { this.ble_client.close(1000); this.ble_client = null; }
             if (this.mocap_client) { this.mocap_client.close(1000); this.mocap_client = null; }
+            if (this.camera_client) { this.camera_client.close(1000); this.camera_client = null; }
+            this.camera_connected = this.mocap_connected = false;
+            this.storage_connected = this.storage_push_connected = false;
 
             // 【新增】关闭 ZMQ sockets
             try {
@@ -1850,7 +1873,7 @@ class RealtimeEngine extends EventEmitter {
 
             clearTimeout(this.reconnectTimer);
             clearTimeout(this.mocap_reconnectTimer);
-        });
+            return { status: 'success' };
     }
 }
 

@@ -1,217 +1,218 @@
-/**
- * logger.js - 日志管理模块
- * 
- * 功能：
- * 1. 自动创建 log 目录
- * 2. 日志文件大小限制（默认 20MB）
- * 3. 日志文件数量限制（默认 10 个）
- * 4. 自动轮询：超过大小创建新文件，超过数量删除最旧文件
- * 5. 同时输出到终端和文件
- */
+'use strict';
 
 const fs = require('fs');
 const path = require('path');
+const util = require('util');
+
+const consolePatch = { originals: null, logger: null };
+
+function formatArgs(args) {
+    try {
+        return util.format(...args);
+    } catch (error) {
+        return args.map(value => {
+            try { return util.inspect(value, { depth: 5, breakLength: Infinity }); }
+            catch { return `[Unformattable: ${error.message}]`; }
+        }).join(' ');
+    }
+}
 
 class Logger {
     constructor(options = {}) {
-        // 如果传入了 logDir 就使用，否则使用默认的 __dirname/log
         this.logDir = options.logDir || path.join(__dirname, 'log');
-        this.maxFileSize = options.maxFileSize || 20 * 1024 * 1024;  // 默认 20MB
-        this.maxFiles = options.maxFiles || 10;  // 默认保留 10 个文件
+        this.maxFileSize = options.maxFileSize ?? 20 * 1024 * 1024;
+        this.maxFiles = options.maxFiles ?? 10;
+        this.maxLineBytes = options.maxLineBytes ?? 64 * 1024;
         this.filePrefix = options.filePrefix || 'server';
-        
         this.currentLogFile = null;
         this.currentStream = null;
         this.currentFileSize = 0;
-        
-        // 保存原始的 console 方法
-        this.originalLog = console.log;
-        this.originalError = console.error;
-        this.originalWarn = console.warn;
-        
+        this.sequence = 0;
+        this.closed = false;
+        this.droppedLogCount = 0;
+        this.backpressured = false;
+        this._closePromise = null;
+        this.endingStreams = new Set();
+        this.originalLog = consolePatch.originals?.log || console.log;
+        this.originalError = consolePatch.originals?.error || console.error;
+        this.originalWarn = consolePatch.originals?.warn || console.warn;
         this.init();
     }
 
-    /**
-     * 初始化日志系统
-     */
     init() {
-        // 创建 log 目录
-        if (!fs.existsSync(this.logDir)) {
-            fs.mkdirSync(this.logDir, { recursive: true });
-        }
-
-        // 清理旧日志文件（启动时检查）
+        fs.mkdirSync(this.logDir, { recursive: true });
         this.cleanOldLogs();
-
-        // 创建或打开当前日志文件
         this.openLogFile();
-
-        // 重写 console 方法
         this.overrideConsole();
-
         this.originalLog(`[Logger] 日志系统已启动，日志目录: ${this.logDir}`);
-        this.originalLog(`[Logger] 单文件大小限制: ${(this.maxFileSize / 1024 / 1024).toFixed(1)}MB, 最大文件数: ${this.maxFiles}`);
     }
 
-    /**
-     * 生成日志文件名
-     */
     generateFileName() {
         const now = new Date();
-        const timestamp = now.toISOString()
-            .replace(/[:.]/g, '-')
-            .replace('T', '_')
-            .slice(0, 19);
-        return `${this.filePrefix}_${timestamp}.log`;
+        const stamp = now.toISOString().replace(/[-:]/g, '').replace('T', '_').replace('Z', '');
+        this.sequence = (this.sequence + 1) % 1000000;
+        return `${this.filePrefix}_${stamp}_${process.pid}_${String(this.sequence).padStart(6, '0')}.log`;
     }
 
-    /**
-     * 打开新的日志文件
-     */
+    _attachStream(stream) {
+        this.endingStreams.add(stream);
+        stream.once('close', () => this.endingStreams.delete(stream));
+        stream.on('error', error => {
+            // A disk error must never become an uncaught exception in the collector.
+            if (this.currentStream === stream) {
+                this.currentStream = null;
+                this.backpressured = false;
+            }
+            this.originalError(`[Logger] 日志流错误: ${error.message}`);
+        });
+        stream.on('drain', () => {
+            this.backpressured = false;
+            if (this.droppedLogCount > 0 && this.currentStream === stream) {
+                const dropped = this.droppedLogCount;
+                this.droppedLogCount = 0;
+                const warning = `[${new Date().toISOString()}] [WARN] 日志背压期间丢弃 ${dropped} 条日志\n`;
+                try {
+                    if (stream.write(warning)) this.currentFileSize += Buffer.byteLength(warning);
+                    else this.backpressured = true;
+                } catch (error) {
+                    this.originalWarn(`[Logger] 日志背压期间丢弃 ${dropped} 条日志`);
+                }
+            }
+        });
+    }
+
     openLogFile() {
-        // 关闭之前的流
-        if (this.currentStream) {
-            this.currentStream.end();
+        const previous = this.currentStream;
+        if (previous) {
+            previous.end();
         }
-
         this.currentLogFile = path.join(this.logDir, this.generateFileName());
-        this.currentStream = fs.createWriteStream(this.currentLogFile, { flags: 'a' });
+        this.currentStream = fs.createWriteStream(this.currentLogFile, { flags: 'wx' });
         this.currentFileSize = 0;
-
-        // 如果文件已存在，获取其大小
-        if (fs.existsSync(this.currentLogFile)) {
-            const stat = fs.statSync(this.currentLogFile);
-            this.currentFileSize = stat.size;
-        }
+        this.backpressured = false;
+        this._attachStream(this.currentStream);
     }
 
-    /**
-     * 写入日志
-     */
-    write(message) {
-        const timestamp = new Date().toISOString();
-        const logLine = `[${timestamp}] ${message}\n`;
-        const lineSize = Buffer.byteLength(logLine, 'utf8');
-
-        // 检查是否需要轮询
-        if (this.currentFileSize + lineSize > this.maxFileSize) {
-            this.rotate();
-        }
-
-        // 写入文件
-        if (this.currentStream) {
-            this.currentStream.write(logLine);
-            this.currentFileSize += lineSize;
-        }
-    }
-
-    /**
-     * 日志轮询
-     */
-    rotate() {
-        this.originalLog(`[Logger] 日志文件达到大小限制，正在轮询...`);
-        
-        // 打开新文件
-        this.openLogFile();
-        
-        // 清理旧文件
-        this.cleanOldLogs();
-    }
-
-    /**
-     * 清理旧日志文件
-     */
     cleanOldLogs() {
         try {
             const files = fs.readdirSync(this.logDir)
-                .filter(f => f.startsWith(this.filePrefix) && f.endsWith('.log'))
-                .map(f => ({
-                    name: f,
-                    path: path.join(this.logDir, f),
-                    mtime: fs.statSync(path.join(this.logDir, f)).mtime.getTime()
-                }))
-                .sort((a, b) => b.mtime - a.mtime);  // 按修改时间降序
-
-            // 删除超出数量限制的旧文件
-            if (files.length > this.maxFiles) {
-                const toDelete = files.slice(this.maxFiles);
-                toDelete.forEach(file => {
-                    fs.unlinkSync(file.path);
-                    this.originalLog(`[Logger] 删除旧日志: ${file.name}`);
-                });
+                .filter(name => name.startsWith(`${this.filePrefix}_`) && name.endsWith('.log'))
+                .map(name => {
+                    const filePath = path.join(this.logDir, name);
+                    const stat = fs.statSync(filePath);
+                    return { name, filePath, mtimeMs: stat.mtimeMs };
+                })
+                .sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
+            for (const file of files.slice(this.maxFiles)) {
+                try { fs.unlinkSync(file.filePath); }
+                catch (error) { this.originalError(`[Logger] 清理旧日志失败: ${error.message}`); }
             }
-        } catch (err) {
-            this.originalError(`[Logger] 清理旧日志失败: ${err.message}`);
+        } catch (error) {
+            this.originalError(`[Logger] 清理旧日志失败: ${error.message}`);
         }
     }
 
-    /**
-     * 重写 console 方法
-     */
+    rotate() {
+        if (this.closed) return;
+        this.originalLog('[Logger] 日志文件达到大小限制，正在轮换...');
+        this.openLogFile();
+        this.cleanOldLogs();
+    }
+
+    write(...args) {
+        if (this.closed) return false;
+        let message = formatArgs(args);
+        if (Buffer.byteLength(message, 'utf8') > this.maxLineBytes) {
+            message = Buffer.from(message, 'utf8').subarray(0, this.maxLineBytes)
+                .toString('utf8') + ' [log entry truncated]';
+        }
+        const logLine = `[${new Date().toISOString()}] ${message}\n`;
+        const lineSize = Buffer.byteLength(logLine, 'utf8');
+        if (this.currentFileSize + lineSize > this.maxFileSize) this.rotate();
+        const stream = this.currentStream;
+        if (!stream || this.backpressured) {
+            this.droppedLogCount += 1;
+            return false;
+        }
+        try {
+            const accepted = stream.write(logLine);
+            this.currentFileSize += lineSize;
+            if (!accepted) this.backpressured = true;
+            return accepted;
+        } catch (error) {
+            this.originalError(`[Logger] 写入日志失败: ${error.message}`);
+            return false;
+        }
+    }
+
     overrideConsole() {
-        const self = this;
-
-        console.log = function(...args) {
-            const message = args.map(arg => 
-                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
-            ).join(' ');
-            
-            self.write(message);
-            self.originalLog.apply(console, args);
-        };
-
-        console.error = function(...args) {
-            const message = '[ERROR] ' + args.map(arg => 
-                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
-            ).join(' ');
-            
-            self.write(message);
-            self.originalError.apply(console, args);
-        };
-
-        console.warn = function(...args) {
-            const message = '[WARN] ' + args.map(arg => 
-                typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)
-            ).join(' ');
-            
-            self.write(message);
-            self.originalWarn.apply(console, args);
-        };
-    }
-
-    /**
-     * 关闭日志系统
-     */
-    close() {
-        if (this.currentStream) {
-            this.currentStream.end();
-            this.currentStream = null;
+        if (!consolePatch.originals) {
+            consolePatch.originals = {
+                log: console.log.bind(console),
+                error: console.error.bind(console),
+                warn: console.warn.bind(console)
+            };
         }
-        
-        // 恢复原始 console
-        console.log = this.originalLog;
-        console.error = this.originalError;
-        console.warn = this.originalWarn;
+        consolePatch.logger = this;
+        this.originalLog = consolePatch.originals.log;
+        this.originalError = consolePatch.originals.error;
+        this.originalWarn = consolePatch.originals.warn;
+        const logger = this;
+        console.log = (...args) => { logger.write(...args); logger.originalLog(...args); };
+        console.error = (...args) => { logger.write('[ERROR]', ...args); logger.originalError(...args); };
+        console.warn = (...args) => { logger.write('[WARN]', ...args); logger.originalWarn(...args); };
+    }
+
+    close() {
+        if (this._closePromise) return this._closePromise;
+        this.closed = true;
+        if (consolePatch.logger === this && consolePatch.originals) {
+            console.log = consolePatch.originals.log;
+            console.error = consolePatch.originals.error;
+            console.warn = consolePatch.originals.warn;
+            consolePatch.logger = null;
+        }
+        const stream = this.currentStream;
+        this.currentStream = null;
+        if (stream && this.droppedLogCount > 0 && !stream.destroyed) {
+            const dropped = this.droppedLogCount;
+            this.droppedLogCount = 0;
+            try { stream.write(`[${new Date().toISOString()}] [WARN] 关闭前累计丢弃 ${dropped} 条日志\n`); }
+            catch (error) { this.originalWarn(`[Logger] 关闭前累计丢弃 ${dropped} 条日志`); }
+        }
+        this._closePromise = new Promise(resolve => {
+            const streams = [...this.endingStreams];
+            if (!streams.length) return resolve();
+            let remaining = streams.length;
+            for (const item of streams) {
+                let settled = false;
+                const done = () => {
+                    if (settled) return;
+                    settled = true;
+                    remaining -= 1;
+                    item.removeListener?.('finish', done);
+                    item.removeListener?.('close', done);
+                    if (remaining <= 0) resolve();
+                };
+                item.once('close', done);
+                if (item.closed) done();
+                else if (item === stream) item.end();
+            }
+        });
+        return this._closePromise;
     }
 }
 
-// 创建单例
 let loggerInstance = null;
-
 function initLogger(options) {
-    if (!loggerInstance) {
-        loggerInstance = new Logger(options);
-    }
+    if (!loggerInstance || loggerInstance.closed) loggerInstance = new Logger(options);
     return loggerInstance;
 }
-
-function getLogger() {
-    return loggerInstance;
+function getLogger() { return loggerInstance; }
+function resetLogger() {
+    const current = loggerInstance;
+    loggerInstance = null;
+    return current?.close();
 }
 
-module.exports = {
-    initLogger,
-    getLogger,
-    Logger
-};
+module.exports = { Logger, initLogger, getLogger, resetLogger, formatArgs };

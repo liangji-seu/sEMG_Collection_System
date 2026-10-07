@@ -202,9 +202,17 @@ class StatisticsPanel(QFrame):
         
         self.labels['created_at'].setText(str(attrs.get('created_at', '-'))[:19])
         
-        # 数据统计
-        emg1_frames = h5file['emg1'].shape[0] if 'emg1' in h5file else 0
-        emg2_frames = h5file['emg2'].shape[0] if 'emg2' in h5file else 0
+        # 数据统计：兼容原始/同步后的命名，只读取 shape 和时间端点。
+        def _first_dataset(names):
+            for name in names:
+                if name in h5file and isinstance(h5file[name], h5py.Dataset):
+                    return h5file[name]
+            return None
+
+        emg1_ds = _first_dataset(['emg1_2khz_adc', 'emg1_2khz', 'emg1_250hz_adc', 'emg1_250hz', 'emg1'])
+        emg2_ds = _first_dataset(['emg2_2khz_adc', 'emg2_2khz', 'emg2_250hz_adc', 'emg2_250hz', 'emg2'])
+        emg1_frames = emg1_ds.shape[0] if emg1_ds is not None else 0
+        emg2_frames = emg2_ds.shape[0] if emg2_ds is not None else 0
         # 【修改】4个IMU数据集（每设备2个IMU传感器）
         imu1a_frames = h5file['imu1a_ble'].shape[0] if 'imu1a_ble' in h5file else 0
         imu1b_frames = h5file['imu1b_ble'].shape[0] if 'imu1b_ble' in h5file else 0
@@ -224,14 +232,35 @@ class StatisticsPanel(QFrame):
             prompts_count = h5file['prompts']['names'].shape[0]
         self.labels['prompts'].setText(str(prompts_count))
         
-        # 时长估算（基于EMG帧数和1000Hz采样率）
-        if emg1_frames > 0:
-            duration_sec = emg1_frames / 1000.0
+        # 优先使用真实 time 字段首尾；无 time 时才按命名采样率估算。
+        duration_sec = self._dataset_duration(emg1_ds, emg1_frames)
+        if duration_sec is None:
+            duration_sec = self._dataset_duration(emg2_ds, emg2_frames)
+        if duration_sec is None and emg1_frames > 0:
+            rate = 250.0 if emg1_ds is not None and '250hz' in str(emg1_ds.name).lower() else 2000.0
+            duration_sec = max(0.0, (emg1_frames - 1) / rate)
+        if duration_sec is not None:
             minutes = int(duration_sec // 60)
             seconds = duration_sec % 60
             self.labels['duration'].setText(f'{minutes}分{seconds:.1f}秒')
         else:
             self.labels['duration'].setText('-')
+
+    @staticmethod
+    def _dataset_duration(dataset, length=None):
+        """Read at most two records to derive a real timestamp duration."""
+        if dataset is None or (length if length is not None else len(dataset)) <= 0:
+            return None
+        names = dataset.dtype.names or ()
+        if 'time' not in names:
+            return None
+        try:
+            time_field = dataset.fields('time')
+            first = float(time_field[0])
+            last = float(time_field[-1])
+            return max(0.0, last - first)
+        except Exception:
+            return None
 
 
 class HDF5StageViewer(QMainWindow):
@@ -831,7 +860,8 @@ class HDF5StageViewer(QMainWindow):
                     self.table.setItem(i, col + j, item)
 
                 # 时间戳
-                item = QTableWidgetItem(f'{row["time"]:.9f}')
+                row_time = float(row['time']) if 'time' in dtype.names else float(i)
+                item = QTableWidgetItem(f'{row_time:.9f}')
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(i, col + n_channels, item)
 
@@ -846,7 +876,7 @@ class HDF5StageViewer(QMainWindow):
                 if has_sd_frame_id:
                     frame_info += f' SD={row["sd_frame_id"]}'
 
-                text_lines.append(f'帧{i:5d}:{frame_info} [{ch_str}] t={row["time"]:.9f}')
+                text_lines.append(f'帧{i:5d}:{frame_info} [{ch_str}] t={row_time:.9f}')
 
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.text_preview.setText('\n'.join(text_lines))
@@ -857,7 +887,12 @@ class HDF5StageViewer(QMainWindow):
             plot_n = min(5000, full_dataset.shape[0])
             plot_data = full_dataset[:plot_n]
             channels_data = plot_data['channels']
-            timestamps = plot_data['time']
+            if 'time' in plot_data.dtype.names:
+                timestamps = np.asarray(plot_data['time'], dtype=np.float64)
+            else:
+                rate = float(full_dataset.attrs.get('sample_rate',
+                            250 if '250hz' in path.lower() else 2000))
+                timestamps = np.arange(plot_n, dtype=np.float64) / max(rate, 1.0)
             self.waveform.plot_emg(channels_data, timestamps, f'{path} 波形 (前{plot_n}帧)')
     
     def show_imu_data(self, path, data, dtype, full_dataset):
@@ -919,7 +954,7 @@ class HDF5StageViewer(QMainWindow):
 
             # 时间戳
             if 'time' in dtype.names:
-                item = QTableWidgetItem(f'{row["time"]:.9f}')
+                item = QTableWidgetItem(f'{float(row["time"]):.9f}')
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.table.setItem(i, col, item)
 
@@ -934,7 +969,7 @@ class HDF5StageViewer(QMainWindow):
             if 'gyr' in dtype.names:
                 parts.append(f'Gyr=[{row["gyr"][0]:8.4f}, {row["gyr"][1]:8.4f}, {row["gyr"][2]:8.4f}]')
             if 'time' in dtype.names:
-                parts.append(f't={row["time"]:.9f}')
+                parts.append(f't={float(row["time"]):.9f}')
             text_lines.append(f'帧{i:5d}: {" ".join(parts)}')
 
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -944,7 +979,11 @@ class HDF5StageViewer(QMainWindow):
         if HAS_MATPLOTLIB and full_dataset.shape[0] > 0:
             plot_n = min(2000, full_dataset.shape[0])
             plot_data = full_dataset[:plot_n]
-            timestamps = plot_data['time']
+            if 'time' in plot_data.dtype.names:
+                timestamps = np.asarray(plot_data['time'], dtype=np.float64)
+            else:
+                rate = float(full_dataset.attrs.get('sample_rate', 100.0))
+                timestamps = np.arange(plot_n, dtype=np.float64) / max(rate, 1.0)
             self.waveform.plot_imu(plot_data, timestamps, f'{path} IMU数据 (前{plot_n}帧)')
     
     def show_prompt_data(self, path, data):

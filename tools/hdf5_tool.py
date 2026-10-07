@@ -8,13 +8,13 @@ HDF5整合工具 - 结合查看和同步功能
 
 import sys
 import os
-# 必须在 import h5py 之前设置，解决 Win32 GetLastError()=33 文件锁冲突
-os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
 import json
 import glob
 import shutil
 import subprocess
 import threading
+import queue
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import h5py
 import numpy as np
@@ -30,6 +30,11 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
 from PyQt5.QtGui import QFont, QColor, QPalette, QPixmap, QImage
+try:
+    from file_access import h5_transaction, FileBusyError, exclusive_file
+except ImportError:
+    h5_transaction = None
+    FileBusyError = RuntimeError
 
 # cv2 用于视频帧读取（精确对齐标定功能）
 try:
@@ -39,6 +44,10 @@ except ImportError:
     HAS_CV2 = False
 
 import time as _time_module  # 避免与 calibrate_tool 中 time 冲突
+try:
+    from video_timeline import VideoTimeline
+except ImportError:  # 作为独立脚本运行时的兼容路径
+    from tools.video_timeline import VideoTimeline
 
 HDF5_SIGNATURE = b'\x89HDF\r\n\x1a\n'
 
@@ -102,7 +111,12 @@ def _is_h5_stale_write_error(exc):
 
 
 def repair_h5_stale_write_flag(h5_path):
-    """Clear stale HDF5 v3 write-access flag left by an ungraceful process exit.
+    """Clear a stale HDF5 v3 write-access flag after the file is known idle.
+
+    Preconditions: the caller has independently confirmed that no recorder or
+    other process currently has this file open for writing. This function edits
+    the raw superblock and creates a backup, so it remains an explicit
+    maintenance operation rather than an automatic open fallback.
 
     Returns (ok, message). A backup is created before modifying the file.
     """
@@ -141,7 +155,62 @@ def ensure_h5_openable(h5_path):
     except Exception as e:
         if not _is_h5_stale_write_error(e):
             return False, str(e)
-        return repair_h5_stale_write_flag(h5_path)
+        return False, 'HDF5 文件可能仍在采集或被其他程序占用，请先停止采集并关闭占用程序后重试'
+
+
+def _sync_output_is_valid(h5_path, device_id, result, require_imu=False):
+    """Validate one device result before an H5 transaction can be committed."""
+    status = result.get('status') if isinstance(result, dict) else None
+    if status == 'success':
+        if int(result.get('frames_2khz', 0) or 0) <= 0:
+            return False, 'EMG 2kHz 输出为空'
+        if require_imu and (result.get('imu_status') != 'success' or
+                             int(result.get('imu_frames', 0) or 0) <= 0):
+            return False, '必需 IMU 输出为空或无效'
+        try:
+            with h5py.File(h5_path, 'r') as f:
+                emg_name = f'emg{device_id}_2khz_adc'
+                if emg_name not in f or f[emg_name].shape[0] <= 0:
+                    return False, 'EMG 2kHz 数据集为空'
+                if require_imu:
+                    imu_names = [f'imu{device_id}{ch}_100hz' for ch in ('a', 'b', 'c', 'd')]
+                    count = int(result.get('imu_count') or f.attrs.get(f'imu{device_id}_num_imus', 1))
+                    if not all(name in f and f[name].shape[0] > 0 for name in imu_names[:count]):
+                        return False, '必需 IMU 数据集为空'
+        except Exception as exc:
+            return False, f'输出数据集检查失败: {exc}'
+        return True, ''
+    if status == 'skipped' and result.get('reason') in ('already_synced', 'already_validated'):
+        try:
+            with h5py.File(h5_path, 'r') as f:
+                if not device_sync_record_valid(f, device_id):
+                    return False, '缺少逐设备同步验证记录，需要重新同步'
+                emg_name = f'emg{device_id}_2khz_adc'
+                if emg_name not in f or f[emg_name].shape[0] <= 0:
+                    return False, '已验证设备缺少非空 EMG 2kHz 输出'
+                if require_imu:
+                    imu_names = [f'imu{device_id}{ch}_100hz' for ch in ('a', 'b', 'c', 'd')]
+                    if not any(name in f and f[name].shape[0] > 0 for name in imu_names):
+                        return False, '已验证设备缺少非空 IMU 输出'
+            return True, ''
+        except Exception as exc:
+            return False, f'已验证输出检查失败: {exc}'
+    return False, result.get('reason', '同步结果未通过') if isinstance(result, dict) else '同步结果无效'
+
+
+def _aggregate_sync_devices(h5_path, device_results):
+    """Return aggregate success and per-device diagnostics for a staged H5."""
+    details = []
+    all_valid = bool(device_results)
+    for device_id, result, require_imu in device_results:
+        valid, reason = _sync_output_is_valid(h5_path, device_id, result, require_imu)
+        detail = dict(result) if isinstance(result, dict) else {'status': 'error'}
+        detail.pop('imu_missing_frame_ids', None)
+        detail.update({'device_id': device_id, 'required_imu': require_imu,
+                       'valid': valid, 'validation_error': reason})
+        details.append(detail)
+        all_valid = all_valid and valid
+    return all_valid, details
 
 # 导入bin_sync_tool中的同步功能
 try:
@@ -154,7 +223,8 @@ try:
                                sync_h5_one_to_one_multibin_rescue,
                                find_bin_offset_by_adc,
                                diagnose_frame_ids, clear_sync_outputs,
-                               append_sync_history)
+                               append_sync_history, update_sync_status,
+                               sync_status_summary, device_sync_record_valid)
     HAS_SYNC_TOOL = True
 except ImportError:
     HAS_SYNC_TOOL = False
@@ -165,6 +235,14 @@ HAS_CALIBRATE_TOOL = None
 FigureCanvas = None
 Figure = None
 HAS_MATPLOTLIB = None
+
+
+def _request_file_edit(widget, paths):
+    """Ask the owning GUI window to close read handles before offline edits."""
+    window = widget.window()
+    signal = getattr(window, 'prepare_file_edit', None)
+    if signal is not None:
+        signal.emit(list(paths))
 
 
 def ensure_calibrate_tool():
@@ -506,206 +584,93 @@ class SyncWorker(QThread):
                 break
         return next_emg, next_imu
 
-    def run(self):
-        if not HAS_SYNC_TOOL:
-            self.finished_signal.emit(False, "同步功能不可用：无法导入bin_sync_tool")
+    def _sync_device_transactional(self, h5_path, device_id, emg_bin, imu_bin):
+        if self.sync_mode == 'one_to_one':
+            repair_250hz_timestamps_in_h5(h5_path, device_id, log_cb=self.log.emit)
+            result = sync_h5_one_to_one(
+                h5_path=h5_path, emg_bin_path=emg_bin, imu_bin_path=imu_bin,
+                device_id=device_id, verify=self.validate_data, set_synced=False)
+            if result.get('status') == 'validation_failed':
+                next_emg, next_imu = self._find_next_bin_pair(emg_bin)
+                candidates = [emg_bin]
+                imu_candidates = [imu_bin]
+                if next_emg:
+                    candidates.append(next_emg)
+                    imu_candidates.append(next_imu)
+                result = sync_h5_one_to_one_multibin_rescue(
+                    h5_path=h5_path, emg_bin_paths=candidates,
+                    imu_bin_paths=imu_candidates, device_id=device_id,
+                    verify=self.validate_data, set_synced=False)
+            return result
+        if self.sync_mode == 'one_to_many':
+            return sync_h5_one_to_many_adc_search(
+                h5_path=h5_path, emg_bin_path=emg_bin, imu_bin_path=imu_bin,
+                device_id=device_id, verify=self.validate_data, set_synced=False)
+        return sync_h5_with_bin(
+            h5_path=h5_path, emg_bin_path=emg_bin, imu_bin_path=imu_bin,
+            device_id=device_id, verify=self.validate_data, set_synced=False)
+
+    def _run_transactional(self):
+        if not HAS_SYNC_TOOL or h5_transaction is None:
+            self.finished_signal.emit(False, "同步功能不可用：离线事务依赖未加载")
             return
+        total = len(self.h5_files)
+        success_count = 0
+        device_ids = sorted({int(name[-1]) for name in self.devices
+                              if name[-1:] in ('1', '2')})
+        for index, h5_file in enumerate(self.h5_files):
+            self.progress.emit(index + 1, total, os.path.basename(h5_file))
+            self.log.emit(f"\n处理文件: {os.path.basename(h5_file)}")
+            ok, message = ensure_h5_openable(h5_file)
+            if not ok:
+                self.log.emit(f"  ✗ H5文件无法打开: {message}")
+                continue
+            specs = []
+            missing = []
+            for device_id in device_ids:
+                emg_bin, imu_bin = self._find_bin_files(h5_file, device_id)
+                require_imu = f'imu{device_id}' in self.devices
+                if not emg_bin:
+                    missing.append(f'D{device_id} EMG bin')
+                if require_imu and not imu_bin:
+                    missing.append(f'D{device_id} IMU bin')
+                if emg_bin and (not require_imu or imu_bin):
+                    specs.append((device_id, emg_bin, imu_bin, require_imu))
+            if missing or not specs:
+                self.log.emit(f"  ✗ 未满足必需设备: {', '.join(missing) or '无可同步设备'}")
+                continue
+            try:
+                with h5_transaction(h5_file) as work_path:
+                    device_results = []
+                    for device_id, emg_bin, imu_bin, require_imu in specs:
+                        try:
+                            result = self._sync_device_transactional(
+                                work_path, device_id, emg_bin, imu_bin)
+                        except Exception as exc:
+                            result = {'status': 'error', 'reason': str(exc)}
+                        device_results.append((device_id, result, require_imu))
+                        self.log.emit(
+                            f"    {device_id}: {result.get('status', 'error')} "
+                            f"{result.get('reason', '')}")
+                    aggregate_ok, details = _aggregate_sync_devices(
+                        work_path, device_results)
+                    if not aggregate_ok:
+                        raise RuntimeError(json.dumps(details, ensure_ascii=False, default=str))
+                    with h5py.File(work_path, 'a') as f:
+                        for device_id, result, _require_imu in device_results:
+                            source = next(spec[1] for spec in specs if spec[0] == device_id)
+                            update_sync_status(f, device_id, source_path=source,
+                                imu_result=result, validation_passed=bool(self.validate_data))
+                        f.attrs['sync_last_operation_results'] = json.dumps(
+                            details, ensure_ascii=False, default=str)
+                success_count += 1
+            except Exception as exc:
+                self.log.emit(f"  ✗ 事务回滚，原文件保持不变: {exc}")
+        self.finished_signal.emit(True, f"完成: {success_count}/{total} 个文件同步成功")
 
-        try:
-            total = len(self.h5_files)
-            success_count = 0
-            skipped_count = 0
+    def run(self):
+        return self._run_transactional()
 
-            # 根据勾选的设备确定需要处理的device_id列表
-            device_ids = set()
-            if 'emg1' in self.devices or 'imu1' in self.devices:
-                device_ids.add(1)
-            if 'emg2' in self.devices or 'imu2' in self.devices:
-                device_ids.add(2)
-
-            # 检查是否需要双设备同步（两个设备都被勾选）
-            require_both_devices = len(device_ids) == 2
-
-            for i, h5_file in enumerate(self.h5_files):
-                self.progress.emit(i + 1, total, os.path.basename(h5_file))
-                self.log.emit(f"\n处理文件: {os.path.basename(h5_file)}")
-
-                ok, repair_msg = ensure_h5_openable(h5_file)
-                if not ok:
-                    self.log.emit(f"  ✗ H5文件无法打开: {repair_msg}")
-                    continue
-                if repair_msg != 'ok':
-                    self.log.emit(f"  [h5clear] {repair_msg}")
-
-                # 【新增】如果需要双设备同步，先检查H5文件是否有两个设备的bin文件配置
-                if require_both_devices:
-                    # 检查H5文件中是否配置了两个设备的bin文件前缀
-                    try:
-                        with h5py.File(h5_file, 'r') as f:
-                            sd_bin_dev1 = f.attrs.get('sd_bin_dev1', None)
-                            sd_bin_dev2 = f.attrs.get('sd_bin_dev2', None)
-
-                            # 如果H5文件配置了两个设备的bin文件，则必须两个都能找到
-                            if sd_bin_dev1 and sd_bin_dev2:
-                                # 检查两个设备的bin文件是否都存在
-                                missing_devices = []
-                                for dev_id in [1, 2]:
-                                    emg_bin_path, imu_bin_path = self._find_bin_files(h5_file, dev_id)
-                                    # 检查EMG bin文件（主要数据）
-                                    if f'emg{dev_id}' in self.devices and not emg_bin_path:
-                                        missing_devices.append(dev_id)
-
-                                if missing_devices:
-                                    self.log.emit(f"  ⚠️ 警告: 此H5文件需要两个设备的bin文件，但设备{missing_devices}的bin文件缺失")
-                                    self.log.emit(f"  ✗ 跳过此文件: 双设备模式要求两个设备的bin文件都存在")
-                                    skipped_count += 1
-                                    continue
-                    except Exception as e:
-                        self.log.emit(f"  ✗ 检查bin文件配置失败: {str(e)}")
-                        continue
-
-                file_success = False
-                # 判断此H5文件需要同步几个设备
-                devices_to_sync = []
-                for device_id in sorted(device_ids):
-                    emg_bin_path, imu_bin_path = self._find_bin_files(h5_file, device_id)
-                    emg_bin = emg_bin_path if (f'emg{device_id}' in self.devices) else None
-                    imu_bin = imu_bin_path if (f'imu{device_id}' in self.devices) else None
-                    if emg_bin:
-                        devices_to_sync.append((device_id, emg_bin, imu_bin))
-
-                total_devices = len(devices_to_sync)
-
-                for idx, (device_id, emg_bin, imu_bin) in enumerate(devices_to_sync):
-                    try:
-                        self.log.emit(f"  设备{device_id}:")
-                        self.log.emit(f"    EMG bin: {os.path.basename(emg_bin)}")
-                        if imu_bin:
-                            self.log.emit(f"    IMU bin: {os.path.basename(imu_bin)}")
-
-                        # 【修复】同步前先消除 250Hz 时间戳重叠
-                        # 原因：采集端按 BLE 包的到达时刻往前推 4ms 生成包内 9 帧的
-                        # 时间戳，通知到达成簇时后一包会早于前一包结束（整包 32ms 重叠）。
-                        # 这里只做单调化（只往后推、不拉早），保留采集端记录的墙钟；
-                        # 不再用 sd_frame_id 重建 —— 它是蓝牙包序号派生的，包计数器重启
-                        # 会让它回退，重建会毁掉真实墙钟。
-                        if self.sync_mode == 'one_to_one':
-                            repair_250hz_timestamps_in_h5(
-                                h5_file, device_id, log_cb=self.log.emit)
-
-                        # 判断是否是最后一个设备，只有最后一个设备同步完才设置synced
-                        is_last_device = (idx == total_devices - 1)
-
-                        if self.sync_mode == 'one_to_one':
-                            # 新格式：一个 H5 对一对 collection bin
-                            self.log.emit(f"    [one_to_one] bin_offset=0, auto_anchor")
-                            result = sync_h5_one_to_one(
-                                h5_path=h5_file,
-                                emg_bin_path=emg_bin,
-                                imu_bin_path=imu_bin,
-                                device_id=device_id,
-                                verify=self.validate_data,
-                                set_synced=is_last_device,
-                            )
-                            if result.get('status') == 'validation_failed':
-                                next_emg, next_imu = self._find_next_bin_pair(emg_bin)
-                                self.log.emit(f"    [rescue] 一对一校验失败，尝试补救同步")
-                                emg_candidates = [emg_bin]
-                                imu_candidates = [imu_bin]
-                                if next_emg:
-                                    self.log.emit(f"    [rescue] next EMG bin: {os.path.basename(next_emg)}")
-                                    if next_imu:
-                                        self.log.emit(f"    [rescue] next IMU bin: {os.path.basename(next_imu)}")
-                                    emg_candidates.append(next_emg)
-                                    imu_candidates.append(next_imu)
-                                else:
-                                    self.log.emit(f"    [rescue] 未找到下一组 bin，将尝试单 bin partial rescue")
-                                result = sync_h5_one_to_one_multibin_rescue(
-                                    h5_path=h5_file,
-                                    emg_bin_paths=emg_candidates,
-                                    imu_bin_paths=imu_candidates,
-                                    device_id=device_id,
-                                    verify=self.validate_data,
-                                    set_synced=is_last_device,
-                                )
-                        elif self.sync_mode == 'one_to_many':
-                            # 旧格式：ADC 搜索 offset
-                            result = sync_h5_one_to_many_adc_search(
-                                h5_path=h5_file,
-                                emg_bin_path=emg_bin,
-                                imu_bin_path=imu_bin,
-                                device_id=device_id,
-                                verify=self.validate_data,
-                                set_synced=is_last_device,
-                            )
-                        else:
-                            # legacy 兼容
-                            self.log.emit(f"    [legacy] using sync_h5_with_bin")
-                            result = sync_h5_with_bin(
-                                h5_path=h5_file,
-                                emg_bin_path=emg_bin,
-                                imu_bin_path=imu_bin,
-                                device_id=device_id,
-                                verify=self.validate_data,
-                                set_synced=is_last_device,
-                            )
-
-                        if result.get('status') == 'success':
-                            file_success = True
-                            self.log.emit(f"    ✓ EMG: {result['frames_2khz']}帧 "
-                                          f"(来自bin:{result['filled_frames']}, "
-                                          f"插值:{result['missing_frames']})")
-                            if result.get('imu_status') == 'success':
-                                # 显示帧数统计
-                                self.log.emit(f"    ✓ IMU: {result['imu_frames']}帧 "
-                                              f"(来自bin:{result['imu_filled']}, "
-                                              f"缺失:{result['imu_missing']})")
-                                # 显示传感器活跃状态
-                                active_cnt = result.get('imu_active_count', result.get('imu_count', '?'))
-                                active_indices = result.get('imu_active_indices', [])
-                                total_cnt = result.get('imu_count', '?')
-                                ch_labels = ['a', 'b', 'c', 'd']
-                                active_chs = [ch_labels[i] for i in active_indices if i < len(ch_labels)]
-                                inactive_indices = result.get('imu_inactive_indices', [])
-                                inactive_chs = [ch_labels[i] for i in inactive_indices if i < len(ch_labels)]
-                                parts = [f"bin解析: {total_cnt}个传感器"]
-                                if active_chs:
-                                    parts.append(f"活跃: {', '.join(active_chs)}")
-                                if inactive_chs:
-                                    parts.append(f"损坏已截断: {', '.join(inactive_chs)}")
-                                self.log.emit(f"      IMU状态: {' | '.join(parts)}")
-                            elif result.get('imu_status') == 'skipped':
-                                self.log.emit(f"    - IMU: 未找到bin文件，跳过")
-                        elif result.get('status') == 'skipped':
-                            self.log.emit(f"    - 跳过: {result.get('reason', '已同步')}")
-                        else:
-                            self.log.emit(f"    ✗ 失败: {result.get('reason', '未知错误')}")
-
-                    except Exception as e:
-                        self.log.emit(f"    ✗ 错误: {str(e)}")
-
-                # 如果没有找到任何可同步的设备
-                if total_devices == 0:
-                    for device_id in sorted(device_ids):
-                        if f'emg{device_id}' in self.devices:
-                            self.log.emit(f"  设备{device_id}:")
-                            self.log.emit(f"    ✗ 找不到EMG bin文件 (sd_bin_dev{device_id}属性缺失或文件不存在)")
-                        else:
-                            self.log.emit(f"  设备{device_id}:")
-                            self.log.emit(f"    - EMG未勾选，跳过")
-
-                if file_success:
-                    success_count += 1
-
-            # 构建完成消息
-            if skipped_count > 0:
-                msg = f"完成: {success_count}/{total} 个文件同步成功, {skipped_count} 个文件因bin文件不全被跳过"
-            else:
-                msg = f"完成: {success_count}/{total} 个文件同步成功"
-            self.finished_signal.emit(True, msg)
-
-        except Exception as e:
-            self.finished_signal.emit(False, f"同步出错: {str(e)}")
 
 
 class WaveformWidget(QWidget):
@@ -968,7 +933,7 @@ def scan_segment_chain(current_h5_path):
                     meta['file_path'] = fpath
                     meta['is_current'] = (fname == current_file)
                     # Phase 5 fix: read real sync_status
-                    sync = _safe_str(f.attrs.get('sync_status'))
+                    sync = sync_status_summary(f)['status']
                     meta['sync_status'] = sync if sync else 'unknown'
                     chain.append(meta)
             except Exception:
@@ -1459,7 +1424,7 @@ class StatisticsPanel(QFrame):
 
             with h5py.File(file_path, 'r') as f:
                 # 读取同步状态 — 中文显示 + 颜色
-                sync_status = f.attrs.get('sync_status', 'unknown')
+                sync_status = sync_status_summary(f)['status']
                 if isinstance(sync_status, bytes):
                     sync_status = sync_status.decode('utf-8')
                 SYNC_LABELS = {
@@ -2258,7 +2223,23 @@ class ViewerTab(QWidget):
     def show_data_preview(self, dataset, path):
         """显示数据预览"""
         try:
-            data = dataset[:]
+            # 预览不需要把整个数据集复制到内存。2kHz 数据集通常有数百万行，
+            # 这里若使用 dataset[:] 会在用户只想看前 100 行时分配数百 MB。
+            # 波形绘制最多使用前 2000 行，因此保留这个上限即可。
+            shape = getattr(dataset, 'shape', ())
+            if shape == ():
+                data = dataset[()]
+                # h5py may return a Python scalar for scalar string datasets;
+                # normalize it so the preview branches can use ndim safely.
+                if not hasattr(data, 'ndim'):
+                    data = np.asarray(data)
+                self._preview_total_rows = 1
+                self._preview_total_shape = ()
+            else:
+                preview_limit = max(int(self.preview_rows), 2000)
+                self._preview_total_rows = int(shape[0])
+                self._preview_total_shape = tuple(shape)
+                data = dataset[:min(self._preview_total_rows, preview_limit)]
             dtype = dataset.dtype
             is_emg = 'emg' in path.lower()
 
@@ -2322,6 +2303,7 @@ class ViewerTab(QWidget):
         precision = self.emg_precision
         max_rows = min(len(data), self.preview_rows)
         preview_data = data[:max_rows]
+        total_rows = getattr(self, '_preview_total_rows', len(data))
 
         fmt = self._get_h5_format_info()
         is_new = (fmt['stream_fmt_ver'] is not None and fmt['stream_fmt_ver'] >= 2)
@@ -2339,7 +2321,7 @@ class ViewerTab(QWidget):
                 hint_text = '旧格式 H5: 250Hz frame_id/sd_frame_id 可能为历史推算值, 仅供诊断'
 
         text_lines = [
-            f'【{path} - EMG数据预览 (前{max_rows}帧，共{len(data)}帧)】',
+            f'【{path} - EMG数据预览 (前{max_rows}帧，共{total_rows}帧)】',
             f'精度: {precision}位小数',
         ]
         if hint_text:
@@ -2438,9 +2420,10 @@ class ViewerTab(QWidget):
         """显示IMU结构化数据（带BLE帧号、SD卡帧号等）"""
         max_rows = min(len(data), self.preview_rows)
         preview_data = data[:max_rows]
+        total_rows = getattr(self, '_preview_total_rows', len(data))
 
         text_lines = [
-            f'【{path} - IMU数据预览 (前{max_rows}帧，共{len(data)}帧)】',
+            f'【{path} - IMU数据预览 (前{max_rows}帧，共{total_rows}帧)】',
             '═' * 100
         ]
 
@@ -2595,9 +2578,10 @@ class ViewerTab(QWidget):
         """显示Prompt数据（正确解码字节字符串）"""
         max_rows = min(len(data), self.preview_rows)
         preview_data = data[:max_rows]
+        total_rows = getattr(self, '_preview_total_rows', len(data))
 
         text_lines = [
-            f'【{path} - Prompt数据预览 (前{max_rows}条，共{len(data)}条)】',
+            f'【{path} - Prompt数据预览 (前{max_rows}条，共{total_rows}条)】',
             '═' * 80
         ]
 
@@ -2751,7 +2735,8 @@ class ViewerTab(QWidget):
         """更新文本视图"""
         precision = self.emg_precision if is_emg else 4
         lines = []
-        lines.append(f"Shape: {data.shape}")
+        shape = getattr(self, '_preview_total_shape', data.shape)
+        lines.append(f"Shape: {shape}")
         lines.append(f"Dtype: {data.dtype}")
 
         if data.ndim == 0:
@@ -2762,6 +2747,8 @@ class ViewerTab(QWidget):
             else:
                 lines.append(f"Value: {val}")
         elif np.issubdtype(data.dtype, np.number):
+            if shape != data.shape and data.ndim > 0:
+                lines.append(f"统计范围：仅基于前 {len(data)} 行预览")
             lines.append(f"Min: {np.min(data):.{precision}f}")
             lines.append(f"Max: {np.max(data):.{precision}f}")
             lines.append(f"Mean: {np.mean(data):.{precision}f}")
@@ -2770,16 +2757,17 @@ class ViewerTab(QWidget):
         lines.append("Data preview (first 20 rows):")
         lines.append("-" * 50)
 
-        preview_data = data[:min(20, len(data))]
         if data.ndim == 0:
-            lines.append(str(preview_data))
+            lines.append(str(data))
         elif data.ndim == 2:
+            preview_data = data[:min(20, len(data))]
             for i, row in enumerate(preview_data):
                 row_str = ", ".join([f"{v:.{precision}f}" if isinstance(v, (float, np.floating)) else str(v) for v in row[:10]])
                 if len(row) > 10:
                     row_str += ", ..."
                 lines.append(f"[{i}] {row_str}")
         else:
+            preview_data = data[:min(20, len(data))]
             lines.append(str(preview_data))
 
         self.text_view.setText("\n".join(lines))
@@ -2811,6 +2799,7 @@ class SyncCalibrationTab(QWidget):
         self.video_first_frame_unix = {}
         self.video_last_frame_unix = {}
         self.video_duration = {}
+        self.video_timelines = {}
         self._current_frame_idx = {'left': 0, 'right': 0}
         self._is_playing = False
         self._playback_timer = QTimer()
@@ -3242,6 +3231,15 @@ class SyncCalibrationTab(QWidget):
 
                 # 读取 video_timing 获取首帧/末帧 Unix 时间
                 self._load_video_timing(side)
+                self.video_timelines[side] = VideoTimeline.from_timing(
+                    frame_count=frame_count,
+                    reported_fps=self.video_fps[side],
+                    first_time=self.video_first_frame_unix.get(side, 0.0),
+                    last_time=(self.video_last_frame_unix.get(side, 0.0)
+                               if self.video_last_frame_unix.get(side, 0.0) > 0
+                               else None),
+                    duration=self.video_duration.get(side, 0.0),
+                )
 
                 # 显示第一帧
                 self._seek_and_display(side, 0)
@@ -3321,17 +3319,20 @@ class SyncCalibrationTab(QWidget):
                                    Qt.KeepAspectRatio, Qt.SmoothTransformation)
             lbl.setPixmap(QPixmap.fromImage(scaled))
 
-            # 更新时间标签（使用实际帧率，与 _mark_calibration 对齐）
-            first_u = self.video_first_frame_unix.get(side, 0)
-            last_u = self.video_last_frame_unix.get(side, 0)
-            actual_dur = last_u - first_u
-            effective_fps = total / actual_dur if actual_dur > 0 else self.video_fps.get(side, 30.0)
-            frame_time = frame_idx / effective_fps if effective_fps > 0 else 0
+            # 更新时间标签，端点按 N-1 个时间间隔映射。
+            timeline = self.video_timelines.get(side)
+            if timeline is None:
+                timeline = VideoTimeline.from_timing(
+                    total, self.video_fps.get(side, 30.0),
+                    self.video_first_frame_unix.get(side, 0.0),
+                    self.video_last_frame_unix.get(side) or None,
+                    self.video_duration.get(side, 0.0),
+                )
+            frame_unix = timeline.frame_to_time(frame_idx)
+            frame_time = max(0.0, frame_unix - timeline.first_time)
             m = int(frame_time // 60)
             s = int(frame_time % 60)
             ms = int((frame_time % 1) * 100)
-            frame_unix = first_u + frame_time
-
             lbl_time = getattr(self, f'lbl_video_{side}_time')
             lbl_time.setText(
                 f'Frame #{frame_idx}/{total - 1} | '
@@ -3359,12 +3360,9 @@ class SyncCalibrationTab(QWidget):
         # 使用视频实际帧率（取左右视频中实际帧率的较小值，避免过快）
         fps_list = []
         for side in self.video_caps:
-            first_u = self.video_first_frame_unix.get(side, 0)
-            last_u = self.video_last_frame_unix.get(side, 0)
-            total = self.video_frame_count.get(side, 0)
-            actual_dur = last_u - first_u
-            if actual_dur > 0 and total > 0:
-                fps_list.append(total / actual_dur)
+            timeline = self.video_timelines.get(side)
+            if timeline is not None and timeline.frame_count > 0:
+                fps_list.append(timeline.effective_fps)
             elif self.video_fps.get(side, 30) > 0:
                 fps_list.append(self.video_fps.get(side, 30))
         actual_fps = min(fps_list) if fps_list else 30.0
@@ -3391,12 +3389,9 @@ class SyncCalibrationTab(QWidget):
             # 使用视频实际帧率（取左右视频中实际帧率的较小值）
             fps_list = []
             for side in self.video_caps:
-                first_u = self.video_first_frame_unix.get(side, 0)
-                last_u = self.video_last_frame_unix.get(side, 0)
-                total = self.video_frame_count.get(side, 0)
-                actual_dur = last_u - first_u
-                if actual_dur > 0 and total > 0:
-                    fps_list.append(total / actual_dur)
+                timeline = self.video_timelines.get(side)
+                if timeline is not None and timeline.frame_count > 0:
+                    fps_list.append(timeline.effective_fps)
                 elif self.video_fps.get(side, 30) > 0:
                     fps_list.append(self.video_fps.get(side, 30))
             actual_fps = min(fps_list) if fps_list else 30.0
@@ -3464,13 +3459,16 @@ class SyncCalibrationTab(QWidget):
             frame_idx = self._current_frame_idx.get(side, 0)
             self._marked_frame[side] = frame_idx
 
-            # 计算视频帧的 Unix 时间（使用实际帧率，与数据可视化对齐）
-            first_u = self.video_first_frame_unix.get(side, 0)
-            last_u = self.video_last_frame_unix.get(side, 0)
             total = self.video_frame_count.get(side, frame_idx + 1)
-            actual_dur = last_u - first_u
-            effective_fps = total / actual_dur if actual_dur > 0 else self.video_fps.get(side, 30.0)
-            frame_unix = first_u + frame_idx / effective_fps
+            timeline = self.video_timelines.get(side)
+            if timeline is None:
+                timeline = VideoTimeline.from_timing(
+                    total, self.video_fps.get(side, 30.0),
+                    self.video_first_frame_unix.get(side, 0.0),
+                    self.video_last_frame_unix.get(side) or None,
+                    self.video_duration.get(side, 0.0),
+                )
+            frame_unix = timeline.frame_to_time(frame_idx)
 
             # 计算偏移量: offset = video_frame_unix - prompt_unix
             # 正值 = 视频帧时间戳晚于 prompt（视频滞后于 EMG）
@@ -3535,6 +3533,7 @@ class SyncCalibrationTab(QWidget):
         if reply != QMessageBox.Yes:
             return
 
+        _request_file_edit(self, [self.h5_path])
         try:
             # 关闭只读文件 → 以读写模式重新打开
             # Windows 文件锁需要确保所有引用释放
@@ -3552,6 +3551,7 @@ class SyncCalibrationTab(QWidget):
             self.video_first_frame_unix.clear()
             self.video_last_frame_unix.clear()
             self.video_duration.clear()
+            self.video_timelines.clear()
 
             if self.h5_file:
                 self.h5_file.close()
@@ -3564,21 +3564,21 @@ class SyncCalibrationTab(QWidget):
             # 短暂睡眠让 Windows 文件系统释放锁
             _time_module.sleep(0.3)
 
-            with h5py.File(h5_path, 'r+') as f:
-                for side in ('left', 'right'):
-                    offset = save_offset.get(side, 0.0)
-                    frame = save_frame.get(side)
-                    if frame is not None:
-                        f.attrs[f'calib_offset_{side}'] = offset
-                        f.attrs[f'calib_marked_frame_{side}'] = int(frame)
+            with h5_transaction(h5_path) as work_path:
+                with h5py.File(work_path, 'r+') as f:
+                    for side in ('left', 'right'):
+                        offset = save_offset.get(side, 0.0)
+                        frame = save_frame.get(side)
+                        if frame is not None:
+                            f.attrs[f'calib_offset_{side}'] = offset
+                            f.attrs[f'calib_marked_frame_{side}'] = int(frame)
 
-                # 元数据
-                f.attrs['calib_prompt_idx'] = save_prompt_idx
-                f.attrs['calib_prompt_time_unix'] = save_prompt_time
-                f.attrs['calib_marked_at'] = save_marked_at
-                f.attrs['calib_present'] = True
-
-                f.flush()
+                    # 元数据
+                    f.attrs['calib_prompt_idx'] = save_prompt_idx
+                    f.attrs['calib_prompt_time_unix'] = save_prompt_time
+                    f.attrs['calib_marked_at'] = save_marked_at
+                    f.attrs['calib_present'] = True
+                    f.flush()
 
             # 重新以只读模式打开
             self.h5_file = h5py.File(h5_path, 'r')
@@ -3619,6 +3619,7 @@ class SyncCalibrationTab(QWidget):
         self.video_first_frame_unix.clear()
         self.video_last_frame_unix.clear()
         self.video_duration.clear()
+        self.video_timelines.clear()
         self._current_frame_idx = {'left': 0, 'right': 0}
 
 
@@ -3667,6 +3668,11 @@ class CalibrateTab(QWidget):
         """关闭 H5 文件句柄（避免 Windows 文件锁冲突）"""
         if self.calibrate_widget is not None:
             cw = self.calibrate_widget
+            if cw.is_playing:
+                cw._stop_playback()
+            if cw.is_full_playing:
+                cw._stop_full_playback()
+            cw._close_videos()
             if cw.h5_file:
                 try:
                     cw.h5_file.close()
@@ -4052,7 +4058,7 @@ class SyncTab(QWidget):
         try:
             with h5py.File(file_path, 'r') as f:
                 # 已同步的跳过
-                sync_st = f.attrs.get('sync_status', 'unknown')
+                sync_st = sync_status_summary(f)['status']
                 if isinstance(sync_st, bytes):
                     sync_st = sync_st.decode('utf-8')
                 if sync_st == 'synced':
@@ -4199,6 +4205,7 @@ class SyncTab(QWidget):
             QMessageBox.warning(self, "警告", "请至少选择一个设备")
             return
 
+        _request_file_edit(self, self.h5_files)
         self.sync_btn.setEnabled(False)
         self._update_video_compress_controls()
         self.progress_bar.setVisible(True)
@@ -4230,7 +4237,7 @@ class SyncTab(QWidget):
             f"并行 ffmpeg 进程: {workers}\n"
             f"每进程线程: {threads}\n"
             f"理论编码线程占用: {workers * threads}\n\n"
-            "压缩成功后会更新 H5 的 video_left/video_right 指向 MP4，并删除原 AVI 文件，仅保留 MP4。\n"
+            "压缩成功后会更新 H5 的 video_left/video_right 指向 MP4，并保留原 AVI 文件。\n"
             "是否开始？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
@@ -4238,6 +4245,7 @@ class SyncTab(QWidget):
         if reply != QMessageBox.Yes:
             return
 
+        _request_file_edit(self, self.h5_files)
         self._compressing = True
         self._update_video_compress_controls()
         self.sync_btn.setEnabled(False)
@@ -4602,44 +4610,133 @@ def probe_video_duration(ffmpeg_path, video_path):
     return None
 
 
-def compress_video_to_mp4(ffmpeg_path, input_path, output_path, ffmpeg_threads, preset, crf, progress_cb=None):
-    """Compress one video to H.264 MP4. Temp file is replaced only on success."""
-    tmp_path = output_path + '.tmp.mp4'
-    if os.path.exists(tmp_path):
+def validate_video_output(input_path, output_path):
+    if not HAS_CV2:
+        raise RuntimeError('缺少 cv2，无法验证压缩视频')
+
+    def probe(path):
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            raise RuntimeError(f'视频无法解码: {path}')
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        advertised = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        frames = 0
+        size = None
         try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                if frame is None or frame.size == 0:
+                    raise RuntimeError(f'视频帧为空: {path}')
+                current_size = (int(frame.shape[1]), int(frame.shape[0]))
+                size = size or current_size
+                if current_size != size:
+                    raise RuntimeError(f'视频帧尺寸变化: {path}')
+                frames += 1
+        finally:
+            cap.release()
+        if frames <= 0:
+            raise RuntimeError(f'视频无可解码帧: {path}')
+        if advertised > 0 and frames != advertised:
+            raise RuntimeError(f'视频解码不完整: expected={advertised}, decoded={frames}, path={path}')
+        duration = frames / fps if fps > 0 else None
+        return frames, duration, size, fps
+
+    src_frames, src_duration, src_size, src_fps = probe(input_path)
+    out_frames, out_duration, out_size, out_fps = probe(output_path)
+    if src_frames != out_frames:
+        raise RuntimeError(f'MP4帧数不一致: source={src_frames}, output={out_frames}')
+    if src_size != out_size:
+        raise RuntimeError(f'MP4尺寸不一致: source={src_size}, output={out_size}')
+    if src_duration and out_duration:
+        tolerance = max(1.0 / max(src_fps, out_fps, 1.0), src_duration * 0.01)
+        if abs(out_duration - src_duration) > tolerance:
+            raise RuntimeError(
+                f'MP4时长异常: source={src_duration:.3f}s, output={out_duration:.3f}s')
+    return {
+        'source_frames': src_frames, 'output_frames': out_frames,
+        'source_duration': src_duration, 'output_duration': out_duration,
+        'source_size': src_size, 'output_size': out_size,
+    }
+
+
+def compress_video_to_mp4(ffmpeg_path, input_path, output_path, ffmpeg_threads, preset,
+                          crf, progress_cb=None, validate_cb=None, timeout_seconds=1800):
+    """Encode to a unique sibling temp file and atomically publish after validation."""
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f'.{Path(output_path).stem}.', suffix='.tmp.mp4',
+        dir=os.path.dirname(output_path)
+    )
+    os.close(fd)
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
 
     duration = probe_video_duration(ffmpeg_path, input_path)
     cmd = [
-        ffmpeg_path, '-y',
-        '-v', 'error',
-        '-i', input_path,
-        '-an',
-        '-c:v', 'libx264',
-        '-preset', preset,
-        '-crf', str(crf),
-        '-threads', str(max(1, int(ffmpeg_threads))),
-        '-pix_fmt', 'yuv420p',
-        '-movflags', '+faststart',
-        '-progress', 'pipe:1',
-        '-nostats',
-        tmp_path
+        ffmpeg_path, '-y', '-v', 'error', '-i', input_path, '-an',
+        '-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+        '-threads', str(max(1, int(ffmpeg_threads))), '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', tmp_path
     ]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-    )
-    last_emit = 0
-    stderr_tail = ''
     try:
-        while True:
-            line = proc.stdout.readline() if proc.stdout else ''
-            if line:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
+            encoding='utf-8', errors='replace',
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+        )
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    progress_lines = queue.Queue(maxsize=256)
+    stderr_tail = []
+
+    def drain_progress():
+        try:
+            for line in iter(lambda: proc.stdout.readline(4096), ''):
+                try:
+                    progress_lines.put_nowait(line)
+                except queue.Full:
+                    try:
+                        progress_lines.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        progress_lines.put_nowait(line)
+                    except queue.Full:
+                        pass
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+
+    def drain_stderr():
+        try:
+            for line in iter(lambda: proc.stderr.readline(4096), ''):
+                stderr_tail.append(line)
+                if len(stderr_tail) > 16:
+                    del stderr_tail[:-16]
+        finally:
+            if proc.stderr:
+                proc.stderr.close()
+
+    progress_thread = threading.Thread(target=drain_progress, daemon=True)
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    progress_thread.start()
+    stderr_thread.start()
+    last_emit = 0.0
+    deadline = _time_module.monotonic() + max(1, float(timeout_seconds))
+    rc = None
+    try:
+        while rc is None:
+            try:
+                line = progress_lines.get(timeout=0.1)
                 now = _time_module.time()
                 if line.startswith('out_time_ms=') and duration and progress_cb and now - last_emit > 1.5:
                     try:
@@ -4648,34 +4745,63 @@ def compress_video_to_mp4(ffmpeg_path, input_path, output_path, ffmpeg_threads, 
                         last_emit = now
                     except Exception:
                         pass
-            elif proc.poll() is not None:
-                break
-
-        if proc.stderr:
-            stderr_tail = proc.stderr.read()[-2000:]
-        rc = proc.wait(timeout=5)
-    except Exception:
+            except queue.Empty:
+                pass
+            rc = proc.poll()
+            if rc is None and _time_module.monotonic() >= deadline:
+                raise TimeoutError(f'ffmpeg timeout after {timeout_seconds}s')
+        proc.wait(timeout=5)
+    except BaseException:
         try:
             proc.kill()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
         raise
+    finally:
+        progress_thread.join(timeout=2)
+        stderr_thread.join(timeout=2)
 
+    stderr_text = ''.join(stderr_tail)
     if rc != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 0:
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
-        except Exception:
+        except OSError:
             pass
-        raise RuntimeError((stderr_tail or 'ffmpeg failed')[-500:])
+        raise RuntimeError((stderr_text or 'ffmpeg failed')[-500:])
 
-    os.replace(tmp_path, output_path)
+    try:
+        validation = validate_cb(tmp_path) if validate_cb else validate_video_output(input_path, tmp_path)
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
     if progress_cb:
         progress_cb(100.0)
-    return os.path.getsize(output_path)
+    result_size = os.path.getsize(output_path)
+    return {'size': result_size, 'validation': validation} if validate_cb else result_size
 
 
 _VIDEO_COMPRESS_H5_LOCK = threading.Lock()
+
+
+def _canonical_video_path(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
 
 
 class VideoCompressWorker(QThread):
@@ -4683,17 +4809,18 @@ class VideoCompressWorker(QThread):
     progress = pyqtSignal(int, int, str)
     finished_signal = pyqtSignal(int, int, object)
 
-    def __init__(self, h5_paths, max_workers=2, ffmpeg_threads=2, preset='superfast', crf=23):
+    def __init__(self, h5_paths, max_workers=2, ffmpeg_threads=2, preset='superfast', crf=23,
+                 timeout_seconds=1800):
         super().__init__()
         self.h5_paths = list(h5_paths)
         self.max_workers = max(1, int(max_workers))
         self.ffmpeg_threads = max(1, int(ffmpeg_threads))
         self.preset = preset
         self.crf = int(crf)
+        self.timeout_seconds = max(1, float(timeout_seconds))
 
     def _collect_jobs(self):
-        jobs = []
-        seen = set()
+        jobs_by_input = {}
         for h5_path in self.h5_paths:
             videos = find_h5_video_files(h5_path)
             if not videos:
@@ -4703,55 +4830,37 @@ class VideoCompressWorker(QThread):
                 if os.path.splitext(video_path)[1].lower() == '.mp4':
                     self.log.emit(f"  跳过已是MP4: {os.path.basename(video_path)}")
                     continue
-                key = os.path.abspath(video_path)
-                if key in seen:
-                    continue
-                seen.add(key)
-                jobs.append({
-                    'h5_path': h5_path,
-                    'side': side,
-                    'input': video_path,
-                    'output': os.path.splitext(video_path)[0] + '.mp4',
+                key = _canonical_video_path(video_path)
+                job = jobs_by_input.setdefault(key, {
+                    'input': os.path.realpath(video_path),
+                    'output': os.path.splitext(os.path.realpath(video_path))[0] + '.mp4',
+                    'references': [],
                 })
+                job['references'].append({'h5_path': h5_path, 'side': side})
+        jobs = list(jobs_by_input.values())
+        for job in jobs:
+            first = job['references'][0]
+            job['h5_path'] = first['h5_path']
+            job['side'] = first['side']
         return jobs
 
     def _update_h5_video_attr(self, h5_path, side, output_path, deleted_source=False):
         attr_key = 'video_left' if side == 'left' else 'video_right'
         source_attr = f'{attr_key}_source_avi'
         with _VIDEO_COMPRESS_H5_LOCK:
-            with h5py.File(h5_path, 'r+') as f:
-                old_value = _h5_attr_to_str(f.attrs.get(attr_key)) or ''
-                f.attrs[source_attr] = os.path.basename(old_value) if old_value else ''
-                f.attrs[attr_key] = os.path.basename(output_path)
-                f.attrs[f'{source_attr}_deleted'] = bool(deleted_source)
-                f.attrs['video_compressed_at'] = datetime.now().isoformat(timespec='seconds')
-                f.attrs['video_compression'] = 'h264_mp4'
+            if h5_transaction is None:
+                raise RuntimeError('离线事务依赖未加载')
+            with h5_transaction(h5_path) as work_path:
+                with h5py.File(work_path, 'r+') as f:
+                    old_value = _h5_attr_to_str(f.attrs.get(attr_key)) or ''
+                    f.attrs[source_attr] = os.path.basename(old_value) if old_value else ''
+                    f.attrs[attr_key] = os.path.basename(output_path)
+                    f.attrs[f'{source_attr}_deleted'] = bool(deleted_source)
+                    f.attrs['video_compressed_at'] = datetime.now().isoformat(timespec='seconds')
+                    f.attrs['video_compression'] = 'h264_mp4'
 
-    def _run_one(self, ffmpeg_path, job, job_no, total):
-        input_path = job['input']
-        output_path = job['output']
-        self.log.emit(f"  开始压缩: {os.path.basename(input_path)} -> {os.path.basename(output_path)}")
-
-        def on_progress(percent):
-            self.log.emit(f"    {os.path.basename(input_path)} {percent:.1f}%")
-
-        size_before = os.path.getsize(input_path)
-        size_after = compress_video_to_mp4(
-            ffmpeg_path, input_path, output_path,
-            self.ffmpeg_threads, self.preset, self.crf, on_progress
-        )
-        self._update_h5_video_attr(job['h5_path'], job['side'], output_path)
-        ratio = size_before / size_after if size_after > 0 else 0
-        return {
-            'success': True,
-            'input': input_path,
-            'output': output_path,
-            'side': job['side'],
-            'h5_path': job['h5_path'],
-            'size_before': size_before,
-            'size_after': size_after,
-            'ratio': ratio,
-        }
+    def _validate_video_output(self, input_path, output_path):
+        return validate_video_output(input_path, output_path)
 
     def _run_one(self, ffmpeg_path, job, job_no, total):
         input_path = job['input']
@@ -4763,31 +4872,47 @@ class VideoCompressWorker(QThread):
         def on_progress(percent):
             self.log.emit(f"[{job_no:02d}/{total:02d}] RUN   {percent:5.1f}% | {os.path.basename(input_path)}")
 
-        size_before = os.path.getsize(input_path)
-        size_after = compress_video_to_mp4(
-            ffmpeg_path, input_path, output_path,
-            self.ffmpeg_threads, self.preset, self.crf, on_progress
-        )
-        deleted_source = False
-        if os.path.splitext(input_path)[1].lower() == '.avi' and os.path.abspath(input_path) != os.path.abspath(output_path):
+        with exclusive_file(input_path):
+            size_before = os.path.getsize(input_path)
+            encoded = compress_video_to_mp4(
+                ffmpeg_path, input_path, output_path,
+                self.ffmpeg_threads, self.preset, self.crf, on_progress,
+                validate_cb=lambda candidate: self._validate_video_output(input_path, candidate),
+                timeout_seconds=self.timeout_seconds,
+            )
+            size_after = encoded['size'] if isinstance(encoded, dict) else encoded
+            validation = encoded.get('validation') if isinstance(encoded, dict) else None
+            if validation is None:
+                validation = self._validate_video_output(input_path, output_path)
+            references = job.get('references') or [{'h5_path': job['h5_path'], 'side': job['side']}]
+            updated = []
             try:
-                os.remove(input_path)
-                deleted_source = True
-            except Exception as delete_error:
-                self.log.emit(f"[{job_no:02d}/{total:02d}] WARN  AVI删除失败: {delete_error}")
-        self._update_h5_video_attr(job['h5_path'], job['side'], output_path, deleted_source=deleted_source)
-        ratio = size_before / size_after if size_after > 0 else 0
-        return {
-            'success': True,
-            'input': input_path,
-            'output': output_path,
-            'side': job['side'],
-            'h5_path': job['h5_path'],
-            'size_before': size_before,
-            'size_after': size_after,
-            'ratio': ratio,
-            'deleted_source': deleted_source,
-        }
+                for ref in references:
+                    self._update_h5_video_attr(
+                        ref['h5_path'], ref['side'], output_path, deleted_source=False)
+                    updated.append(ref)
+            except Exception as ref_error:
+                return {
+                    'success': False, 'partial': bool(updated), 'input': input_path,
+                    'output': output_path, 'side': job['side'],
+                    'h5_path': job['h5_path'], 'references_updated': len(updated),
+                    'error': f'H5 引用更新失败，源视频已保留: {ref_error}',
+                    'validation': validation,
+                }
+            ratio = size_before / size_after if size_after > 0 else 0
+            return {
+                'success': True,
+                'input': input_path,
+                'output': output_path,
+                'side': job['side'],
+                'h5_path': job['h5_path'],
+                'size_before': size_before,
+                'size_after': size_after,
+                'ratio': ratio,
+                'deleted_source': False,
+                'references_updated': len(updated),
+                'validation': validation,
+            }
 
     def run(self):
         ffmpeg_path = find_ffmpeg_for_hdf5_tool()
@@ -4808,7 +4933,7 @@ class VideoCompressWorker(QThread):
         self.log.emit("=" * 72)
         self.log.emit(f"ffmpeg: {ffmpeg_path}")
         self.log.emit(f"jobs={total} | parallel_ffmpeg={self.max_workers} | threads_per_ffmpeg={self.ffmpeg_threads} | preset={self.preset} | crf={self.crf}")
-        self.log.emit("成功后删除源 AVI，仅保留 MP4。")
+        self.log.emit("成功后更新 H5 视频引用，并保留源视频以便恢复。")
         self.log.emit("-" * 72)
         for idx, job in enumerate(jobs, 1):
             self.log.emit(f"[{idx:02d}/{total:02d}] QUEUE {job['side']:<5s} {os.path.basename(job['input'])}")
@@ -4832,17 +4957,19 @@ class VideoCompressWorker(QThread):
                 remaining = total - done
                 try:
                     res = fut.result()
-                    success += 1
                     results.append(res)
-                    self.log.emit(
-                        f"  完成: {os.path.basename(res['output'])} "
-                        f"{res['size_before']/(1024*1024):.1f}MB -> {res['size_after']/(1024*1024):.1f}MB "
-                        f"({res['ratio']:.1f}x)"
-                    )
-                    deleted_text = " | deleted AVI" if res.get('deleted_source') else ""
-                    self.log.emit(f"[{job_no:02d}/{total:02d}] DONE  {os.path.basename(res['output'])} "
-                                  f"{res['size_before']/(1024*1024):.1f}MB -> {res['size_after']/(1024*1024):.1f}MB "
-                                  f"({res['ratio']:.1f}x){deleted_text}")
+                    if res.get('success'):
+                        success += 1
+                        self.log.emit(
+                            f"  完成: {os.path.basename(res['output'])} "
+                            f"{res['size_before']/(1024*1024):.1f}MB -> {res['size_after']/(1024*1024):.1f}MB "
+                            f"({res['ratio']:.1f}x)"
+                        )
+                        self.log.emit(f"[{job_no:02d}/{total:02d}] DONE  {os.path.basename(res['output'])} "
+                                      f"{res['size_before']/(1024*1024):.1f}MB -> {res['size_after']/(1024*1024):.1f}MB "
+                                      f"({res['ratio']:.1f}x) | source retained")
+                    else:
+                        self.log.emit(f"  失败: {os.path.basename(res.get('input', job['input']))}: {res.get('error', 'unknown')}")
                 except Exception as e:
                     results.append({
                         'success': False,
@@ -5003,7 +5130,7 @@ class OneToManySyncTab(QWidget):
         info = {'status': 'unknown', 'mode': '-', 'cmap': '-', 'range_mode': '-', 'video_compressed': False}
         try:
             with h5py.File(h5_path, 'r') as f:
-                st = f.attrs.get('sync_status')
+                st = sync_status_summary(f)['status']
                 if isinstance(st, bytes): st = st.decode('utf-8')
                 info['status'] = st or 'unknown'
                 sm = f.attrs.get('sync_mode')
@@ -5141,7 +5268,7 @@ class OneToManySyncTab(QWidget):
             f"并行 ffmpeg 进程: {workers}\n"
             f"每进程线程: {threads}\n"
             f"理论编码线程占用: {total_threads}\n\n"
-            "压缩成功后会更新 H5 的 video_left/video_right 指向 MP4，并删除原 AVI 文件，仅保留 MP4。\n"
+            "压缩成功后会更新 H5 的 video_left/video_right 指向 MP4，并保留原 AVI 文件。\n"
             "是否开始？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
@@ -5149,6 +5276,7 @@ class OneToManySyncTab(QWidget):
         if reply != QMessageBox.Yes:
             return
 
+        _request_file_edit(self, self.h5_paths)
         self._compressing = True
         self._update_ui()
         self.progress_bar.setVisible(True)
@@ -5194,6 +5322,7 @@ class OneToManySyncTab(QWidget):
     def run_sync(self):
         if not self.h5_paths or not self.bin_dir or self._syncing or self._compressing:
             return
+        _request_file_edit(self, self.h5_paths)
         synced = self._get_synced_files()
         files_to_sync = list(self.h5_paths)
         clear_first = set()
@@ -5212,7 +5341,12 @@ class OneToManySyncTab(QWidget):
                 for _, p in synced:
                     self.log(f"清除旧同步: {os.path.basename(p)}")
                     try:
-                        clear_sync_outputs(p, backup=True)
+                        if h5_transaction is None:
+                            raise RuntimeError('离线事务依赖未加载')
+                        with h5_transaction(p) as work_path:
+                            r = clear_sync_outputs(work_path, backup=False)
+                            if not r.get('success'):
+                                raise RuntimeError('; '.join(r.get('errors', ['unknown'])))
                         clear_first.add(p)
                         self.refresh_file_status(p)
                     except Exception as e:
@@ -5226,6 +5360,7 @@ class OneToManySyncTab(QWidget):
             self.log("没有需要同步的文件")
             return
 
+        _request_file_edit(self, files_to_sync)
         self._syncing = True
         self._update_ui()
         self.progress_bar.setVisible(True)
@@ -5328,68 +5463,71 @@ class OneToManySyncWorker(QThread):
             pass
         return None, None
 
-    def run(self):
-        from bin_sync_tool import sync_h5_one_to_many_adc_search
+    def _run_transactional(self):
+        if h5_transaction is None:
+            self.finished.emit(0, len(self.h5_paths), [{'status': 'failed', 'reason': '离线事务依赖未加载'}])
+            return
         total = len(self.h5_paths)
         results = []
         success_count = 0
-
+        device_ids = [d for d, enabled in ((1, self.emg1 or self.imu),
+                                            (2, self.emg2 or self.imu)) if enabled]
         for idx, h5_path in enumerate(self.h5_paths):
             fname = os.path.basename(h5_path)
             self.file_started.emit(idx, total, fname)
-            self.log.emit(f"\n--- {fname} ---")
-
-            devices = []
-            if self.emg1: devices.append(1)
-            if self.emg2: devices.append(2)
-            ndev = len(devices)
-            file_ok = True
-            parts = []
-
-            for di, did in enumerate(devices):
-                emg_bin, imu_bin = self._find_bin(h5_path, did)
+            specs = []
+            missing = []
+            for device_id in device_ids:
+                emg_bin, imu_bin = self._find_bin(h5_path, device_id)
                 if not emg_bin:
-                    self.log.emit(f"  Dev{did}: 未找到 bin, 跳过")
-                    file_ok = False
-                    continue
-                is_last = (di == ndev - 1)
-                ini = imu_bin if self.imu else None
-                self.progress_text.emit(f"正在同步 {idx+1}/{total}: {fname} Dev{did}...")
-                self.log.emit(f"  Dev{did}: {os.path.basename(emg_bin)}")
-                try:
-                    r = sync_h5_one_to_many_adc_search(
-                        h5_path, emg_bin, ini, device_id=did,
-                        verify=True, set_synced=is_last,
-                        num_anchors=self.num_anchors,
-                        match_threshold=self.match_threshold,
-                    )
-                    if r.get('status') == 'success':
-                        cm = r.get('search_result', {}).get('channel_map_name', '?') if 'search_result' in r else r.get('channel_map_name', '?')
-                        mr = r.get('match_rate', '?')
-                        rm = r.get('search_result', {}).get('range_mode', '?') if 'search_result' in r else r.get('range_mode', '?')
-                        imu_s = r.get('imu_status', '?')
-                        imu_f = r.get('imu_frames', 0)
-                        parts.append(f"D{did}=OK(map={cm},rate={mr},range={rm},IMU={imu_s}/{imu_f}f)")
-                        self.log.emit(f"    OK offset={r.get('offset')} channel_map={cm} rate={mr} range={rm} IMU={imu_s}({imu_f}f)")
-                    else:
-                        parts.append(f"D{did}=FAIL")
-                        self.log.emit(f"    FAIL: {r.get('reason','?')}")
-                        file_ok = False
-                except Exception as e:
-                    parts.append(f"D{did}=ERR")
-                    self.log.emit(f"    ERROR: {e}")
-                    file_ok = False
-
-            status = 'success' if file_ok else 'failed'
-            summary = '; '.join(parts) if parts else 'no devices'
-            self.file_finished.emit(idx, total, fname, status, summary)
-            if file_ok:
+                    missing.append(f'D{device_id} EMG bin')
+                if self.imu and not imu_bin:
+                    missing.append(f'D{device_id} IMU bin')
+                if emg_bin and (not self.imu or imu_bin):
+                    specs.append((device_id, emg_bin, imu_bin))
+            if missing or not specs:
+                reason = ', '.join(missing) or '无可同步设备'
+                results.append({'file': fname, 'status': 'failed', 'reason': reason})
+                self.file_finished.emit(idx, total, fname, 'failed', reason)
+                continue
+            try:
+                with h5_transaction(h5_path) as work_path:
+                    device_results = []
+                    for device_id, emg_bin, imu_bin in specs:
+                        try:
+                            result = sync_h5_one_to_many_adc_search(
+                                work_path, emg_bin, imu_bin,
+                                device_id=device_id, verify=True, set_synced=False,
+                                num_anchors=self.num_anchors,
+                                match_threshold=self.match_threshold)
+                        except Exception as exc:
+                            result = {'status': 'error', 'reason': str(exc)}
+                        device_results.append((device_id, result, self.imu))
+                    aggregate_ok, details = _aggregate_sync_devices(
+                        work_path, device_results)
+                    if not aggregate_ok:
+                        raise RuntimeError(json.dumps(details, ensure_ascii=False, default=str))
+                    with h5py.File(work_path, 'a') as f:
+                        for device_id, result, _require_imu in device_results:
+                            source = next(spec[1] for spec in specs if spec[0] == device_id)
+                            update_sync_status(f, device_id, source_path=source,
+                                imu_result=result, validation_passed=True)
+                        f.attrs['sync_last_operation_results'] = json.dumps(
+                            details, ensure_ascii=False, default=str)
+                summary = '; '.join(
+                    f"D{d}: {r.get('status', 'error')}" for d, r, _ in device_results)
+                results.append({'file': fname, 'status': 'success', 'summary': summary})
                 success_count += 1
-                results.append({'file': fname, 'status': 'success'})
-            else:
-                results.append({'file': fname, 'status': 'failed', 'reason': summary})
-
+                self.file_finished.emit(idx, total, fname, 'success', summary)
+            except Exception as exc:
+                reason = f'事务回滚，原文件保持不变: {exc}'
+                results.append({'file': fname, 'status': 'failed', 'reason': reason})
+                self.file_finished.emit(idx, total, fname, 'failed', reason)
         self.finished.emit(success_count, total, results)
+
+    def run(self):
+        return self._run_transactional()
+
 
 class SyncToolsTab(QWidget):
     """擦除同步标签页 - 清除同步结果，保留 250Hz 原始数据"""
@@ -5489,6 +5627,7 @@ class SyncToolsTab(QWidget):
         if reply != QMessageBox.Yes:
             return
 
+        _request_file_edit(self, self.h5_paths)
         self.clear_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(len(self.h5_paths))
@@ -5541,13 +5680,14 @@ class ClearSyncWorker(QThread):
             self.progress.emit(idx, total, f"擦除中: {fn}")
             self.log.emit(f"  {fn}...")
             try:
-                r = clear_sync_outputs(h5_path, backup=True)
-                if r['success']:
-                    success += 1
-                    self.log.emit(f"    OK: 已备份, 已删除 {r['removed_datasets']}")
-                else:
-                    errs.append(f"{fn}: {'; '.join(r.get('errors', ['unknown']))}")
-                    self.log.emit(f"    FAIL: {r.get('errors')}")
+                if h5_transaction is None:
+                    raise RuntimeError('离线事务依赖未加载')
+                with h5_transaction(h5_path) as work_path:
+                    r = clear_sync_outputs(work_path, backup=False)
+                    if not r.get('success'):
+                        raise RuntimeError('; '.join(r.get('errors', ['unknown'])))
+                success += 1
+                self.log.emit(f"    OK: 已删除 {r.get('removed_datasets', [])}")
             except Exception as e:
                 errs.append(f"{fn}: {e}")
                 self.log.emit(f"    ERROR: {e}")
@@ -5556,10 +5696,13 @@ class ClearSyncWorker(QThread):
 
 class HDF5Tool(QMainWindow):
     """HDF5整合工具主窗口"""
+    prepare_file_edit = pyqtSignal(object)
+
     def __init__(self):
         super().__init__()
         self.current_directory = None
         self.h5_files = []
+        self.prepare_file_edit.connect(self._prepare_file_edit)
         self.init_ui()
 
         # 恢复上次打开的目录
@@ -5811,6 +5954,13 @@ class HDF5Tool(QMainWindow):
 
         main_layout.addWidget(main_splitter)
 
+    def _prepare_file_edit(self, paths):
+        """GUI-thread-only release of read handles before a transactional edit."""
+        for tab in (getattr(self, 'calibrate_tab', None),
+                    getattr(self, 'sync_calibration_tab', None)):
+            if tab is not None and hasattr(tab, 'close_file'):
+                tab.close_file()
+
     def select_directory(self):
         dir_path = QFileDialog.getExistingDirectory(self, "选择包含H5文件的目录")
         if dir_path:
@@ -5829,6 +5979,8 @@ class HDF5Tool(QMainWindow):
     def refresh_file_list_colors(self):
         """轻量刷新文件列表颜色 — 不重新扫描目录，仅更新已有条目的 sync_status 颜色"""
         STATUS_COLORS = {
+            'partial': QColor('#fff3cd'),
+            'unverified': QColor('#e2e3e5'),
             'synced':      QColor('#d4edda'),
             'video_compressed': QColor('#dbeafe'),
             'sync_failed': QColor('#f8d7da'),
@@ -5853,7 +6005,7 @@ class HDF5Tool(QMainWindow):
         """快速读取 H5 文件的 sync_status 属性"""
         try:
             with h5py.File(h5_path, 'r') as f:
-                return f.attrs.get('sync_status', 'unknown')
+                return sync_status_summary(f)['status']
         except Exception:
             return 'error'
 
@@ -5866,6 +6018,8 @@ class HDF5Tool(QMainWindow):
 
         # 同步状态对应的背景色
         STATUS_COLORS = {
+            'partial': QColor('#fff3cd'),
+            'unverified': QColor('#e2e3e5'),
             'synced':      QColor('#d4edda'),  # 绿色 - 已完成
             'video_compressed': QColor('#dbeafe'),  # 蓝色 - 已同步且视频已压缩
             'sync_failed': QColor('#f8d7da'),  # 红色 - 同步失败
@@ -6038,6 +6192,32 @@ class HDF5Tool(QMainWindow):
             if not self.sync_tab.bin_dir:
                 self.sync_tab._auto_detect_bin_dir()
             self.tabs.setCurrentIndex(1)
+
+    def closeEvent(self, event):
+        """后台任务运行时延迟关闭，避免 QThread 被提前销毁。"""
+        workers = []
+        for tab in (self.sync_tab, self.one_to_many_tab, self.sync_tools_tab):
+            for attr_name in ('worker', 'video_worker'):
+                worker = getattr(tab, attr_name, None)
+                if isinstance(worker, QThread) and worker.isRunning() and worker not in workers:
+                    workers.append(worker)
+
+        # 同步/压缩操作可能正在进行文件写入，关闭请求只应延后，不能强杀线程。
+        if workers:
+            if not getattr(self, '_close_wait_notice_shown', False):
+                self._close_wait_notice_shown = True
+                QMessageBox.information(
+                    self, '后台任务进行中',
+                    '当前仍有后台任务运行，任务完成后请再次关闭窗口。')
+            event.ignore()
+            return
+
+        # 关闭可视化标签页可能持有的 H5/视频句柄，避免 Windows 下遗留锁。
+        for tab in (getattr(self, 'calibrate_tab', None),
+                    getattr(self, 'sync_calibration_tab', None)):
+            if tab is not None and hasattr(tab, 'close_file'):
+                tab.close_file()
+        super().closeEvent(event)
 
 
 def main():

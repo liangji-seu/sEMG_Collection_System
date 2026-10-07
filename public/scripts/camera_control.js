@@ -138,6 +138,8 @@
     }
 
     function disconnect() {
+        Object.values(CamState.pendingCommands).forEach(pending => pending.reject(new Error('连接已关闭')));
+        CamState.pendingCommands = {};
         CamState.reconnecting = false;
         if (CamState.ws) {
             CamState.ws.onclose = null;
@@ -240,6 +242,10 @@
                 return;
             }
 
+            if (Object.keys(CamState.pendingCommands).length >= 32) {
+                reject(new Error('相机命令队列已满'));
+                return;
+            }
             const requestId = `cmd_${++_requestIdCounter}_${Date.now()}`;
             const payload = {
                 command,

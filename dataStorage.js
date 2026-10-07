@@ -8,21 +8,24 @@
  - 支持打包后使用 exe 或开发时使用 Python
 */
 
-const { spawn } = require('child_process');
 const EventEmitter = require('events');
-const path = require('path');
 const { PATHS } = require('./paths'); // [新增] 引入路径管理模块
 const { getPythonCommand } = require('./pythonPath'); // [新增] Python路径解析
+const { ManagedProcess } = require('./lib/service-process');
 
 class DataStorage extends EventEmitter {
     constructor() {
         super();
-        this.pythonProcess = null; // Python子进程
+        this.pythonProcess = null; // ManagedProcess
+        this.initializePromise = null;
     }
 
     // 初始化Python进程连接
     async initialize() {
-        return new Promise((resolve, reject) => {
+        if (this.pythonProcess?.state === 'ready') return this.getStatus();
+        if (this.initializePromise) return this.initializePromise;
+        if (this.pythonProcess?.child) throw new Error('Storage旧进程尚未退出，请先重试关闭');
+        this.initializePromise = (async () => {
             try {
                 console.log('[dataStorage] 正在启动storage_server......');
 
@@ -37,68 +40,49 @@ class DataStorage extends EventEmitter {
                 ]);
 
                 console.log(`[dataStorage] 启动命令: ${command} ${args.join(' ')}`);
-                this.pythonProcess = spawn(command, args);
-
-                this.pythonProcess.on('spawn', () => {
-                    console.log('[dataStorage] storage_server已启动');
-                    resolve();
+                this.pythonProcess = new ManagedProcess({
+                    name: 'storage_server', command, args,
+                    env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+                    readyPorts: 5555
                 });
-
-               // 接收Python脚本的调试日志（stderr）
-                this.pythonProcess.stderr.on('data', (data) => {
-                    const log = data.toString().trim();
-                    if (log) {
-                        console.log(`${log}`);
-                    }
-                });
-
-                // 接收标准输出（如果有）
-                this.pythonProcess.stdout.on('data', (data) => {
-                    const log = data.toString().trim();
-                    if (log) {
-                         console.log(`[Python STDOUT] ${log}`);
-                    }
-                });
-
-                this.pythonProcess.on('error', (error) => {
-                    console.error('[dataStorage] storage_server发生错误:', error.message);
-                    this.emit('error', error);
-                    reject(error);
-                });
-
-                this.pythonProcess.on('close', (code) => {
+                this.pythonProcess.on('error', error => this.emit('error', error));
+                this.pythonProcess.on('close', ({ code }) => {
                     console.log(`[dataStorage] storage_server已关闭，退出码: ${code}`);
                     this.emit('disconnected');
                 });
-
+                await this.pythonProcess.start();
+                console.log('[dataStorage] storage_server已就绪 (端口: 5555)');
+                return this.getStatus();
             } catch (error) {
                 console.error('[dataStorage] 启动storage_server失败:', error);
-                reject(error);
+                try {
+                    await this.pythonProcess?.stop();
+                    this.pythonProcess = null;
+                } catch (stopError) {
+                    console.error('[dataStorage] 启动失败后的进程清理失败，保留句柄:', stopError);
+                }
+                throw error;
             }
-        });
+        })().finally(() => { this.initializePromise = null; });
+        return this.initializePromise;
     }
 
     
     // 关闭连接
     async close() {
-        return new Promise((resolve) => {
-            if (this.pythonProcess) {
-                this.pythonProcess.kill();
-                this.pythonProcess = null;
-                console.log('[dataStorage] storage_server关闭');
-                this.emit('disconnected');
-                resolve();
-            } else {
-                console.log('[dataStorage] storage_server未启动，无需关闭');
-                resolve();
-            }
-        });
+        const service = this.pythonProcess;
+        if (!service) return;
+        await service.stop();
+        if (this.pythonProcess === service) this.pythonProcess = null;
+        console.log('[dataStorage] storage_server关闭');
+        this.emit('disconnected');
     }
 
     // 获取状态
     getStatus() {
         return {
-            isRunning: this.pythonProcess !== null
+            isRunning: this.pythonProcess?.state === 'ready',
+            process: this.pythonProcess?.getStatus() || { state: 'stopped', ready: false }
         };
     }
 

@@ -29,9 +29,10 @@ function getPythonCommand(scriptName, extraArgs = []) {
 
     // 优先使用 Python 脚本
     if (fs.existsSync(pyPath)) {
-        console.log(`[pythonPath] 使用 Python 脚本: ${pyPath}`);
+        const interpreter = getPythonInterpreter();
+        console.log(`[pythonPath] 使用 Python 脚本: ${pyPath} (${interpreter})`);
         return {
-            command: 'python',
+            command: interpreter,
             args: [pyPath, ...extraArgs]
         };
     }
@@ -56,4 +57,20 @@ function getPythonCommand(scriptName, extraArgs = []) {
     throw new Error(`找不到: ${scriptName}.py 或 ${scriptName}.exe`);
 }
 
-module.exports = { getPythonCommand, PYTHON_DIST_DIR };
+/**
+ * Python interpreter precedence is explicit and deterministic:
+ * SEMG_PYTHON > CONDA_PREFIX/python.exe > python on PATH.
+ */
+function getPythonInterpreter(env = process.env) {
+    const explicit = String(env.SEMG_PYTHON || '').trim().replace(/^"|"$/g, '');
+    if (explicit) return explicit;
+
+    const condaPrefix = String(env.CONDA_PREFIX || '').trim();
+    if (condaPrefix) {
+        const condaPython = path.join(condaPrefix, process.platform === 'win32' ? 'python.exe' : 'bin/python');
+        if (fs.existsSync(condaPython)) return condaPython;
+    }
+    return 'python';
+}
+
+module.exports = { getPythonCommand, getPythonInterpreter, PYTHON_DIST_DIR };

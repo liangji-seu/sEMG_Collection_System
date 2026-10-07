@@ -54,6 +54,34 @@
         onError: null,
     };
 
+    let requestSequence = 0;
+    const commandQueue = [];
+    function rejectCommands(reason) {
+        const pending = BleState._pendingResponse;
+        delete BleState._pendingResponse;
+        if (pending) { clearTimeout(pending.timeoutId); pending.reject(new Error(reason)); }
+        for (const command of commandQueue.splice(0)) command.reject(new Error(reason));
+    }
+    function pumpCommands() {
+        if (BleState._pendingResponse || !commandQueue.length) return;
+        const command = commandQueue.shift();
+        const requestId = `ble_${Date.now()}_${++requestSequence}`;
+        const pending = { ...command, requestId };
+        BleState._pendingResponse = pending;
+        pending.timeoutId = setTimeout(() => {
+            if (BleState._pendingResponse !== pending) return;
+            delete BleState._pendingResponse;
+            pending.reject(new Error(`BLE 命令超时: ${pending.action}`));
+            pumpCommands();
+        }, command.timeoutMs);
+        if (!send({ ...command.extraData, action: command.action, request_id: requestId })) {
+            clearTimeout(pending.timeoutId);
+            delete BleState._pendingResponse;
+            pending.reject(new Error(`BLE 未连接，无法发送: ${command.action}`));
+            pumpCommands();
+        }
+    }
+
     // ================= WebSocket 连接 =================
 
     function connect() {
@@ -96,6 +124,7 @@
 
             BleState.ws.onclose = (event) => {
                 console.log('[BLE] 连接关闭, code:', event.code, 'reason:', event.reason);
+                rejectCommands('BLE 连接已断开');
                 BleState.connected = false;
                 BleState.ws = null;
                 updateServerStatus('disconnected');
@@ -131,6 +160,7 @@
     }
 
     function disconnect() {
+        rejectCommands('BLE 连接已关闭');
         BleState.reconnecting = false;
         stopHeartbeat();
         if (BleState.ws) {
@@ -281,7 +311,7 @@ async function decodeData(buffer) {
         const action = msg.action;
 
         // 【新增】检查是否有待处理的 Promise 响应
-        if (BleState._pendingResponse && BleState._pendingResponse.action === action) {
+        if (BleState._pendingResponse && BleState._pendingResponse.requestId === msg.request_id) {
             const pending = BleState._pendingResponse;
             clearTimeout(pending.timeoutId);
             delete BleState._pendingResponse;
@@ -290,6 +320,7 @@ async function decodeData(buffer) {
             } else {
                 pending.reject(new Error(msg.error || `BLE 命令失败: ${action}`));
             }
+            pumpCommands();
             // 即使有 pending response，仍然继续执行下面的 UI 更新逻辑
         }
 
@@ -869,19 +900,12 @@ async function decodeData(buffer) {
         // 返回 Promise，成功时 resolve(msg)，失败/超时时 reject(error)
         sendAndWait: (action, extraData = {}, timeoutMs = 12000) => {
             return new Promise((resolve, reject) => {
-                const timeoutId = setTimeout(() => {
-                    if (BleState._pendingResponse && BleState._pendingResponse.action === action) {
-                        delete BleState._pendingResponse;
-                    }
-                    reject(new Error(`BLE 命令超时 (${timeoutMs}ms): ${action}`));
-                }, timeoutMs);
-                BleState._pendingResponse = { action, resolve, reject, timeoutId };
-                const sent = send(Object.assign({ action }, extraData));
-                if (!sent) {
-                    clearTimeout(timeoutId);
-                    delete BleState._pendingResponse;
-                    reject(new Error(`BLE 未连接，无法发送: ${action}`));
+                if (commandQueue.length >= 32) {
+                    reject(new Error('BLE 命令队列已满，请等待当前操作完成'));
+                    return;
                 }
+                commandQueue.push({ action, extraData, timeoutMs, resolve, reject });
+                pumpCommands();
             });
         },
 

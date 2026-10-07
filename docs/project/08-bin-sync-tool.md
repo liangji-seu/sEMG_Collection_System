@@ -1,5 +1,13 @@
 # 08 - Bin 同步工具
 
+## 2026-10-07 同步算法基线
+
+实现与真实数据证据见 [系统审查](13-system-review.md)。normal / rescue / ADC 共用锚点偏移规则：单bin中每条输出满足 `channels == bin[sd_frame_id + sync_bin_align_offset]`；多bin保存逐段来源和偏移。
+
+解析使用紧凑ID索引与16通道int32矩阵，仅输出真实存在的帧。BLE或bin缺口不前值填充，不按计数器跨度分配巨型矩阵。重复、回退、截断和跨u32 epoch的bin明确拒绝并提供位置；时间戳修复仅接受证据明确的u32回绕。
+
+IMU的±3帧锚点匹配仍属启发式，保存歧义与置信度，并标记 `imu_verified=False`。不能把启发式成功等同于全文件已验证。所有入口共用离线事务，失败不发布半成品。
+
 ## 1. 概述
 
 **文件**: `tools/bin_sync_tool.py` (2900+ 行)

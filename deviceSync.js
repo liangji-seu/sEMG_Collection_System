@@ -3,12 +3,11 @@
  负责启动ble_server, 以及监控ble_server的传输信息（数据不接受，只接收一些统计信息，为前端提供api接口）
 */
 
-const { spawn } = require('child_process');
 const EventEmitter = require('events');
 const realtimeEngine = require('./realtimeEngine');
-const path = require('path');
 const { getPythonCommand } = require('./pythonPath');
 const cameraManager = require('./cameraManager');
+const { ManagedProcess } = require('./lib/service-process');
 
 // BLE服务脚本切换:
 // - 'ble_server'        真实腕带
@@ -23,8 +22,10 @@ const PYTHON_ENV = {
 class DeviceSync extends EventEmitter {
     constructor() {
         super();
-        this.pythonProcess = null; // ble_server Python子进程
-        this.mocapProcess = null;  // mocap_server Python子进程
+        this.pythonProcess = null; // ble_server ManagedProcess
+        this.mocapProcess = null;  // mocap_server ManagedProcess
+        this.initializePromise = null;
+        this.mocapStatus = 'stopped';
         this.packetCount = 0;
         this.lastTimestamp = 0;
         this.isConnected = false;
@@ -47,56 +48,58 @@ class DeviceSync extends EventEmitter {
 
     // 初始化Python进程连接
     async initialize() {
-        return new Promise((resolve, reject) => {
+        if (this.pythonProcess?.state === 'ready') return this.getStatus();
+        if (this.initializePromise) return this.initializePromise;
+        if (this.pythonProcess?.child) throw new Error('BLE旧进程尚未退出，请先重试关闭');
+        this.initializePromise = (async () => {
             try {
                 console.log('[deviceSync] 正在启动ble_server......');
 
                 // 自动判断使用 Python 脚本还是打包后的 exe
                 const { command, args } = getPythonCommand(BLE_SERVER_SCRIPT);
-                this.pythonProcess = spawn(command, args, { env: PYTHON_ENV });
-
-                this.pythonProcess.on('spawn', () => {
-                    console.log('[deviceSync] ble_server已启动');
-                    this.isConnected = true;
-                    this.startTime = Date.now();
-
-                    // ble_server启动后，启动mocap_server
-                    this.startMocapServer();
-
-                    resolve();
+                this.pythonProcess = new ManagedProcess({
+                    name: 'ble_server', command, args, env: PYTHON_ENV,
+                    readyPorts: [8764, 8766]
                 });
-
-               // 接收Python脚本的调试日志（stderr）
-                this.pythonProcess.stderr.on('data', (data) => {
-                    const log = data.toString().trim();
-                    if (log) {
-                        console.log(`${log}`);
-                    }
-                });
-
-
-                this.pythonProcess.on('error', (error) => {
+                this.pythonProcess.on('error', error => {
                     console.error('[deviceSync] ble_server发生错误:', error.message);
                     this.isConnected = false;
                     this.emit('error', error);
-                    reject(error);
                 });
-
-                this.pythonProcess.on('close', (code) => {
+                this.pythonProcess.on('close', ({ code }) => {
                     console.log(`[deviceSync] ble_server已关闭，退出码: ${code}`);
                     this.isConnected = false;
                     this.emit('disconnected');
                 });
-
+                await this.pythonProcess.start();
+                this.isConnected = true;
+                this.startTime = Date.now();
+                console.log('[deviceSync] ble_server已就绪 (端口: 8764, 8766)');
+                // mocap is optional: a missing SDK degrades motion capture while BLE remains usable.
+                this.startMocapServer().catch(error => {
+                    this.mocapStatus = 'degraded';
+                    console.warn(`[deviceSync] mocap_server不可用，已降级: ${error.message}`);
+                });
+                return this.getStatus();
             } catch (error) {
                 console.error('[deviceSync] 启动ble_server失败:', error);
-                reject(error);
+                this.isConnected = false;
+                try {
+                    await this.pythonProcess?.stop();
+                    this.pythonProcess = null;
+                } catch (stopError) {
+                    console.error('[deviceSync] BLE启动清理失败，保留句柄:', stopError);
+                }
+                throw error;
             }
-        });
+        })().finally(() => { this.initializePromise = null; });
+        return this.initializePromise;
     }
 
     // 启动mocap_server
-    startMocapServer() {
+    async startMocapServer() {
+        if (this.mocapProcess?.state === 'ready') return this.mocapProcess;
+        if (this.mocapProcess?.child) throw new Error('动捕旧进程尚未退出，请先重试关闭');
         try {
             console.log('[deviceSync] 正在启动mocap_server......');
 
@@ -109,39 +112,30 @@ class DeviceSync extends EventEmitter {
                 : ['-s', '10.1.1.198'];
 
             const { command, args } = getPythonCommand('mocap_server', mocapArgs);
-            this.mocapProcess = spawn(command, args, { env: PYTHON_ENV });
-
-            this.mocapProcess.on('spawn', () => {
-                console.log('[deviceSync] mocap_server已启动 (端口: 8767)');
+            this.mocapProcess = new ManagedProcess({
+                name: 'mocap_server', command, args, env: PYTHON_ENV,
+                readyPorts: 8767
             });
-
-            // 接收mocap_server的调试日志（stderr）
-            this.mocapProcess.stderr.on('data', (data) => {
-                const log = data.toString().trim();
-                if (log) {
-                    console.log(`[mocap_server] ${log}`);
-                }
-            });
-
-            // 接收mocap_server的标准输出
-            this.mocapProcess.stdout.on('data', (data) => {
-                const log = data.toString().trim();
-                if (log) {
-                    console.log(`[mocap_server] ${log}`);
-                }
-            });
-
-            this.mocapProcess.on('error', (error) => {
-                console.error('[deviceSync] mocap_server发生错误:', error.message);
-            });
-
-            this.mocapProcess.on('close', (code) => {
+            this.mocapStatus = 'starting';
+            this.mocapProcess.on('close', ({ code }) => {
                 console.log(`[deviceSync] mocap_server已关闭，退出码: ${code}`);
+                this.mocapStatus = 'stopped';
                 this.mocapProcess = null;
             });
-
+            await this.mocapProcess.start();
+            this.mocapStatus = 'ready';
+            console.log('[deviceSync] mocap_server已就绪 (端口: 8767)');
+            return this.mocapProcess;
         } catch (error) {
             console.error('[deviceSync] 启动mocap_server失败:', error);
+            try {
+                await this.mocapProcess?.stop();
+                this.mocapProcess = null;
+            } catch (stopError) {
+                console.error('[deviceSync] 动捕启动清理失败，保留句柄:', stopError);
+            }
+            this.mocapStatus = 'degraded';
+            throw error;
         }
     }
 
@@ -174,6 +168,11 @@ class DeviceSync extends EventEmitter {
     getStatus() {
         return {
             isConnected: this.isConnected,
+            bleProcess: this.pythonProcess?.getStatus() || { state: 'stopped', ready: false },
+            mocap: {
+                status: this.mocapStatus,
+                ready: this.mocapProcess?.state === 'ready'
+            },
             dataCount: this.packetCount,
             currentRate: this.dataRate,
             lastTimestamp: this.lastTimestamp,
@@ -187,31 +186,30 @@ class DeviceSync extends EventEmitter {
 
     // 关闭连接
     async close() {
-        return new Promise(async (resolve) => {
             // 关闭摄像头
             await this.cameraManager.stopAll();
             console.log('[deviceSync] 摄像头已关闭');
 
             // 关闭mocap_server
             if (this.mocapProcess) {
-                this.mocapProcess.kill();
-                this.mocapProcess = null;
+                const process = this.mocapProcess;
+                await process.stop();
+                if (this.mocapProcess === process) this.mocapProcess = null;
+                this.mocapStatus = 'stopped';
                 console.log('[deviceSync] mocap_server关闭');
             }
 
             // 关闭ble_server
             if (this.pythonProcess) {
-                this.pythonProcess.kill();
-                this.pythonProcess = null;
+                const process = this.pythonProcess;
+                await process.stop();
+                if (this.pythonProcess === process) this.pythonProcess = null;
                 this.isConnected = false;
                 console.log('[deviceSync] ble_server关闭');
                 this.emit('disconnected');
-                resolve();
             } else {
                 console.log('[deviceSync] ble_server未启动，无需关闭');
-                resolve();
             }
-        });
     }
 
     // 重置模块状态

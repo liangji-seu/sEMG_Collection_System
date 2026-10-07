@@ -41,6 +41,7 @@ import os
 import sys
 import io
 import argparse
+import time
 from datetime import datetime
 import numpy as np
 from threading import Lock
@@ -168,6 +169,15 @@ class HDF5StorageServer:
         self.data_socket = self.context.socket(zmq.PULL)
         self.data_socket.bind(f"tcp://{host}:{self.data_port}")
         debug_log(f"数据接收端口: {host}:{self.data_port} (PULL模式，非阻塞)")
+        # Monotonic sequence acknowledged by the data channel.  REP close
+        # requests use this value as a barrier so a close cannot overtake
+        # already-sent PUSH appends.
+        self.last_data_sequence = 0
+        self.last_received_sequence = 0
+        self.file_token = None
+        self.finalized_files = {}
+        self.create_failed = False
+        self.data_barrier_timeout_ms = 5000
         
         # 存储根目录
         self.storage_dir = os.path.abspath(storage_dir)
@@ -215,6 +225,12 @@ class HDF5StorageServer:
             "mocap_R_frames": 0,  # 【修改】右手动捕帧数
             "prompts": 0
         }
+        self.data_write_error = None
+
+    def _record_data_write_error(self, error):
+        if getattr(self, "data_write_error", None) is None:
+            self.data_write_error = str(error)
+        debug_log(f"❌ 数据写入错误（文件将拒绝close）: {error}")
     
     def _sanitize_name(self, name):
         """清理文件/目录名中的非法字符"""
@@ -343,6 +359,15 @@ class HDF5StorageServer:
 
     def create_file(self, params):
         """创建新的HDF5文件（使用多级目录结构，包含受试者层级）"""
+        token = params.get("_storage_file_token")
+        if self.f:
+            if token is not None and token == getattr(self, "file_token", None) and not getattr(self, "create_failed", False):
+                return {"status": "success", "file_path": self.file_path, "file_token": token, "idempotent": True}
+            return {"status": "error", "msg": "上一个文件仍处于打开状态，拒绝覆盖创建新文件"}
+        if token is not None and token in getattr(self, "finalized_files", {}):
+            return {"status": "error", "msg": "该文件标识已收尾，不能重新创建", "finalized": True}
+        self.file_token = token
+        self.create_failed = True
         try:
             # 提取参数
             task_id = params.get("task_id", "discrete_gesture")
@@ -393,8 +418,10 @@ class HDF5StorageServer:
             
             # 如果有已打开的文件，先关闭
             if self.f:
-                debug_log("关闭上一个文件...")
-                self.close_file()
+                return {
+                    "status": "error",
+                    "msg": "上一个文件仍处于打开状态，拒绝覆盖创建新文件"
+                }
             
             # 生成多级目录路径（包含user_id层级）
             dir_path = self.generate_directory_path(task_id, category1, category2, category4, user_id)
@@ -794,6 +821,14 @@ class HDF5StorageServer:
                 "prompts": 0
             }
             self.is_collecting = True
+            # A successfully created file starts a fresh write-error and
+            # sequence boundary; a failed append remains fatal for this file.
+            self.data_write_error = None
+            self.last_data_sequence = 0
+            self.last_received_sequence = 0
+            self.create_failed = False
+            if token is not None:
+                self.f.attrs["storage_file_token"] = token
             
             # 显示相对路径
             rel_path = os.path.relpath(self.file_path, self.storage_dir)
@@ -819,11 +854,21 @@ class HDF5StorageServer:
     
     def append_data(self, params):
         """追加数据"""
+        if not self._matches_file(params):
+            return {"status": "error", "msg": "stale storage file token"}
         if not self.f:
             return {"status": "error", "msg": "文件未打开，请先调用create"}
 
         try:
             data = params.get("data", {})
+            if not isinstance(data, dict):
+                raise ValueError("append data must be an object")
+            # Validate both devices before resizing either dataset. A malformed
+            # batch must not be silently shortened or padded with invented data.
+            for name in ("emg1", "emg2"):
+                if data.get(name):
+                    self._validate_emg_batch(data[name], data.get(name + "_t", []),
+                                             data.get(name + "_frame_ids"))
 
             with self.lock:
                 # 追加EMG1到250Hz数据集
@@ -886,9 +931,121 @@ class HDF5StorageServer:
             return {"status": "success", "msg": "数据已追加"}
 
         except Exception as e:
+            self._record_data_write_error(e)
             debug_log(f"❌ 追加数据失败: {e}")
             return {"status": "error", "msg": f"追加数据失败：{str(e)}"}
-    
+
+    def _matches_file(self, params):
+        # An untagged legacy request can only access an untagged legacy file.
+        return params.get("_storage_file_token") == getattr(self, "file_token", None)
+
+    def get_file_status(self):
+        return {
+            "status": "success", "open": self.f is not None,
+            "file_token": getattr(self, "file_token", None),
+            "file_path": getattr(self, "file_path", None),
+            "create_failed": getattr(self, "create_failed", False),
+            "received_sequence": getattr(self, "last_received_sequence", 0),
+            "written_sequence": self.last_data_sequence,
+            "write_error": self.data_write_error,
+        }
+
+    def _process_data_request(self, request):
+        if request.get("cmd") != "append":
+            return True
+        params = request.get("params", {})
+        if not self._matches_file(params):
+            debug_log("Discarded stale storage data token")
+            return False
+        sequence = params.get("_storage_seq")
+        if sequence is not None:
+            try:
+                sequence = int(sequence)
+            except (TypeError, ValueError):
+                self._record_data_write_error("invalid data sequence")
+                return False
+            if sequence <= getattr(self, "last_received_sequence", 0):
+                return not bool(self.data_write_error)  # retry must not append twice
+            expected = getattr(self, "last_received_sequence", 0) + 1
+            if getattr(self, "file_token", None) is not None and sequence != expected:
+                self._record_data_write_error(f"data sequence gap: expected {expected}, received {sequence}")
+            self.last_received_sequence = sequence
+        response = self.append_data(params)
+        if response.get("status") != "success":
+            self._record_data_write_error(response.get("msg", "append failed"))
+            return False
+        if getattr(self, "data_write_error", None):
+            return False
+        if sequence is not None:
+            self.last_data_sequence = max(self.last_data_sequence, sequence)
+        return True
+
+    def _drain_data_until(self, target_sequence, allow_errors=False):
+        try:
+            target_sequence = int(target_sequence)
+        except (TypeError, ValueError):
+            return False
+        if getattr(self, "data_write_error", None) and not allow_errors:
+            return False
+        def acknowledged():
+            return getattr(self, "last_received_sequence", 0) if allow_errors else self.last_data_sequence
+        deadline = time.monotonic() + (self.data_barrier_timeout_ms / 1000.0)
+        while acknowledged() < target_sequence:
+            try:
+                request = self.data_socket.recv_json(zmq.NOBLOCK)
+            except zmq.Again:
+                remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                if remaining_ms == 0:
+                    return False
+                poller = zmq.Poller()
+                poller.register(self.data_socket, zmq.POLLIN)
+                poller.poll(min(remaining_ms, 100))
+                continue
+            except Exception as error:
+                debug_log(f"数据栅栏读取失败: {error}")
+                return False
+            self._process_data_request(request)
+            if getattr(self, "data_write_error", None) and not allow_errors:
+                return False
+            if time.monotonic() > deadline and acknowledged() < target_sequence:
+                return False
+        return True
+
+    def finalize_file(self, params, incomplete=False):
+        token = params.get("_storage_file_token")
+        previous = getattr(self, "finalized_files", {}).get(token) if token is not None else None
+        if previous is not None:
+            return dict(previous, idempotent=True)
+        if not self._matches_file(params):
+            return {"status": "error", "msg": "stale storage file token"}
+        if not self._drain_data_until(params.get("_storage_data_seq", 0), allow_errors=incomplete):
+            return {"status": "error", "msg": "数据栅栏未完成，文件保持打开"}
+        return self.close_file(params, incomplete=incomplete)
+
+    def _validate_emg_batch(self, emg_data, timestamps, frame_ids):
+        channels = np.asarray(emg_data)
+        if channels.ndim != 2 or channels.shape[0] != 16:
+            raise ValueError("EMG batch must contain 16 equally sized channels")
+        count = channels.shape[1]
+        times = np.asarray(timestamps, dtype=np.float64)
+        if times.shape != (count,) or not np.all(np.isfinite(times)):
+            raise ValueError("EMG timestamps must be finite and match the sample count")
+        if count == 0 and (frame_ids is None or len(frame_ids) == 0):
+            return channels, times
+        if channels.dtype.kind not in "iuf" or not np.all(np.isfinite(channels)) or \
+                np.any(channels < np.iinfo(np.int32).min) or np.any(channels > np.iinfo(np.int32).max) or \
+                np.any(channels != np.trunc(channels)):
+            raise ValueError("EMG ADC samples must be signed 32-bit integers")
+        if frame_ids is None:
+            if getattr(self, "file_token", None) is not None and count:
+                raise ValueError("EMG frame counters missing from the collection batch")
+        else:
+            ids = np.asarray(frame_ids)
+            if ids.shape != (count,) or ids.dtype.kind not in "iu" or \
+                    np.any(ids < 0) or np.any(ids > np.iinfo(np.uint32).max // 8):
+                raise ValueError("EMG frame counters must match the sample count and fit the SD counter")
+        return channels, times
+
     def _append_emg(self, dataset_name, emg_data, timestamps, frame_ids=None):
         """追加EMG数据到250Hz ADC数据集
 
@@ -902,49 +1059,27 @@ class HDF5StorageServer:
             frame_ids: BLE帧号列表（用于与SD卡bin文件同步）
         """
         try:
-            if not emg_data or len(emg_data) != 16:
+            channels, times = self._validate_emg_batch(emg_data, timestamps, frame_ids)
+            num_frames = channels.shape[1]
+            if not num_frames:
                 return 0
-
-            num_frames = len(emg_data[0])
-            if len(timestamps) != num_frames:
-                if len(timestamps) < num_frames:
-                    timestamps = list(timestamps) + [timestamps[-1]] * (num_frames - len(timestamps))
-                else:
-                    timestamps = timestamps[:num_frames]
-
-            # 确保frame_ids存在且长度匹配
-            if frame_ids is None:
-                frame_ids = list(range(num_frames))  # 默认从0开始
-            elif len(frame_ids) != num_frames:
-                if len(frame_ids) < num_frames:
-                    last_id = frame_ids[-1] if frame_ids else 0
-                    frame_ids = list(frame_ids) + [last_id + j + 1 for j in range(num_frames - len(frame_ids))]
-                else:
-                    frame_ids = frame_ids[:num_frames]
-
-            # 保存到250Hz ADC数据集
             ds_250hz_name = f"{dataset_name}_250hz_adc"
-            if ds_250hz_name in self.f:
-                ds_250hz = self.f[ds_250hz_name]
-
-                # 构造250Hz结构化数组
-                data_250hz = np.empty(num_frames, dtype=EMG_250HZ_ADC_DTYPE)
-                for i in range(num_frames):
-                    channels = [emg_data[ch][i] for ch in range(16)]
-                    ble_frame_id = frame_ids[i]
-                    # H5 250Hz row matches the first 2kHz SD sample in each 8-sample group.
-                    sd_frame_id = ble_frame_id * 8
-
-                    data_250hz[i]["channels"] = np.array(channels, dtype=np.int32)
-                    data_250hz[i]["frame_id"] = ble_frame_id
-                    data_250hz[i]["sd_frame_id"] = sd_frame_id
-                    data_250hz[i]["time"] = timestamps[i]
-
-                # 追加到250Hz数据集
-                current_len = ds_250hz.shape[0]
-                new_len = current_len + num_frames
-                ds_250hz.resize(new_len, axis=0)
-                ds_250hz[current_len:new_len] = data_250hz
+            ds_250hz = self.f[ds_250hz_name]
+            if frame_ids is None:
+                # Only untagged legacy sessions may omit counters. Mark the
+                # provenance so these values cannot be mistaken for SD anchors.
+                start = int(ds_250hz[-1]["frame_id"]) + 1 if len(ds_250hz) else 0
+                frame_ids = np.arange(start, start + num_frames, dtype=np.uint32)
+                ds_250hz.attrs["frame_id_source"] = "synthetic_legacy_missing"
+            ids = np.asarray(frame_ids, dtype=np.uint32)
+            data_250hz = np.empty(num_frames, dtype=EMG_250HZ_ADC_DTYPE)
+            data_250hz["channels"] = channels.T
+            data_250hz["frame_id"] = ids
+            data_250hz["sd_frame_id"] = ids * np.uint32(8)
+            data_250hz["time"] = times
+            current_len = len(ds_250hz)
+            ds_250hz.resize(current_len + num_frames, axis=0)
+            ds_250hz[current_len:current_len + num_frames] = data_250hz
 
             # 更新统计
             self.stats[f"{dataset_name}_frames"] += num_frames
@@ -953,7 +1088,8 @@ class HDF5StorageServer:
 
         except Exception as e:
             debug_log(f"❌ 追加{dataset_name}失败: {e}")
-            return 0
+            self._record_data_write_error(e)
+            raise
 
     def _append_imu(self, dataset_name, imu_data, timestamps, frame_id=None):
         """追加IMU数据到BLE数据集
@@ -1005,7 +1141,8 @@ class HDF5StorageServer:
 
         except Exception as e:
             debug_log(f"❌ 追加{dataset_name}失败: {e}")
-            return 0
+            self._record_data_write_error(e)
+            raise
 
     def _append_imu_all(self, dataset_name, imu_list, timestamps, frame_id=None, hw_version="V1"):
         """追加 V1/V2 通用 IMU 数据到 imu*_all_ble 数据集
@@ -1064,7 +1201,8 @@ class HDF5StorageServer:
 
         except Exception as e:
             debug_log(f"❌ 追加{dataset_name}失败: {e}")
-            return 0
+            self._record_data_write_error(e)
+            raise
 
     def _append_mocap_batch(self, frames_data):
         """【修改】批量追加MOCAP数据（左右手分开存储）"""
@@ -1123,7 +1261,8 @@ class HDF5StorageServer:
 
         except Exception as e:
             debug_log(f"❌ 批量追加mocap失败: {e}")
-            return 0
+            self._record_data_write_error(e)
+            raise
 
     def _append_prompt(self, name, time):
         """追加Prompt数据"""
@@ -1149,14 +1288,15 @@ class HDF5StorageServer:
             
         except Exception as e:
             debug_log(f"❌ 追加prompt失败: {e}")
-            return 0
+            self._record_data_write_error(e)
+            raise
     
     def flush(self):
         """刷盘"""
         if self.f:
             self.f.flush()
     
-    def close_file(self, params=None):
+    def close_file(self, params=None, incomplete=False):
         """关闭文件
 
         Args:
@@ -1169,6 +1309,13 @@ class HDF5StorageServer:
         """
         if params is None:
             params = {}
+        if not self._matches_file(params):
+            return {"status": "error", "msg": "stale storage file token"}
+        if self.f is not None and getattr(self, "data_write_error", None) and not incomplete:
+            return {
+                "status": "error",
+                "msg": f"文件存在数据写入错误，拒绝标记完成: {self.data_write_error}"
+            }
         try:
             self.flush()
 
@@ -1188,8 +1335,12 @@ class HDF5StorageServer:
 
                 # ==================== 采集状态标记（断点续采支持） ====================
                 # collection_status: 采集完成状态
-                collection_status = params.get("collection_status", "completed")
-                self.f.attrs["collection_status"] = str(collection_status)
+                collection_status = "incomplete" if incomplete else params.get("collection_status", "completed")
+                if incomplete:
+                    self.f.attrs["storage_error"] = str(getattr(self, "data_write_error", None) or params.get("error_reason") or "incomplete")
+                    self.f.attrs["finalize_reason"] = str(params.get("error_reason") or "")
+                self.f.attrs["storage_received_sequence"] = getattr(self, "last_received_sequence", 0)
+                self.f.attrs["storage_written_sequence"] = self.last_data_sequence
                 debug_log(f"   collection_status: {collection_status}")
 
                 # segment_index: 仅当 close 显式传了 segment_index 时才写
@@ -1260,6 +1411,8 @@ class HDF5StorageServer:
                                   f"last_frame={timing.get('last_frame_unix')}, duration={timing.get('duration')}")
 
                 if sides:
+                    if "video_timing" in self.f:
+                        del self.f["video_timing"]
                     video_grp = self.f.create_group("video_timing")
                     dt_str = h5py.string_dtype()
                     video_grp.create_dataset("sides", data=np.array(sides, dtype=dt_str))
@@ -1279,6 +1432,8 @@ class HDF5StorageServer:
                 # ==================== Phase 3: frame/time range 与 segment/bin 元数据 ====================
                 self._write_segment_metadata(params)
 
+                self.f.attrs["collection_status"] = str(collection_status)
+                self.f.flush()
                 self.f.close()
                 self.f = None
             
@@ -1294,14 +1449,24 @@ class HDF5StorageServer:
                      f"MOCAP_L={self.stats['mocap_L_frames']}, MOCAP_R={self.stats['mocap_R_frames']}, "
                      f"Prompts={self.stats['prompts']}")
             
-            return {
-                "status": "success",
-                "msg": f"文件已保存并关闭",
-                "file_path": self.file_path,
-                "stats": self.stats.copy()
+            result = {
+                "status": "success", "msg": "文件已保存并关闭",
+                "file_path": self.file_path, "stats": self.stats.copy(),
+                "collection_status": "incomplete" if incomplete else params.get("collection_status", "completed")
             }
+            token = getattr(self, "file_token", None)
+            if token is not None:
+                self.finalized_files[token] = result
+            return result
             
         except Exception as e:
+            if self.f is not None:
+                try:
+                    self.f.attrs["collection_status"] = "save_failed"
+                    self.f.attrs["finalize_error"] = str(e)
+                    self.f.flush()
+                except Exception:
+                    pass
             debug_log(f"❌ 关闭文件失败: {e}")
             return {"status": "error", "msg": f"关闭文件失败：{str(e)}"}
     
@@ -1491,6 +1656,39 @@ class HDF5StorageServer:
         
         return tree
     
+    def handle_control(self, cmd, params):
+        if cmd == "create":
+            return self.create_file(params)
+        if cmd == "get_file_status":
+            return self.get_file_status()
+        if cmd in ("close", "finalize_incomplete"):
+            return self.finalize_file(params, incomplete=cmd == "finalize_incomplete")
+        if cmd in ("append", "flush", "video_recording_started") and not self._matches_file(params):
+            return {"status": "error", "msg": "stale storage file token"}
+        if cmd == "append":
+            if params.get("_storage_seq") is not None:
+                try:
+                    sequence = int(params["_storage_seq"])
+                except (ValueError, TypeError):
+                    return {"status": "error", "msg": "invalid data sequence"}
+                # REP fallback must consume preceding PUSH messages first.
+                if not self._drain_data_until(sequence - 1):
+                    return {"status": "error", "msg": "append data barrier incomplete"}
+                success = self._process_data_request({"cmd": "append", "params": params})
+                return {"status": "success" if success else "error",
+                        "msg": self.data_write_error or "data appended"}
+            return self.append_data(params)
+        if cmd == "stats":
+            return {"status": "success", "data": self.get_stats()}
+        if cmd == "flush":
+            self.flush()
+            return {"status": "success"}
+        if cmd == "tree":
+            return {"status": "success", "data": self.get_directory_tree()}
+        if cmd == "video_recording_started":
+            return self.record_video_info(params)
+        return {"status": "error", "msg": f"未知指令: {cmd}"}
+
     def run(self):
         """启动服务，循环处理客户端请求"""
         debug_log("🚀 存储服务开始运行 (v4.3 - PUSH/PULL优化版)...")
@@ -1516,29 +1714,11 @@ class HDF5StorageServer:
                     cmd = request.get("cmd")
                     params = request.get("params", {})
 
-                    # 处理命令
-                    if cmd == "create":
-                        response = self.create_file(params)
-                    elif cmd == "append":
-                        # 兼容旧版：REP socket 也支持 append
-                        response = self.append_data(params)
-                    elif cmd == "close":
-                        response = self.close_file(params)
-                    elif cmd == "stats":
-                        response = {"status": "success", "data": self.get_stats()}
-                    elif cmd == "flush":
-                        self.flush()
-                        response = {"status": "success", "msg": "数据已刷盘"}
-                    elif cmd == "tree":
-                        response = {"status": "success", "data": self.get_directory_tree()}
-                    elif cmd == "video_recording_started":
-                        # 【新增】处理视频录制信息
-                        response = self.record_video_info(params)
-                    else:
-                        response = {
-                            "status": "error",
-                            "msg": f"未知指令：{cmd}，支持的指令：create/append/close/stats/flush/tree/video_recording_started"
-                        }
+                    try:
+                        response = self.handle_control(cmd, params)
+                    except Exception as error:
+                        debug_log(f"控制命令失败 ({cmd}): {error}")
+                        response = {"status": "error", "msg": str(error)}
 
                     # 发送响应
                     self.socket.send_json(response)
@@ -1547,11 +1727,8 @@ class HDF5StorageServer:
                 if self.data_socket in socks:
                     try:
                         request = self.data_socket.recv_json(zmq.NOBLOCK)
-                        cmd = request.get("cmd")
-                        if cmd == "append":
-                            params = request.get("params", {})
-                            self.append_data(params)
-                            # PULL 模式不需要响应
+                        self._process_data_request(request)
+                        # PULL 模式不需要响应
                     except zmq.Again:
                         pass  # 没有数据，继续
 

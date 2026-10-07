@@ -8,17 +8,14 @@ build/
 mocap_sdk/
 motion_marker_data/
 band/
-<<<<<<< HEAD
 wband_emg_V2/
 wband_emg_V1/
-__pycache__/
-=======
 __pycache__/
 tools/__pycache__/
-wband_emg_V1/
-wband_emg_V2/
 wband_emg_V3/
 L015_h5/
 L015_bin/
->>>>>>> feat_animation_place
+tmp/verify/*.h5
+tmp/verify/*.npz
+tmp/system-validation/
 

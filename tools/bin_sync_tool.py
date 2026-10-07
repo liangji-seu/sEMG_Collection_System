@@ -30,7 +30,6 @@ bin文件格式（来自ESP32固件）：
 """
 
 import os
-os.environ.setdefault('HDF5_USE_FILE_LOCKING', 'FALSE')
 import sys
 import json
 import math
@@ -39,7 +38,22 @@ import struct
 import argparse
 import numpy as np
 import h5py
+from collections.abc import Mapping
 from datetime import datetime
+from functools import wraps
+try:
+    from .alignment import counter_transition
+except ImportError:
+    from alignment import counter_transition
+
+try:
+    from .file_access import h5_transaction, logical_h5_path
+except ImportError:
+    try:
+        from file_access import h5_transaction, logical_h5_path
+    except ImportError:  # pragma: no cover - source-only fallback
+        h5_transaction = None
+        logical_h5_path = os.path.realpath
 
 # scipy 仅用于"新固件滤波型 BLE"的带限相关校验；缺失时该回退路径自动禁用，
 # 旧固件的精确匹配路径不受影响。
@@ -807,6 +821,152 @@ def _firmware_mode_from_align(offset_result):
 
 # ===================== bin文件解析 =====================
 
+def _bin_data_end(handle, file_size, magic, frame_size):
+    """Exclude a recognized 36-byte footer, and reject truncated payloads."""
+    end = file_size
+    if file_size >= HEADER_SIZE + FOOTER_SIZE:
+        handle.seek(file_size - FOOTER_SIZE)
+        marker = handle.read(4)
+        # Deployed firmware writes the footer marker in network byte order;
+        # older exporters use the little-endian header marker.
+        if marker in (struct.pack('<I', magic), struct.pack('>I', magic)):
+            end -= FOOTER_SIZE
+    if (end - HEADER_SIZE) % frame_size:
+        raise ValueError(f'truncated bin payload: {handle.name}, data_bytes={end-HEADER_SIZE}, frame_size={frame_size}')
+    handle.seek(HEADER_SIZE)
+    return end
+
+
+def _check_bin_counter(previous, current, path, row, frame_size):
+    if previous is None:
+        return
+    kind = counter_transition(previous, current)
+    if kind != 'forward':
+        # Current H5 output uses raw u32 keys. Reject even a proven wrap until
+        # a segmented source representation can preserve both epochs.
+        raise ValueError(f'{kind} in {path} at row {row}, byte {HEADER_SIZE + row * frame_size}: '
+                         f'{previous} -> {current}; segmented counter handling required')
+
+
+class _CompactFrameMapping(Mapping):
+    """Mapping view over sorted frame ids and a dense int32 channel matrix.
+
+    The old parser kept one Python ``dict`` entry and one Python ``int`` per
+    channel for every frame.  This adapter deliberately retains the public
+    Mapping surface used by the synchronizers while keeping the storage in two
+    numpy arrays.  A lookup is a binary search, so a sparse counter range never
+    turns into a dense allocation.
+    """
+
+    __slots__ = ('_ids', '_channels')
+
+    def __init__(self, ids, channels):
+        ids = np.asarray(ids)
+        channels = np.asarray(channels, dtype=np.int32)
+        if ids.ndim != 1 or channels.ndim != 2 or channels.shape[1:] != (16,):
+            raise ValueError('compact EMG frames must be (n,) ids and (n,16) channels')
+        if len(ids) != len(channels):
+            raise ValueError('compact EMG frame ids/channels length mismatch')
+        if len(ids):
+            if ids.dtype.kind not in 'ui' or int(ids.min()) < 0:
+                raise ValueError('EMG frame IDs must be nonnegative integers')
+            storage_type = np.uint32 if int(ids.max()) <= np.iinfo(np.uint32).max else np.uint64
+            ids = ids.astype(storage_type, copy=False)
+            if np.any(ids[1:] <= ids[:-1]):
+                raise ValueError('compact EMG frame ids must be strictly increasing')
+        else:
+            ids = np.asarray(ids, dtype=np.uint32)
+        self._ids = ids
+        self._channels = channels
+
+    @property
+    def ids_array(self):
+        return self._ids
+
+    @property
+    def channels_array(self):
+        return self._channels
+
+    def __len__(self):
+        return int(self._ids.size)
+
+    def __iter__(self):
+        return (int(value) for value in self._ids)
+
+    def __contains__(self, key):
+        try:
+            value = int(key)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if value < 0 or value > np.iinfo(self._ids.dtype).max: return False
+        index = int(np.searchsorted(self._ids, self._ids.dtype.type(value), side='left'))
+        return index < len(self._ids) and int(self._ids[index]) == value
+
+    def __getitem__(self, key):
+        try:
+            value = int(key)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise KeyError(key) from exc
+        if value < 0 or value > np.iinfo(self._ids.dtype).max: raise KeyError(key)
+        index = int(np.searchsorted(self._ids, self._ids.dtype.type(value), side='left'))
+        if index >= len(self._ids) or int(self._ids[index]) != value:
+            raise KeyError(key)
+        # Keep a compact numpy row.  Callers already accept array-like rows,
+        # and this avoids manufacturing sixteen Python integers per lookup.
+        return self._channels[index]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __eq__(self, other):
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        try:
+            if len(self) != len(other):
+                return False
+            for key in self:
+                if key not in other or not np.array_equal(self[key], np.asarray(other[key])):
+                    return False
+            return True
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def subset(self, mask):
+        mask = np.asarray(mask, dtype=bool)
+        return _CompactFrameMapping(self._ids[mask], self._channels[mask])
+
+
+class _RollbackResult(Exception):
+    """Internal control flow used to return a failure dict after rollback."""
+
+    def __init__(self, result):
+        super().__init__('offline operation failed; transaction rolled back')
+        self.result = result
+
+
+def _offline_h5_entrypoint(function):
+    """Run a public H5 writer copy-on-write, preserving failure return values."""
+    @wraps(function)
+    def wrapped(h5_path, *args, **kwargs):
+        if h5_transaction is None:
+            return function(h5_path, *args, **kwargs)
+        try:
+            with h5_transaction(h5_path) as staged:
+                result = function(staged, *args, **kwargs)
+                failed = result is False or (isinstance(result, dict) and (
+                    result.get('success') is False or result.get('status') in
+                    ('error', 'failed', 'sync_failed', 'validation_failed')))
+                if failed:
+                    raise _RollbackResult(result)
+                return result
+        except _RollbackResult as rollback:
+            return rollback.result
+    return wrapped
+
+
 class EMGBinParser:
     """EMG bin文件解析器
 
@@ -823,7 +983,9 @@ class EMGBinParser:
         self.bit_depth = 24
         self.lsb_uv = 0  # LSB系数，用于转换为μV
         self.timestamp_str = ""
-        self.frames = {}  # {frame_id: channels_data} - 存储原始ADC值
+        # Public Mapping adapter over sorted uint32 ids and int32 channels.
+        self.frames = _CompactFrameMapping(np.empty(0, dtype=np.uint32),
+                                           np.empty((0, 16), dtype=np.int32))
         self.frame_count = 0
         # bin 内首个 frame_id（全局 SD 卡计数器初值）。SD 卡为追加写入，
         # 同一张卡上后续 session 的 bin 首帧号 != 0，而 H5 的 sd_frame_id
@@ -890,28 +1052,36 @@ class EMGBinParser:
             log(f"时间戳: {self.timestamp_str}")
             log(f"LSB系数: {self.lsb_uv:.6f} μV/LSB (用于转换)")
 
-            # 读取所有帧
-            while True:
-                chunk = f.read(frame_size)
-                if len(chunk) < frame_size:
-                    break
+            data_end = _bin_data_end(f, file_size, EMG_MAGIC, frame_size)
+            payload_bytes = data_end - HEADER_SIZE
+            payload = f.read(payload_bytes)
+            if len(payload) != payload_bytes:
+                raise ValueError(f'truncated bin payload: {self.bin_path}, data_bytes={payload_bytes}')
 
-                frame_id = struct.unpack('<I', chunk[0:4])[0]
-                raw_data = chunk[4:]
+            # Decode all rows in vectorized numpy operations.  The allocation is
+            # proportional to payload bytes, never to the counter span.
+            rows = np.frombuffer(payload, dtype=np.uint8).reshape(payload_bytes // frame_size, frame_size)
+            ids = rows[:, :4].copy().view('<u4').reshape(-1)
+            if len(ids) > 1:
+                for row, (previous_id, current_id) in enumerate(zip(ids[:-1], ids[1:]), start=1):
+                    _check_bin_counter(int(previous_id), int(current_id), self.bin_path, row, frame_size)
+            raw_data = rows[:, 4:]
+            if bit_depth == 24:
+                samples = raw_data.reshape(-1, 16, 3).astype(np.int32)
+                channels = ((samples[:, :, 0] << 16) |
+                            (samples[:, :, 1] << 8) | samples[:, :, 2])
+                negative = (channels & 0x800000) != 0
+                channels[negative] -= 0x1000000
+            else:
+                channels = raw_data.reshape(-1, 16, 2).copy().view('>i2').reshape(-1, 16).astype(np.int32)
+            self.frames = _CompactFrameMapping(ids, channels)
+            self.frame_count = len(self.frames)
 
-                # 解析16通道数据 - 保持原始ADC值，不转换为μV
-                channels = []
-                for i in range(16):
-                    start = i * bytes_per_sample
-                    val = int.from_bytes(raw_data[start:start + bytes_per_sample], 'big', signed=True)
-                    channels.append(val)  # 原始ADC值
-
-                self.frames[frame_id] = channels
-                self.frame_count += 1
-
-        log(f"解析完成: 共 {self.frame_count} 帧, 帧号范围 [{min(self.frames.keys())}, {max(self.frames.keys())}]")
+        if not self.frames:
+            raise ValueError(f'bin contains no frames: {self.bin_path}')
+        log(f"解析完成: 共 {self.frame_count} 帧, 帧号范围 [{int(self.frames.ids_array[0])}, {int(self.frames.ids_array[-1])}]")
         if self.frames:
-            self.fid0 = int(min(self.frames.keys()))
+            self.fid0 = int(self.frames.ids_array[0])
             if self.fid0 != 0:
                 log(f"bin 首帧号 fid0={self.fid0}（全局 SD 计数器，非 0 时按 sd_frame_id 查找需加此偏移）")
         return self
@@ -981,13 +1151,16 @@ class IMUBinParser:
             log(f"IMU文件信息: 采样率={self.sample_rate}Hz, num_imus={self.num_imus}, frame_size={frame_size}B")
             log(f"时间戳: {self.timestamp_str}")
 
-            # 读取所有帧
-            while True:
+            data_end = _bin_data_end(f, file_size, IMU_MAGIC, frame_size)
+            previous_id = None
+            while f.tell() < data_end:
                 chunk = f.read(frame_size)
                 if len(chunk) < frame_size:
                     break
 
                 frame_id = struct.unpack('<I', chunk[0:4])[0]
+                _check_bin_counter(previous_id, frame_id, self.bin_path, self.frame_count, frame_size)
+                previous_id = frame_id
                 raw_data = chunk[4:]
 
                 # 解析每个 IMU 芯片
@@ -1020,7 +1193,7 @@ class IMUBinParser:
 class SyntheticEMGParser:
     """EMG parser facade for rescue sync across multiple reset-frame-id bins."""
 
-    def __init__(self, parsers, segment_bases):
+    def __init__(self, parsers, segment_bases, frame_ranges=None):
         self.parsers = parsers
         self.segment_bases = segment_bases
         self.bin_path = " + ".join(os.path.basename(p.bin_path) for p in parsers)
@@ -1028,10 +1201,37 @@ class SyntheticEMGParser:
         # 合成的帧号空间本身即"相对当前 H5"的基准（各段已按 segment_base 对齐），
         # 因此这里不需要再叠加偏移，fid0 恒为 0。
         self.fid0 = 0
-        self.frames = {}
-        for parser, base in zip(parsers, segment_bases):
-            for fid, row in parser.frames.items():
-                self.frames[int(base) + int(fid)] = row
+        id_parts = []
+        channel_parts = []
+        for index, (parser, base) in enumerate(zip(parsers, segment_bases)):
+            ids = getattr(parser.frames, 'ids_array', None)
+            channels = getattr(parser.frames, 'channels_array', None)
+            if ids is None or channels is None:
+                ids = np.fromiter(parser.frames.keys(), dtype=np.uint64)
+                channels = np.asarray(list(parser.frames.values()), dtype=np.int32)
+            mask = np.ones(len(ids), dtype=bool)
+            if frame_ranges is not None:
+                lo, hi = frame_ranges[index]
+                mask = (ids >= int(lo)) & (ids <= int(hi))
+            if np.any(mask):
+                combined_ids = ids[mask].astype(np.int64) + int(base)
+                if np.any(combined_ids < 0):
+                    raise ValueError(f'negative synthetic frame id in {parser.bin_path}')
+                id_parts.append(combined_ids.astype(np.uint64))
+                channel_parts.append(channels[mask])
+        if id_parts:
+            ids = np.concatenate(id_parts)
+            channels = np.concatenate(channel_parts, axis=0)
+            order = np.argsort(ids, kind='stable')
+            ids = ids[order]
+            channels = channels[order]
+            if len(ids) > 1 and np.any(ids[1:] == ids[:-1]):
+                duplicate = int(ids[np.flatnonzero(ids[1:] == ids[:-1])[0]])
+                raise ValueError(f'overlapping rescue sources at synthetic frame {duplicate}')
+            self.frames = _CompactFrameMapping(ids, channels)
+        else:
+            self.frames = _CompactFrameMapping(np.empty(0, dtype=np.uint32),
+                                               np.empty((0, 16), dtype=np.int32))
 
     def get_frame(self, frame_id):
         return self.frames.get(int(frame_id))
@@ -1055,7 +1255,10 @@ class SyntheticIMUParser:
                 continue
             imu_base = int(base) // EMG_IMU_RATIO
             for fid, row in parser.frames.items():
-                self.frames[imu_base + int(fid)] = row
+                key = imu_base + int(fid)
+                if key in self.frames:
+                    raise ValueError(f'overlapping IMU rescue sources at frame {key}: {parser.bin_path}')
+                self.frames[key] = row
 
 
 def _format_validation_report(validation_report):
@@ -1109,8 +1312,91 @@ def _format_validation_report(validation_report):
     return '\n'.join(lines)
 
 
+def derive_required_sync_devices(h5_file):
+    """Physical configuration and actual source data outrank cached sync state."""
+    required = set()
+    raw = h5_file.attrs.get('physical_device_ids')
+    if raw is not None:
+        try:
+            if isinstance(raw, bytes): raw = raw.decode('utf-8')
+            required.update(int(v) for v in (json.loads(raw) if isinstance(raw, str) else raw))
+        except (TypeError, ValueError):
+            pass
+    for device_id in (1, 2):
+        name = f'emg{device_id}_250hz_adc'
+        if name in h5_file and h5_file[name].shape[0] > 0:
+            required.add(device_id)
+    return sorted(required)
+
+
+def _sync_source_fingerprint(path):
+    try:
+        stat = os.stat(path)
+        return f'{os.path.realpath(os.fspath(path))}|{stat.st_size}|{stat.st_mtime_ns}'
+    except OSError:
+        return ''
+
+
+def device_sync_record_valid(h5_file, device_id, source_path=None):
+    prefix = 'sync_device_'
+    name = f'emg{device_id}_2khz_adc'
+    fingerprint = h5_file.attrs.get(f'{prefix}source_fingerprint_dev{device_id}', '')
+    return bool(name in h5_file and h5_file[name].shape[0] > 0 and
+        h5_file.attrs.get(f'{prefix}status_dev{device_id}') == 'synced' and
+        h5_file.attrs.get(f'{prefix}validation_dev{device_id}', False) and fingerprint and
+        (source_path is None or fingerprint == _sync_source_fingerprint(source_path)))
+
+
+def sync_status_summary(h5_file):
+    required = derive_required_sync_devices(h5_file)
+    complete = bool(required) and all(device_sync_record_valid(h5_file, d) for d in required)
+    verified = complete and all(bool(h5_file.attrs.get(
+        f'sync_device_imu_verified_dev{d}', False)) for d in required)
+    raw = h5_file.attrs.get('sync_status', 'unknown')
+    if isinstance(raw, bytes): raw = raw.decode('utf-8')
+    has_output = any(f'emg{d}_2khz_adc' in h5_file for d in (1, 2))
+    status = ('synced' if verified else 'unverified' if complete else
+              'partial' if any(device_sync_record_valid(h5_file, d) for d in required) else
+              'unverified' if has_output or raw in ('synced', 'unverified') else raw)
+    return dict(required_devices=required, complete=complete, verified=verified, status=status)
+
+
+def update_sync_status(h5_file, device_id, *, source_path=None, imu_result=None,
+                       validation_passed=True, set_synced=True):
+    """Persist device evidence; never infer whole-file success from a selection."""
+    device_id = int(device_id)
+    imu_result = imu_result or {}
+    prefix = 'sync_device_'
+    h5_file.attrs[f'{prefix}status_dev{device_id}'] = 'synced'
+    h5_file.attrs[f'{prefix}validation_dev{device_id}'] = bool(validation_passed)
+    # Missing an IMU bin is unverified if this source contains physical IMU data.
+    has_imu = any(name.startswith(f'imu{device_id}') and isinstance(ds, h5py.Dataset)
+                  and ds.shape and ds.shape[0] > 0 for name, ds in h5_file.items())
+    imu_verified = imu_result.get('imu_verified', not has_imu)
+    if has_imu and imu_result.get('imu_status') == 'skipped': imu_verified = False
+    h5_file.attrs[f'{prefix}imu_verified_dev{device_id}'] = bool(imu_verified)
+    if source_path:
+        h5_file.attrs[f'{prefix}source_fingerprint_dev{device_id}'] = _sync_source_fingerprint(source_path)
+    summary = sync_status_summary(h5_file)
+    h5_file.attrs['sync_required_devices'] = json.dumps(summary['required_devices'])
+    # Even set_synced=False invalidates a stale green aggregate while another
+    # device is being rebuilt; GUI transactions publish the final summary.
+    status = summary['status']
+    h5_file.attrs['sync_status'] = status
+    h5_file.attrs['sync_aggregate_status'] = status
+    h5_file.attrs['sync_verified'] = bool(summary['verified'])
+    details = []
+    for did in summary['required_devices']:
+        details.append(dict(device_id=did, valid=device_sync_record_valid(h5_file, did),
+            imu_verified=bool(h5_file.attrs.get(f'{prefix}imu_verified_dev{did}', False)),
+            source_fingerprint=str(h5_file.attrs.get(f'{prefix}source_fingerprint_dev{did}', ''))))
+    h5_file.attrs['sync_device_results'] = json.dumps(details, ensure_ascii=False)
+    return summary
+
+
 # ===================== h5文件同步 =====================
 
+@_offline_h5_entrypoint
 def sync_h5_with_bin(h5_path, emg_bin_path, imu_bin_path=None, device_id=1, verify=True, set_synced=True,
                      channel_map_name='V2', manual_num_imus=None):
     """
@@ -1152,7 +1438,7 @@ def sync_h5_with_bin(h5_path, emg_bin_path, imu_bin_path=None, device_id=1, veri
     with h5py.File(h5_path, 'r+') as f:
         # 检查sync_status
         current_status = f.attrs.get('sync_status', 'unknown')
-        if current_status == 'synced':
+        if current_status in ('synced', 'unverified') and device_sync_record_valid(f, device_id, emg_bin_path):
             if not _synced_file_needs_prompt_coverage_resync(f, device_id):
                 log("警告: 文件已同步，跳过")
                 return {'status': 'skipped', 'reason': 'already_synced'}
@@ -1466,7 +1752,6 @@ def sync_h5_with_bin(h5_path, emg_bin_path, imu_bin_path=None, device_id=1, veri
 
         # 更新sync_status（仅当set_synced=True时）
         if set_synced:
-            f.attrs["sync_status"] = "synced"
             f.attrs["sync_time"] = datetime.now().isoformat()
             f.attrs["channel_map_name"] = resolved_map_name
             f.attrs["sync_firmware_type"] = str(firmware_mode)
@@ -1482,6 +1767,10 @@ def sync_h5_with_bin(h5_path, emg_bin_path, imu_bin_path=None, device_id=1, veri
             log(f"同步完成！EMG 2kHz: {ds_2khz_name}, IMU: {imu_result.get('imu_status', 'skipped')}, 状态已设为synced")
         else:
             log(f"同步完成！EMG 2kHz: {ds_2khz_name}, IMU: {imu_result.get('imu_status', 'skipped')}, 状态保持pending（等待其他设备同步）")
+
+        update_sync_status(f, device_id, source_path=emg_parser.bin_path,
+                           imu_result=imu_result, validation_passed=bool(verify),
+                           set_synced=bool(set_synced))
 
         result = {
             'status': 'success',
@@ -1561,6 +1850,7 @@ def _scan_bin_for_h5_rows(parser, channels_250hz, channel_map):
         sig_to_rows.setdefault(sig, []).append(int(row_idx))
 
     matched_rows = {}
+    ambiguous_rows = set()
     duplicate_hits = 0
     for sd_fid, row in parser.frames.items():
         mapped = map_physical_to_h5_order(row, channel_map)
@@ -1569,10 +1859,17 @@ def _scan_bin_for_h5_rows(parser, channels_250hz, channel_map):
         if not row_indices:
             continue
         for row_idx in row_indices:
+            if len(row_indices) != 1 or row_idx in ambiguous_rows:
+                ambiguous_rows.add(row_idx)
+                matched_rows.pop(row_idx, None)
+                duplicate_hits += 1
+                continue
             if row_idx not in matched_rows:
                 matched_rows[row_idx] = int(sd_fid)
             else:
                 duplicate_hits += 1
+                ambiguous_rows.add(row_idx)
+                del matched_rows[row_idx]
 
     if not matched_rows:
         return {
@@ -1586,6 +1883,10 @@ def _scan_bin_for_h5_rows(parser, channels_250hz, channel_map):
 
     ordered = sorted(matched_rows.items())
     sd_values = [sd for _, sd in ordered]
+    if any(b <= a for a, b in zip(sd_values, sd_values[1:])):
+        return {'found': False, 'matched_rows': 0, 'match_rate': 0.0,
+                'start_sd_frame_id': None, 'end_sd_frame_id': None,
+                'duplicate_hits': duplicate_hits, 'error': 'ADC matches are not in source order'}
     return {
         'found': True,
         'matched_rows': len(matched_rows),
@@ -1600,7 +1901,8 @@ def _scan_bin_for_h5_rows(parser, channels_250hz, channel_map):
 
 
 def find_bin_offset_by_adc(h5_path, emg_bin_path, device_id=1, channel_map_name='V2',
-                           num_anchors=40, match_threshold=0.95, max_offset_search=None):
+                           num_anchors=40, match_threshold=0.95, max_offset_search=None,
+                           parser=None):
     """通过 ADC 采样值在长 bin 中搜索 H5 250Hz 数据的对应 offset。
 
     用于一对多模式：一个长 bin 对应多个 H5。不依赖 H5 的旧 frame_id，
@@ -1653,7 +1955,8 @@ def find_bin_offset_by_adc(h5_path, emg_bin_path, device_id=1, channel_map_name=
             emg_kwargs = _resolve_emg_parser_kwargs(_f, device_id)
     except Exception:
         pass
-    parser = EMGBinParser(emg_bin_path, **emg_kwargs).parse()
+    if parser is None:
+        parser = EMGBinParser(emg_bin_path, **emg_kwargs).parse()
     bin_total = len(parser.frames)
     if bin_total == 0:
         return {'found': False, 'offset': None, 'error': 'bin 文件为空'}
@@ -1667,9 +1970,10 @@ def find_bin_offset_by_adc(h5_path, emg_bin_path, device_id=1, channel_map_name=
     if channel_map is None or resolved_name.lower() not in ('physical', 'none', 'identity'):
         map_candidates.append((None, 'physical'))
 
-    max_offset = max_offset_search or (bin_total - n * DOWNSAMPLE_RATIO)
-    if max_offset <= 0:
-        return {'found': False, 'offset': None, 'error': f'bin too small (bin={bin_total}, need>{n * DOWNSAMPLE_RATIO})'}
+    # Raw counter coordinates, not the count of present frames. A zero offset
+    # and bins with missing samples are valid search inputs.
+    max_offset = (int(max_offset_search) if max_offset_search is not None
+                  else max(parser.frames))
 
     # 4. 选择锚点（用于 anchor fallback）
     skip_start = min(500, n // 5)
@@ -1698,13 +2002,19 @@ def find_bin_offset_by_adc(h5_path, emg_bin_path, device_id=1, channel_map_name=
             sd_start = row_result['start_sd_frame_id']
             sd_end = row_result['end_sd_frame_id']
             first_row = row_result['first_h5_row']
-            derived_offset = sd_start - first_row * DOWNSAMPLE_RATIO
+            anchor_position = DOWNSAMPLE_RATIO - 1
+            derived_offset = sd_start - first_row * DOWNSAMPLE_RATIO - anchor_position
+            anchors = np.full(n, -1, dtype=np.int64)
+            for row_idx, sd in row_result['matched_row_map'].items():
+                anchors[row_idx] = sd
             log(f"    row scan PASSED (channel_map={cm_name}): start={sd_start}, end={sd_end}, rate={row_rate:.3f}")
             log(f"    derived offset={derived_offset} (from first matched row {first_row})")
             log(f"    range_mode=row_signature_span")
             return {
                 'found': True,
                 'offset': int(derived_offset),
+                'anchor_position': anchor_position,
+                'anchor_sd_frame_ids': anchors,
                 'match_rate': row_rate,
                 'checked': n,
                 'matched': row_result['matched_rows'],
@@ -1788,6 +2098,7 @@ def find_bin_offset_by_adc(h5_path, emg_bin_path, device_id=1, channel_map_name=
     return {
         'found': found,
         'offset': best_off if found else None,
+        'anchor_position': DOWNSAMPLE_RATIO - 1,
         'match_rate': best_rate,
         'checked': best_checked,
         'matched': best_matched,
@@ -2295,18 +2606,6 @@ def _recover_one_to_one_anchors(parser, channels_250hz, channel_map):
     for row_idx, sd_fid in matched_map.items():
         anchors[int(row_idx)] = int(sd_fid)
 
-    matched_positions = np.flatnonzero(anchors >= 0)
-    if len(matched_positions) >= 2:
-        first_pos = int(matched_positions[0])
-        first_anchor = int(anchors[first_pos])
-        for i in range(first_pos - 1, -1, -1):
-            anchors[i] = first_anchor - (first_pos - i) * DOWNSAMPLE_RATIO
-
-        last_pos = int(matched_positions[-1])
-        last_anchor = int(anchors[last_pos])
-        for i in range(last_pos + 1, len(anchors)):
-            anchors[i] = last_anchor + (i - last_pos) * DOWNSAMPLE_RATIO
-
     return anchors, row_result
 
 
@@ -2351,17 +2650,13 @@ def _build_multibin_rescue_anchors(segments, total_rows):
         if first_filled_row is None:
             first_filled_row = first_row
 
-        # Fill the whole matched span with the expected 250 Hz stride. Rows that
-        # do not exist in the actual bin will become interpolated/missing frames.
-        for row in range(first_row, last_row + 1):
-            anchors[row] = base + first_sd + (row - first_row) * DOWNSAMPLE_RATIO
-
-        if prev_last_row is not None and first_row > prev_last_row + 1:
-            for row in range(prev_last_row + 1, first_row):
-                anchors[row] = prev_last_anchor + (row - prev_last_row) * DOWNSAMPLE_RATIO
+        # ADC matches are evidence; row spacing is not (BLE may have dropped
+        # rows). Unmatched rows stay unknown and are excluded from time fitting.
+        for row, sd in ordered:
+            anchors[row] = base + sd
 
         prev_last_row = last_row
-        prev_last_anchor = base + first_sd + (last_row - first_row) * DOWNSAMPLE_RATIO
+        prev_last_anchor = base + last_sd
         metadata.append({
             'bin': os.path.basename(seg['parser'].bin_path),
             'synthetic_base': int(base),
@@ -2373,18 +2668,10 @@ def _build_multibin_rescue_anchors(segments, total_rows):
             'match_rate_partial': float(len(row_map) / max(1, last_row - first_row + 1)),
         })
 
-    if first_filled_row is not None and first_filled_row > 0:
-        first_anchor = int(anchors[first_filled_row])
-        for row in range(first_filled_row - 1, -1, -1):
-            anchors[row] = first_anchor - (first_filled_row - row) * DOWNSAMPLE_RATIO
-
-    if prev_last_row is not None and prev_last_row < total_rows - 1:
-        for row in range(prev_last_row + 1, total_rows):
-            anchors[row] = prev_last_anchor + (row - prev_last_row) * DOWNSAMPLE_RATIO
-
     return anchors, segment_bases, metadata
 
 
+@_offline_h5_entrypoint
 def sync_h5_one_to_one_multibin_rescue(h5_path, emg_bin_paths, imu_bin_paths=None, device_id=1,
                                        verify=True, set_synced=True, channel_map_name='V2',
                                        manual_num_imus=None, min_matched_rows=40,
@@ -2483,7 +2770,12 @@ def sync_h5_one_to_one_multibin_rescue(h5_path, emg_bin_paths, imu_bin_paths=Non
         parser = imu_parsers_all[idx] if idx < len(imu_parsers_all) else None
         imu_parsers.append(parser)
 
-    rescue_emg_parser = SyntheticEMGParser(selected_emg_parsers, segment_bases)
+    source_ranges = None
+    if len(segments) > 1:
+        source_ranges = [(max(seg['parser'].fid0, meta['original_start_sd'] - rescue_anchor_position),
+                          meta['original_end_sd'] + DOWNSAMPLE_RATIO - 1 - rescue_anchor_position)
+                         for seg, meta in zip(segments, segment_meta)]
+    rescue_emg_parser = SyntheticEMGParser(selected_emg_parsers, segment_bases, source_ranges)
     rescue_imu_parser = SyntheticIMUParser(imu_parsers, segment_bases) if any(imu_parsers) else None
 
     rescue_mode = 'one_to_one_partial_rescue' if len(segments) == 1 else 'one_to_one_multibin_rescue'
@@ -2501,8 +2793,9 @@ def sync_h5_one_to_one_multibin_rescue(h5_path, emg_bin_paths, imu_bin_paths=Non
     align_offset_attr = None
     if len(segments) == 1:
         row_map = segments[0]['row_result'].get('matched_row_map') or {}
-        diffs = [int(sd) - int(data_250hz['sd_frame_id'][int(row)])
-                 for row, sd in row_map.items() if 0 <= int(row) < num_frames_250hz]
+        diffs = ([int(sd) - int(data_250hz['sd_frame_id'][int(row)])
+                  for row, sd in row_map.items() if 0 <= int(row) < num_frames_250hz]
+                 if 'sd_frame_id' in (data_250hz.dtype.names or ()) else [])
         if len(diffs) >= 16:
             tbb = int(round(float(np.median(diffs))))
             spread = int(max(diffs) - min(diffs))
@@ -2521,27 +2814,48 @@ def sync_h5_one_to_one_multibin_rescue(h5_path, emg_bin_paths, imu_bin_paths=Non
         log(f"  WARN: [rescue] {len(segments)} 个 bin 段各有基准，无单一偏移可表达，"
             f"sd_frame_id 沿用合成基准")
 
+    valid_rows = anchor_sd_frame_ids >= 0
+    aligned_data = data_250hz[valid_rows]
+    aligned_anchors = anchor_sd_frame_ids[valid_rows]
     result = _build_and_write_2khz(
         h5_path, rescue_emg_parser, rescue_imu_parser, device_id, channel_map, resolved_name,
-        data_250hz, num_frames_250hz, 0, set_synced,
+        aligned_data, len(aligned_data), 0, set_synced,
         sync_mode=rescue_mode,
         sync_match_rate=direct_match_rate,
         verify_passed=verify,
-        anchor_sd_frame_ids=anchor_sd_frame_ids,
+        anchor_sd_frame_ids=aligned_anchors,
         sync_frame_id_mode='multibin_rescue_adc_rows',
         anchor_position=rescue_anchor_position,
         label_offset=label_offset,
         align_offset_attr=align_offset_attr,
     )
 
+    if result.get('status') != 'success':
+        return result
     with h5py.File(h5_path, 'r+') as f:
+        if len(segments) > 1:
+            # A single scalar cannot refer back to several independently reset
+            # source counters. Publish piecewise provenance instead.
+            for meta, (lo, hi) in zip(segment_meta, source_ranges):
+                base = meta['synthetic_base']
+                meta.update(source_start_sd=int(lo), source_end_sd=int(hi),
+                            output_start_sd=int(lo + base), output_end_sd=int(hi + base),
+                            source_offset=int(-base))
+            ds = f[f'emg{device_id}_2khz_adc']
+            ds.attrs['sync_bin_align_offset_scope'] = 'per_segment'
+            ds.attrs['sync_source_segments'] = json.dumps(segment_meta, ensure_ascii=False)
+            if 'sync_bin_align_offset' in ds.attrs:
+                del ds.attrs['sync_bin_align_offset']
+            offset_key = f'sync_bin_align_offset_dev{device_id}'
+            if offset_key in f.attrs:
+                del f.attrs[offset_key]
         f.attrs[f'sync_rescue_segments_dev{device_id}'] = json.dumps(segment_meta, ensure_ascii=False)
         f.attrs[f'sync_rescue_anchored_rows_dev{device_id}'] = int(anchored_rows)
         f.attrs[f'sync_rescue_direct_match_rate_dev{device_id}'] = float(direct_match_rate)
         f.attrs[f'sync_rescue_coverage_dev{device_id}'] = float(coverage)
         if rescue_mode == 'one_to_one_partial_rescue':
             f.attrs[f'sync_rescue_warning_dev{device_id}'] = (
-                'partial rescue: only one bin segment matched; uncovered rows are interpolated from H5 250Hz anchors'
+                'partial rescue: only one bin segment matched; unmatched BLE rows are not time anchors'
             )
         append_sync_history(f, action='sync_rescue', status='synced', details={
             'mode': rescue_mode,
@@ -2557,6 +2871,7 @@ def sync_h5_one_to_one_multibin_rescue(h5_path, emg_bin_paths, imu_bin_paths=Non
     return result
 
 
+@_offline_h5_entrypoint
 def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
                        verify=True, set_synced=True, channel_map_name='V2',
                        manual_num_imus=None):
@@ -2585,7 +2900,7 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
 
     with h5py.File(h5_path, 'r+') as f:
         current_status = f.attrs.get('sync_status', 'unknown')
-        if current_status == 'synced':
+        if current_status in ('synced', 'unverified') and device_sync_record_valid(f, device_id, emg_bin_path):
             if not _synced_file_needs_prompt_coverage_resync(f, device_id):
                 log("警告: 文件已同步，跳过")
                 return {'status': 'skipped', 'reason': 'already_synced'}
@@ -2789,7 +3104,7 @@ def _synced_file_needs_prompt_coverage_resync(h5_file, device_id):
         return False
 
 
-def _get_prompt_coverage_target_time(h5_path, current_end_time, margin_seconds=3.0):
+def _get_prompt_coverage_target_time(h5_path, current_end_time, margin_seconds=0.0):
     """Return a target time only when synced 2kHz would otherwise not cover prompts."""
     try:
         with h5py.File(h5_path, 'r') as f:
@@ -2815,9 +3130,11 @@ def _get_prompt_coverage_target_time(h5_path, current_end_time, margin_seconds=3
                 end_time = float(end_time) if end_time is not None else None
             except Exception:
                 end_time = None
-            target = prompt_end + float(margin_seconds)
+            target = prompt_end + max(0.0, float(margin_seconds))
             if end_time is not None and np.isfinite(end_time):
-                target = max(target, end_time)
+                target = min(target, end_time)
+            if target <= current_end_time:
+                return None, prompt_end
             return float(target), prompt_end
     except Exception as exc:
         log(f"  WARN: prompt coverage check failed: {exc}")
@@ -2826,7 +3143,7 @@ def _get_prompt_coverage_target_time(h5_path, current_end_time, margin_seconds=3
 
 def _extend_2khz_to_cover_prompts(h5_path, data_2khz, emg_parser, channel_map, resolved_map_name,
                                   lookup_base=0):
-    """Append all remaining real SD-bin 2kHz frames when H5 BLE 250Hz ended before prompts.
+    """Append only real SD frames, bounded by the prompt/session end time.
 
     lookup_base: 把 data_2khz 里的 sd_frame_id（H5 会话内相对帧号）换算成
     emg_parser.frames 键所需的偏移，即 bin_frame_key = sd_frame_id + lookup_base。
@@ -2864,33 +3181,31 @@ def _extend_2khz_to_cover_prompts(h5_path, data_2khz, emg_parser, channel_map, r
 
     # bin 的帧号是绝对计数器，这里统一换算回会话内相对空间（= sd_frame_id 的空间）再算可扩展长度
     max_sd = (int(max(emg_parser.frames.keys())) - int(lookup_base)) if emg_parser.frames else last_sd
-    available_extra = max(0, max_sd - last_sd)
+    # Continue the existing frame-to-time model instead of changing clock slope
+    # at the extension boundary. Missing source frames remain genuine gaps.
+    ids = data_2khz['sd_frame_id'].astype(np.int64)
+    dt = np.diff(data_2khz['time'])
+    df = np.diff(ids)
+    valid = (df > 0) & np.isfinite(dt) & (dt > 0)
+    slope = float(np.median(dt[valid] / df[valid])) if np.any(valid) else 1.0 / 2000.0
+    end_sd = min(max_sd, last_sd + int(np.floor((target_time - original_end_time) / slope + 1e-3)))
+    available_extra = max(0, end_sd - last_sd)
     if available_extra <= 0:
         log("  WARN: prompt extends past EMG, but SD bin has no additional frames")
         return result
-    extra_frames = available_extra
-    result['target_time'] = original_end_time + extra_frames / 2000.0
-
-    extra = np.empty(extra_frames, dtype=data_2khz.dtype)
-    prev_channels = data_2khz['channels'][-1].astype(np.int32)
-    filled = 0
-    missing = 0
-    for idx in range(extra_frames):
-        sd_frame_id = last_sd + idx + 1
-        bin_data = emg_parser.get_frame(sd_frame_id + int(lookup_base))
-        if bin_data is not None:
-            prev_channels = np.array(map_physical_to_h5_order(bin_data, channel_map), dtype=np.int32)
-            filled += 1
-        else:
-            missing += 1
-        extra[idx]['channels'] = prev_channels
+    kept = sorted(k - int(lookup_base) for k in emg_parser.frames
+                  if last_sd < k - int(lookup_base) <= end_sd)
+    extra = np.empty(len(kept), dtype=data_2khz.dtype)
+    for idx, sd_frame_id in enumerate(kept):
+        extra[idx]['channels'] = map_physical_to_h5_order(
+            emg_parser.get_frame(sd_frame_id + int(lookup_base)), channel_map)
         extra[idx]['sd_frame_id'] = sd_frame_id
-        extra[idx]['time'] = original_end_time + (idx + 1) / 2000.0
+        extra[idx]['time'] = original_end_time + (sd_frame_id - last_sd) * slope
 
     result['data_2khz'] = np.concatenate([data_2khz, extra])
-    result['extra_frames'] = int(extra_frames)
-    result['extra_filled_frames'] = int(filled)
-    result['extra_missing_frames'] = int(missing)
+    result['extra_frames'] = len(kept)
+    result['extra_filled_frames'] = len(kept)
+    result['extra_missing_frames'] = int(available_extra - len(kept))
     return result
 
 
@@ -3066,55 +3381,55 @@ def _enumerate_2khz_from_bin(emg_parser, channel_map, x_anchor, bin_base,
         label_offset = int(bin_base)
     fid0 = int(getattr(emg_parser, 'fid0', min(frames)))
     n_anchor = len(x_anchor)
+    if n_anchor == 0 or np.any(np.diff(np.asarray(x_anchor, dtype=np.int64)) <= 0):
+        return None, {'reason': 'anchors must be strictly increasing and nonempty'}
 
     sd_lo = int(x_anchor[0]) - int(anchor_position)
     sd_hi = int(x_anchor[-1]) - int(anchor_position) + DOWNSAMPLE_RATIO - 1
     bin_lo = sd_lo + int(bin_base)
     bin_hi = sd_hi + int(bin_base)
     clamped_to_bin_start = 0
-    if bin_lo < fid0:
-        clamped_to_bin_start = fid0 - bin_lo
-        bin_lo = fid0
+    lower_bound = max(fid0, int(label_offset))
+    if bin_lo < lower_bound:
+        clamped_to_bin_start = lower_bound - bin_lo
+        bin_lo = lower_bound
     if bin_hi < bin_lo:
         return None, {'reason': '对齐区间为空'}
 
     span_len = bin_hi - bin_lo + 1
-    # 旧行为（按蓝牙网格逐组写 8 帧）覆盖了哪些帧号：用于量化被丢包吞掉的帧数
-    covered = np.zeros(span_len, dtype=bool)
+    # Allocate by present sample count, never by counter span (a damaged/gappy
+    # counter can span billions of absent frames).
+    bin_kept = np.fromiter(sorted(k for k in frames if bin_lo <= k <= bin_hi), dtype=np.int64)
+    if not len(bin_kept):
+        return None, {'reason': 'no real bin frames in alignment interval'}
+    covered = np.zeros(len(bin_kept), dtype=bool)
     for i in range(n_anchor):
-        s = int(x_anchor[i]) - int(anchor_position) - bin_lo
+        s = int(x_anchor[i]) + int(bin_base) - int(anchor_position)
         e = s + DOWNSAMPLE_RATIO
-        if e <= 0 or s >= span_len:
-            continue
-        covered[max(s, 0):min(e, span_len)] = True
-    present = np.fromiter((k in frames for k in range(bin_lo, bin_hi + 1)),
-                          dtype=bool, count=span_len)
-
-    keep_idx = np.flatnonzero(present)
-    bin_kept = keep_idx.astype(np.int64) + bin_lo
+        covered[np.searchsorted(bin_kept, s):np.searchsorted(bin_kept, e)] = True
     x_kept = bin_kept - int(label_offset)
-    # uint32 溢出保护：会话内相对帧号不应超过 4G，但负数会回绕，这里显式夹住
-    x_kept = np.clip(x_kept, 0, np.iinfo(np.uint32).max)
+    if np.any(x_kept > np.iinfo(np.uint32).max):
+        return None, {'reason': 'output frame ids exceed u32; explicit segmentation required'}
 
-    data_2khz = np.empty(len(keep_idx), dtype=np.dtype([
+    data_2khz = np.empty(len(bin_kept), dtype=np.dtype([
         ("channels", "<i4", (16,)),
         ("sd_frame_id", "<u4"),
         ("time", "<f8"),
     ]))
     data_2khz['sd_frame_id'] = x_kept.astype(np.uint32)
     data_2khz['time'] = intercept + slope * x_kept.astype(np.float64)
-    for row in range(len(keep_idx)):
+    for row in range(len(bin_kept)):
         data_2khz[row]['channels'] = np.array(
             map_physical_to_h5_order(frames[int(bin_kept[row])], channel_map),
             dtype=np.int32)
 
-    grid_omitted = int((present & ~covered).sum())
-    bin_gap = int((covered & ~present).sum())
+    grid_omitted = int((~covered).sum())
+    bin_gap = int(span_len - len(bin_kept))
     diag = {
         'reason': None,
         'bin_lo': bin_lo,
         'bin_hi': bin_hi,
-        'rows': int(len(keep_idx)),
+        'rows': int(len(bin_kept)),
         'grid_omitted_frames': grid_omitted,
         'bin_gap_frames': bin_gap,
         'grid_rows_expected': int(n_anchor * DOWNSAMPLE_RATIO),
@@ -3244,10 +3559,10 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
     extension_info = _extend_2khz_to_cover_prompts(
         h5_path, data_2khz, emg_parser, channel_map, resolved_map_name, lookup_base=label_offset
     )
+    missing_frames += extension_info['extra_missing_frames']
     if extension_info['extra_frames'] > 0:
         data_2khz = extension_info['data_2khz']
         filled_frames += extension_info['extra_filled_frames']
-        missing_frames += extension_info['extra_missing_frames']
         num_frames_2khz = int(len(data_2khz))
         log(
             f"2kHz prompt coverage extension: +{extension_info['extra_frames']} frames "
@@ -3295,6 +3610,9 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         _align_attr = int(bin_base if align_offset_attr is None else align_offset_attr)
         ds_2khz.attrs["sync_bin_fid0"] = int(getattr(emg_parser, 'fid0', 0))
         ds_2khz.attrs["sync_bin_align_offset"] = _align_attr
+        ds_2khz.attrs["sync_bin_align_offset_scope"] = 'single_source'
+        if 'sync_source_segments' in ds_2khz.attrs:
+            del ds_2khz.attrs['sync_source_segments']
         ds_2khz.attrs["sync_firmware_type"] = str(firmware_mode)
         ds_2khz.attrs["sync_align_model"] = str(align_model)
         ds_2khz.attrs["sync_align_tier"] = str(align_tier)
@@ -3312,7 +3630,6 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
 
         # sync attrs (Issue 4: include match_rate)
         if set_synced:
-            f.attrs["sync_status"] = "synced"
             f.attrs["sync_time"] = datetime.now().isoformat()
             f.attrs["sync_mode"] = sync_mode
             if "sync_error" in f.attrs:
@@ -3344,6 +3661,10 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
                 detail['prompt_coverage_extra_frames'] = int(extension_info['extra_frames'])
             append_sync_history(f, action='sync', status='synced', details=detail)
 
+        update_sync_status(f, device_id, source_path=emg_parser.bin_path,
+                           imu_result=imu_result, validation_passed=bool(verify_passed),
+                           set_synced=bool(set_synced))
+
     imu_info = f", IMU: {imu_result.get('imu_frames',0)}f filled={imu_result.get('imu_filled',0)}" if imu_result.get('imu_status') == 'success' else f", IMU: {imu_result.get('imu_status','skipped')}"
     if imu_result.get('imu_status') == 'success':
         active_cnt = imu_result.get('imu_active_count', '?')
@@ -3363,6 +3684,10 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         'imu_active_count': imu_result.get('imu_active_count', 0),
         'imu_active_indices': imu_result.get('imu_active_indices', []),
         'imu_inactive_indices': imu_result.get('imu_inactive_indices', []),
+        'imu_verified': imu_result.get('imu_verified', True),
+        'imu_alignment_confidence': imu_result.get('imu_alignment_confidence', 'not_applicable'),
+        'imu_missing_frame_ids': imu_result.get('imu_missing_frame_ids', []),
+        'imu_sensor_diagnostics': imu_result.get('imu_sensor_diagnostics', {}),
     }
 
 
@@ -3416,22 +3741,33 @@ def _build_imu_frame_axis_from_ble(h5_file, imu_parser, device_id, num_imus,
         return None
 
     anchors = []
+    ambiguous_anchors = 0
+    rejected_anchors = 0
     for row_count, (imu_index, emg_sd, t, ble_acc) in enumerate(_iter_imu_ble_anchor_rows(h5_file, device_id)):
         if row_count >= max_anchor_rows:
             break
         if imu_index < 0 or imu_index >= num_imus:
             continue
         approx_imu_fid = int(round(float(emg_sd) / EMG_IMU_RATIO))
-        best = None
+        candidates = []
         for fid in range(approx_imu_fid - search_radius, approx_imu_fid + search_radius + 1):
             imu_data = imu_parser.frames.get(fid)
             if imu_data is None or imu_index >= len(imu_data):
                 continue
             bin_acc = np.array(imu_data[imu_index]['acc'], dtype=np.float32)
             acc_err = float(np.max(np.abs(bin_acc - ble_acc)))
-            if best is None or acc_err < best[0]:
-                best = (acc_err, fid)
-        if best is None or best[0] > acc_tolerance:
+            candidates.append((acc_err, fid))
+        if not candidates:
+            rejected_anchors += 1
+            continue
+        candidates.sort()
+        best = candidates[0]
+        tied = [item for item in candidates[1:] if np.isclose(item[0], best[0], rtol=0.0, atol=1e-7)]
+        if tied:
+            ambiguous_anchors += 1
+            continue
+        if best[0] > acc_tolerance:
+            rejected_anchors += 1
             continue
         anchors.append((int(best[1]), float(t), int(imu_index), float(best[0])))
 
@@ -3442,6 +3778,9 @@ def _build_imu_frame_axis_from_ble(h5_file, imu_parser, device_id, num_imus,
     base_time = float(np.median(base_times))
     min_fid = int(min(imu_parser.frames.keys()))
     max_fid = int(max(imu_parser.frames.keys()))
+    span = max_fid - min_fid + 1
+    if span > max(len(imu_parser.frames) * 64, 1000000):
+        raise ValueError(f'IMU计数器跨度异常，拒绝分配补齐数组: span={span}, samples={len(imu_parser.frames)}')
     frame_ids = np.arange(min_fid, max_fid + 1, dtype=np.uint32)
     time_by_frame = {int(fid): base_time + int(fid) / 100.0 for fid in frame_ids}
     return {
@@ -3452,13 +3791,19 @@ def _build_imu_frame_axis_from_ble(h5_file, imu_parser, device_id, num_imus,
         'min_frame_id': min_fid,
         'max_frame_id': max_fid,
         'median_acc_error': float(np.median([a[3] for a in anchors])),
+        'ambiguous_anchors': int(ambiguous_anchors),
+        'rejected_anchors': int(rejected_anchors),
+        # The ±search_radius match is useful evidence, but it is not a proof
+        # of frame identity.  Consumers must not call this alignment verified.
+        'confidence': 'unverified',
     }
 
 
 def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
     """IMU 100Hz 同步 — 支持 2/3 动态数量 IMU"""
     if imu_parser is None:
-        return {'imu_status': 'skipped'}
+        return {'imu_status': 'skipped', 'imu_verified': True,
+                'imu_alignment_confidence': 'not_applicable'}
     num_imus = imu_parser.num_imus
     labels = ['a', 'b', 'c', 'd'][:num_imus]
 
@@ -3488,7 +3833,8 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
 
     imu_100hz_dtype = np.dtype([
         ("acc", "<f4", (3,)), ("gyr", "<f4", (3,)), ("mag", "<f4", (3,)),
-        ("sd_frame_id", "<u4"), ("time", "<f8")
+        ("sd_frame_id", "<u4"), ("time", "<f8"),
+        ("valid", "<?"), ("missing", "<?")
     ])
 
     # 为每个 IMU 分配独立的 data array
@@ -3496,11 +3842,14 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
     all_data = [np.zeros(num_imu_frames, dtype=imu_100hz_dtype) for _ in range(num_imus)]
     imu_filled = 0
     imu_missing = 0
+    missing_frame_ids = []
+    per_sensor_missing = [0] * num_imus
 
     for idx, imu_fid in enumerate(imu_frame_ids_unique):
         imu_fid = int(imu_fid)
         imu_data = imu_parser.frames.get(imu_fid)
-        if imu_data is not None:
+        frame_present = imu_data is not None
+        if frame_present:
             for k in range(num_imus):
                 if k < len(imu_data):
                     all_data[k][idx]['acc'] = np.array(imu_data[k]['acc'], dtype=np.float32)
@@ -3511,18 +3860,29 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
                     all_data[k][idx]['acc'] = np.zeros(3, dtype=np.float32)
                     all_data[k][idx]['gyr'] = np.zeros(3, dtype=np.float32)
                     all_data[k][idx]['mag'] = np.zeros(3, dtype=np.float32)
+                    per_sensor_missing[k] += 1
+                    all_data[k][idx]['missing'] = True
             imu_filled += 1
         else:
+            missing_frame_ids.append(imu_fid)
             for k in range(num_imus):
                 all_data[k][idx]['acc'] = np.zeros(3, dtype=np.float32)
                 all_data[k][idx]['gyr'] = np.zeros(3, dtype=np.float32)
                 all_data[k][idx]['mag'] = np.zeros(3, dtype=np.float32)
+                all_data[k][idx]['missing'] = True
+                per_sensor_missing[k] += 1
             imu_missing += 1
         for k in range(num_imus):
             all_data[k][idx]['sd_frame_id'] = imu_fid
+            if frame_present and k < len(imu_data):
+                all_data[k][idx]['valid'] = True
+                all_data[k][idx]['missing'] = False
         t = imu_time_by_frame.get(imu_fid, float(idx) * 0.01)
         for k in range(num_imus):
             all_data[k][idx]['time'] = t
+
+    quality = h5_file.require_group('sync_quality').require_group(f'dev{device_id}')
+    if 'imu_missing_frame_ids' in quality: del quality['imu_missing_frame_ids']
 
     def write_or_create_dataset(name, data, filled, missing, imu_index=None):
         created = name not in h5_file
@@ -3534,6 +3894,18 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
         dataset.attrs["sync_time"] = datetime.now().isoformat()
         dataset.attrs["filled_frames"] = filled
         dataset.attrs["missing_frames"] = missing
+        # Large missing-ID vectors belong in datasets, not limited HDF5 attributes.
+        quality = h5_file.require_group('sync_quality').require_group(f'dev{device_id}')
+        key = 'imu_missing_frame_ids'
+        if key not in quality:
+            quality.create_dataset(key, data=np.asarray(missing_frame_ids, dtype=np.uint32),
+                                   maxshape=(None,), chunks=True, compression='gzip')
+        dataset.attrs['missing_frame_ids_path'] = quality[key].name
+        dataset.attrs['missing_frame_count'] = len(missing_frame_ids)
+        if 'missing_frame_ids' in dataset.attrs: del dataset.attrs['missing_frame_ids']
+        dataset.attrs["valid_field"] = "valid"
+        dataset.attrs["missing_field"] = "missing"
+        dataset.attrs["sensor_missing_frames"] = int(per_sensor_missing[imu_index] if imu_index is not None else (per_sensor_missing[0] if per_sensor_missing else 0))
         dataset.attrs["sync_source_mode"] = imu_time_alignment
         if imu_index is not None:
             dataset.attrs["imu_index"] = imu_index
@@ -3544,6 +3916,9 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
             dataset.attrs["sync_min_sd_frame_id"] = int(anchor_info['min_frame_id'])
             dataset.attrs["sync_max_sd_frame_id"] = int(anchor_info['max_frame_id'])
             dataset.attrs["sync_median_acc_error"] = float(anchor_info['median_acc_error'])
+            dataset.attrs["sync_anchor_confidence"] = anchor_info.get('confidence', 'unverified')
+            dataset.attrs["sync_ambiguous_anchor_count"] = int(anchor_info.get('ambiguous_anchors', 0))
+            dataset.attrs["sync_rejected_anchor_count"] = int(anchor_info.get('rejected_anchors', 0))
         return dataset
 
     for k, label in enumerate(labels):
@@ -3564,17 +3939,8 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
             f"acc_range={s['acc_range']}, gyr_range={s['gyr_range']}")
 
     if inactive_indices:
-        log(f"  ⚠️ 检测到 {len(inactive_indices)} 个疑似损坏传感器: "
+        log(f"  ⚠️ IMU 数据诊断疑似异常（保留原始物理传感器数据，不截断）: "
             f"{[chr(ord('a') + i) for i in inactive_indices]}")
-        # 截断损坏传感器的数据集（避免加载时读到垃圾/全零数据）
-        for idx in inactive_indices:
-            label = chr(ord('a') + idx)
-            ds_name = f"imu{device_id}{label}_100hz"
-            if ds_name in h5_file:
-                ds_inactive = h5_file[ds_name]
-                if ds_inactive.shape[0] > 0:
-                    ds_inactive.resize(0, axis=0)
-                    log(f"  IMU dataset TRUNCATED (inactive sensor): {ds_name} → 0 rows")
 
     # 截断超出 num_imus 范围的传感器数据集（旧同步残留清理）
     all_labels = ['a', 'b', 'c', 'd']
@@ -3590,6 +3956,14 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
     # 更新 H5 attrs：记录实际活跃的 IMU 数量
     h5_file.attrs[f'imu{device_id}_active_count'] = active_count
     h5_file.attrs[f'imu{device_id}_active_indices'] = str(validation['active'])
+    h5_file.attrs[f'imu{device_id}_sensor_count'] = int(num_imus)
+    h5_file.attrs[f'imu{device_id}_sensor_diagnostics'] = json.dumps(validation, ensure_ascii=False)
+    h5_file.attrs[f'imu{device_id}_verified'] = False
+    h5_file.attrs[f'imu{device_id}_alignment_confidence'] = 'unverified'
+    h5_file.attrs[f'imu{device_id}_missing_frame_ids_path'] = f'/sync_quality/dev{device_id}/imu_missing_frame_ids'
+    h5_file.attrs[f'imu{device_id}_missing_frame_count'] = len(missing_frame_ids)
+    if f'imu{device_id}_missing_frame_ids' in h5_file.attrs:
+        del h5_file.attrs[f'imu{device_id}_missing_frame_ids']
 
     # legacy single-IMU dataset (keep for old tools)
     legacy_name = f"imu{device_id}_100hz"
@@ -3606,9 +3980,15 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
         'imu_active_count': active_count,
         'imu_active_indices': validation['active'],
         'imu_inactive_indices': inactive_indices,
+        'imu_sensor_count': num_imus,
+        'imu_verified': False,
+        'imu_alignment_confidence': 'unverified',
+        'imu_missing_frame_ids': missing_frame_ids,
+        'imu_sensor_diagnostics': validation,
     }
 
 
+@_offline_h5_entrypoint
 def sync_h5_one_to_many_adc_search(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
                                    verify=True, set_synced=True, channel_map_name='V2',
                                    num_anchors=40, match_threshold=0.95,
@@ -3637,10 +4017,22 @@ def sync_h5_one_to_many_adc_search(h5_path, emg_bin_path, imu_bin_path=None, dev
     log(f"  H5: {os.path.basename(h5_path)}, bin: {os.path.basename(emg_bin_path)}")
     log("=" * 60)
 
+    # Parse the EMG source once and reuse it for offset search and output
+    # construction.  This matters for million-frame bins and keeps parser
+    # memory/time accounting meaningful.
+    emg_kwargs = {}
+    try:
+        with h5py.File(h5_path, 'r') as _f:
+            emg_kwargs = _resolve_emg_parser_kwargs(_f, device_id)
+    except Exception:
+        pass
+    parser = EMGBinParser(emg_bin_path, **emg_kwargs).parse()
+
     # Step 1: ADC offset search
     search_result = find_bin_offset_by_adc(
         h5_path, emg_bin_path, device_id, channel_map_name,
         num_anchors=num_anchors, match_threshold=match_threshold,
+        parser=parser,
     )
 
     if not search_result['found']:
@@ -3661,15 +4053,12 @@ def sync_h5_one_to_many_adc_search(h5_path, emg_bin_path, imu_bin_path=None, dev
     log(f"[FOUND] bin_offset={bin_offset}, match_rate={search_result['match_rate']:.3f}")
 
     _ni = 2
-    emg_kwargs = {}
     try:
         with h5py.File(h5_path, 'r') as _f:
             _ni = _resolve_num_imus(_f, device_id, imu_bin_path, manual_num_imus=manual_num_imus)
-            emg_kwargs = _resolve_emg_parser_kwargs(_f, device_id)
     except Exception:
         pass
     # Step 2: Build 2kHz with offset (use channel_map from search result)
-    parser = EMGBinParser(emg_bin_path, **emg_kwargs).parse()
     imu_parser = IMUBinParser(imu_bin_path, num_imus=_ni).parse() if imu_bin_path else None
 
     # 使用搜索命中的 channel_map（如 L015 physical），而非 H5 attr 默认 V2
@@ -3687,18 +4076,29 @@ def sync_h5_one_to_many_adc_search(h5_path, emg_bin_path, imu_bin_path=None, dev
     bin_offset_mode = 'row_signature_span' if range_mode == 'row_signature_span' else 'adc_search'
     log(f"  using channel_map={resolved_cm_name}, range_mode={range_mode}")
 
+    anchor_position = int(search_result.get('anchor_position', DOWNSAMPLE_RATIO - 1))
+    anchors = search_result.get('anchor_sd_frame_ids')
+    if anchors is not None:
+        valid_rows = np.asarray(anchors) >= 0
+        data_250hz = data_250hz[valid_rows]
+        anchors = np.asarray(anchors)[valid_rows]
+        num_frames_250hz = len(data_250hz)
     result = _build_and_write_2khz(
         h5_path, parser, imu_parser, device_id, actual_cm, resolved_cm_name,
         data_250hz, num_frames_250hz, bin_offset, set_synced,
         sync_mode='one_to_many_adc_search', sync_match_rate=search_result['match_rate'], verify_passed=True,
+        anchor_sd_frame_ids=anchors, anchor_position=anchor_position,
+        sync_frame_id_mode='adc_row_scan' if anchors is not None else 'row_index',
     )
 
+    if result.get('status') != 'success':
+        return result
     # Write additional search metadata
     with h5py.File(h5_path, 'r+') as f:
         f.attrs['sync_bin_offset_mode'] = bin_offset_mode
         f.attrs['sync_range_mode'] = range_mode
         f.attrs[f'sync_offset_match_rate_dev{device_id}'] = float(search_result['match_rate'])
-        f.attrs['sync_frame_id_mode'] = 'row_index'
+        f.attrs['sync_frame_id_mode'] = 'adc_row_scan' if anchors is not None else 'row_index'
         f.attrs['sync_adc_search_num_anchors'] = int(num_anchors)
         f.attrs['sync_adc_search_channel_map'] = resolved_cm_name
         if search_result.get('start_sd_frame_id') is not None:
@@ -4185,6 +4585,7 @@ def diagnose_frame_ids(h5_path):
     return result
 
 
+@_offline_h5_entrypoint
 def clear_sync_outputs(h5_path, backup=True):
     """Phase 2: 清除 H5 中旧同步产物（2kHz datasets + sync attrs），保留 250Hz 原始数据
 
@@ -4203,9 +4604,11 @@ def clear_sync_outputs(h5_path, backup=True):
     # backup
     if backup:
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup_path = h5_path + f'.bak_{ts}'
+        # Keep backup/provenance beside the logical source H5, never beside a
+        # transaction staging file.
+        backup_path = logical_h5_path(h5_path) + f'.bak_{ts}'
         try:
-            shutil.copy2(h5_path, backup_path)
+            shutil.copy2(logical_h5_path(h5_path), backup_path)
             log(f"已备份: {backup_path}")
         except Exception as e:
             errors.append(f"备份失败: {e}")
@@ -4217,10 +4620,13 @@ def clear_sync_outputs(h5_path, backup=True):
             # 2kHz/100Hz sync datasets to remove (new + legacy names)
             sync_datasets = [
                 'emg1_2khz_adc', 'emg2_2khz_adc',
-                'imu1a_100hz', 'imu1b_100hz', 'imu1c_100hz',
-                'imu2a_100hz', 'imu2b_100hz', 'imu2c_100hz',
+                'imu1a_100hz', 'imu1b_100hz', 'imu1c_100hz', 'imu1d_100hz',
+                'imu2a_100hz', 'imu2b_100hz', 'imu2c_100hz', 'imu2d_100hz',
                 'imu1_100hz', 'imu2_100hz',  # legacy single-IMU names
             ]
+            if 'sync_quality' in f:
+                del f['sync_quality']
+                removed_datasets.append('sync_quality')
             for ds_name in sync_datasets:
                 if ds_name in f:
                     del f[ds_name]
@@ -4235,7 +4641,8 @@ def clear_sync_outputs(h5_path, backup=True):
             for dev_id in [1, 2]:
                 sync_attrs.append(f'sync_bin_offset_dev{dev_id}')
                 sync_attrs.append(f'sync_offset_match_rate_dev{dev_id}')
-            for ak in sync_attrs:
+            sync_attrs.extend(k for k in f.attrs if k.startswith('sync_') and not k.startswith('sync_history'))
+            for ak in set(sync_attrs):
                 if ak in f.attrs:
                     del f.attrs[ak]
                     removed_attrs.append(ak)
@@ -4259,8 +4666,12 @@ def clear_sync_outputs(h5_path, backup=True):
     else:
         # record failure (backup or clear failed)
         try:
+            # Keep the failure audit on the staged copy so the transaction can
+            # discard it; include the logical source for provenance without
+            # mutating the source behind the transaction's back.
             append_sync_history(h5_path, action='clear', status='error',
-                                details={'errors': errors})
+                                details={'errors': errors,
+                                         'logical_h5_path': logical_h5_path(h5_path)})
         except Exception:
             pass
 

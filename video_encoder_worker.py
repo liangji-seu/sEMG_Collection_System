@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import threading
+import tempfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -32,6 +33,7 @@ RECORDING_SUFFIX = '.recording'
 COLLECTION_ACTIVE_FILE = 'video_collection_active.json'
 IDLE_EXIT_SECONDS = 20
 LOCK_STALE_SECONDS = 120
+_ATOMIC_JSON_LOCK = threading.RLock()
 
 
 def env_int(name, default, minimum=1):
@@ -52,10 +54,21 @@ IDLE_RECORDING_PRESET = os.environ.get('VIDEO_ENCODING_IDLE_PRESET', ENCODING_X2
 
 
 def atomic_write_json(path, data):
-    tmp = path.with_suffix(path.suffix + '.tmp')
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    path = Path(path)
+    with _ATOMIC_JSON_LOCK:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f'.{path.name}.', suffix='.tmp', dir=str(path.parent))
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_name, path)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
 
 
 def read_json(path, default=None):
@@ -221,30 +234,32 @@ class VideoEncoderWorker:
     def write_status(self):
         with self.jobs_lock:
             details = [dict(j) for j in self.jobs.values()]
-        policy = self.current_encoding_policy()
-        active = sum(1 for j in details if j.get('status') == 'encoding')
-        queued = sum(1 for j in details if j.get('status') == 'queued')
-        raw_bytes = sum(int(j.get('raw_size') or 0) for j in details if j.get('status') in ('queued', 'encoding'))
-        atomic_write_json(self.status_path, {
-            'success': True,
-            'worker_pid': os.getpid(),
-            'worker_running': True,
-            'updated_at': time.time(),
-            'encoding_jobs': len(details),
-            'encoding_active_jobs': active,
-            'encoding_queued_jobs': queued,
-            'encoding_raw_bytes': raw_bytes,
-            'encoding_mode': policy['mode'],
-            'encoding_mode_reason': policy['reason'],
-            'encoding_threads': policy['threads'],
-            'encoding_workers': policy['workers'],
-            'encoding_preset': policy['preset'],
-            'encoding_crf': ENCODING_X264_CRF,
-            'encoding_idle_grace_seconds': 0,
-            'encoding_dispatch_due_at': None,
-            'encoding_countdown_seconds': None,
-            'encoding_details': details,
-        })
+            policy = self.current_encoding_policy()
+            active = sum(1 for j in details if j.get('status') == 'encoding')
+            queued = sum(1 for j in details if j.get('status') == 'queued')
+            raw_bytes = sum(int(j.get('raw_size') or 0) for j in details if j.get('status') in ('queued', 'encoding'))
+            # Keep the snapshot and its durable replacement under one lock so
+            # an older snapshot cannot overwrite a newer state transition.
+            atomic_write_json(self.status_path, {
+                'success': True,
+                'worker_pid': os.getpid(),
+                'worker_running': True,
+                'updated_at': time.time(),
+                'encoding_jobs': len(details),
+                'encoding_active_jobs': active,
+                'encoding_queued_jobs': queued,
+                'encoding_raw_bytes': raw_bytes,
+                'encoding_mode': policy['mode'],
+                'encoding_mode_reason': policy['reason'],
+                'encoding_threads': policy['threads'],
+                'encoding_workers': policy['workers'],
+                'encoding_preset': policy['preset'],
+                'encoding_crf': ENCODING_X264_CRF,
+                'encoding_idle_grace_seconds': 0,
+                'encoding_dispatch_due_at': None,
+                'encoding_countdown_seconds': None,
+                'encoding_details': details,
+            })
 
     def discover_jobs(self):
         found = []

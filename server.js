@@ -20,11 +20,12 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const fsp = fs.promises;
 const app = express();
 const PORT = process.env.PORT || 3000;
 let httpServer = null;
 let isShuttingDown = false;
+let shutdownPromise = null;
 
 // 引入设备协同模块
 const deviceSync = require('./deviceSync');
@@ -37,6 +38,7 @@ const dataStorage = require('./dataStorage');
 
 // 【新增】Python 环境配置（与 deviceSync 一致）
 const { getPythonCommand } = require('./pythonPath');
+const { ManagedProcess } = require('./lib/service-process');
 const PYTHON_ENV = {
     ...process.env,
     PYTHONIOENCODING: 'utf-8',
@@ -46,6 +48,10 @@ const PYTHON_ENV = {
 // 【新增】Camera Server 进程管理
 let cameraServerProcess = null;
 const CAMERA_SERVER_SCRIPT = 'camera_server';
+let startPromise = null;
+let storageFilesCache = null;
+let storageFilesPromise = null;
+const STORAGE_FILES_CACHE_MS = 500;
 
 
 // 中间件配置， 用于给前端获取数据的接口
@@ -55,40 +61,49 @@ app.use(express.static(PATHS.public));
 
 
 // ===================== Storage 文件列表 API =====================
-app.get('/api/storage/files', (req, res) => {
+async function listStorageFiles() {
     const storageDir = PATHS.storage;
-    
-    if (!fs.existsSync(storageDir)) {
-        return res.json({ success: false, error: 'storage 目录不存在', files: [] });
-    }
-
     const files = [];
-    
-    function readDirRecursive(dir, relativePath = '') {
-        const items = fs.readdirSync(dir);
-        for (const item of items) {
-            const fullPath = path.join(dir, item);
-            const relPath = relativePath ? `${relativePath}/${item}` : item;
-            const stat = fs.statSync(fullPath);
-            
-            if (stat.isDirectory()) {
-                readDirRecursive(fullPath, relPath);
-            } else if (item.endsWith('.h5') || item.endsWith('.hdf5')) {
-                files.push({
-                    name: item,
-                    path: relPath,
-                    size: stat.size,
-                    lastModified: stat.mtimeMs
-                });
+    async function readDirRecursive(dir, relativePath = '') {
+        let items;
+        try { items = await fsp.readdir(dir, { withFileTypes: true }); }
+        catch (error) { if (error.code === 'ENOENT') return; throw error; }
+        await Promise.all(items.map(async item => {
+            // Do not follow symlinks: storage traversal is bounded to PATHS.storage.
+            if (item.isSymbolicLink()) return;
+            const fullPath = path.join(dir, item.name);
+            const relPath = relativePath ? `${relativePath}/${item.name}` : item.name;
+            if (item.isDirectory()) {
+                await readDirRecursive(fullPath, relPath);
+            } else if (item.isFile() && /\.(?:h5|hdf5)$/i.test(item.name)) {
+                const stat = await fsp.stat(fullPath);
+                files.push({ name: item.name, path: relPath, size: stat.size, lastModified: stat.mtimeMs });
             }
-        }
+        }));
     }
-    
+    await readDirRecursive(storageDir);
+    files.sort((a, b) => a.path.localeCompare(b.path));
+    return files;
+}
+
+function getStorageFilesCached() {
+    const now = Date.now();
+    if (storageFilesCache && now - storageFilesCache.at < STORAGE_FILES_CACHE_MS) return Promise.resolve(storageFilesCache.files);
+    if (!storageFilesPromise) {
+        storageFilesPromise = listStorageFiles().then(files => {
+            storageFilesCache = { at: Date.now(), files };
+            return files;
+        }).finally(() => { storageFilesPromise = null; });
+    }
+    return storageFilesPromise;
+}
+
+app.get('/api/storage/files', async (req, res) => {
     try {
-        readDirRecursive(storageDir);
-        res.json({ success: true, files: files, count: files.length });
-    } catch (err) {
-        res.json({ success: false, error: err.message, files: [] });
+        const files = await getStorageFilesCached();
+        res.json({ success: true, files, count: files.length });
+    } catch (error) {
+        res.json({ success: false, error: error.message, files: [] });
     }
 });
 
@@ -203,30 +218,11 @@ app.delete('/api/config/delete/:filename', (req, res) => {
     }
 });
 
-// ===================== 接收前端按钮点击的POST请求 =====================
-app.post('/button-click', (req, res) => {
-    // 获取前端传递的按钮名称
-    const buttonName = req.body.buttonName;
-    // 后端打印按钮名称
-    //console.log(`收到按钮点击：${buttonName}`);
-    realtimeEngine.taskManager_get_command(buttonName);
-    // 向前端返回成功响应
-    res.json({ 
-        code: 0, 
-        msg: `成功接收：${buttonName}`,
-        data: { buttonName }
-    });
-});
-
 // API路由 - 获取设备状态
 app.get('/api/device-status', (req, res) => {
     // 获取设备协同模块状态
     const syncStatus = deviceSync.getStatus();
     
-    // 原有的模拟数据
-    const bluetoothDb = Math.floor(Math.random() * 30) - 70;
-    const bluetoothStrength = Math.max(0, Math.min(100, 100 - (bluetoothDb + 70) * 3.33));
-
     // 设备协同模块提供的传输数据量
     const throughput = (deviceSync.getCurrentThroughput()/1000).toFixed(4);
     const throughputPercent = throughput/10;
@@ -243,35 +239,6 @@ app.get('/api/device-status', (req, res) => {
     });
 });
 
-
-// 文件列表API， 模拟数据 
-// TODO
-app.get('/api/files', (req, res) => {
-    const files = [
-        {
-            name: 'data_20251107_1430.hdf5',
-            createTime: '2025-11-07 14:30',
-            size: '128.5 MB',
-            semgChannels: 16,
-            imuChannels: 9
-        },
-        {
-            name: 'data_20251107_1500.hdf5',
-            createTime: '2025-11-07 15:00',
-            size: '135.2 MB',
-            semgChannels: 16,
-            imuChannels: 9
-        },
-        {
-            name: 'data_20251107_1530.hdf5',
-            createTime: '2025-11-07 15:30',
-            size: '142.8 MB',
-            semgChannels: 16,
-            imuChannels: 9
-        }
-    ];
-    res.json(files);
-});
 
 // 存储空间状态
 app.get('/api/storage-volume', (req, res) => {
@@ -361,37 +328,29 @@ app.get('/api/camera/status', async (req, res) => {
 
 
 
-// 文件预览API， 模拟数据
-// TODO
-app.get('/api/preview-file/:filename', (req, res) => {
-    const { filename } = req.params;
-    
-    // 生成模拟预览数据
-    res.json({
-        filename,
-        createTime: '2025-11-07 14:30:22',
-        size: '128.5 MB',
-        dataStats: {
-            semgRange: '±2.56 mV',
-            imuAccRange: '±1.25 g',
-            imuGyroRange: '±15.3 °/s',
-            completeness: '100%'
+app.get('/api/health', (req, res) => {
+    let engine = {};
+    try { engine = realtimeEngine.getStatus?.() || {}; } catch (error) { engine = { error: error.message }; }
+    const ble = deviceSync.getStatus();
+    const storage = dataStorage.getStatus();
+    const health = {
+        status: ble.isConnected && storage.isRunning && engine.isRunning === true &&
+                engine.bleConnected === true && engine.storageConnected === true ? 'ready' : 'degraded',
+        services: {
+            realtimeEngine: { ready: engine.isRunning === true, state: engine.isRunning ? 'ready' : 'starting' },
+            ble: { ready: ble.isConnected === true, state: ble.bleProcess?.state || 'stopped' },
+            storage: { ready: storage.isRunning === true, state: storage.process?.state || 'stopped' },
+            mocap: ble.mocap || { ready: false, status: 'degraded' }
         },
-        semgData: [
-            Array(100).fill().map(() => Math.random() * 5 - 2.5),
-            Array(100).fill().map(() => Math.random() * 5 - 2.5),
-            Array(100).fill().map(() => Math.random() * 5 - 2.5),
-            Array(100).fill().map(() => Math.random() * 5 - 2.5)
-        ],
-        imuData: [
-            Array(100).fill().map(() => Math.random() * 2 - 1),
-            Array(100).fill().map(() => Math.random() * 2 - 1),
-            Array(100).fill().map(() => Math.random() * 2 - 1),
-            Array(100).fill().map(() => Math.random() * 20 - 10)
-        ]
-    });
+        engine: {
+            running: engine.isRunning === true,
+            bleConnected: engine.bleConnected === true,
+            storageConnected: engine.storageConnected === true,
+            mocapConnected: engine.mocapConnected === true
+        }
+    };
+    res.status(health.status === 'ready' ? 200 : 503).json(health);
 });
-
 
 // 所有路由都指向index.html（支持前端路由）
 app.get('*', (req, res) => {
@@ -424,12 +383,12 @@ function openBrowser() {
 }
 
 // 优雅关闭处理
-async function shutdownServices(signal = 'manual') {
-    if (isShuttingDown) return;
+function shutdownServices(signal = 'manual') {
+    if (shutdownPromise) return shutdownPromise;
     isShuttingDown = true;
-    console.log(`\n收到 ${signal}，正在关闭服务器...`);
-
-    try {
+    shutdownPromise = (async () => {
+      console.log(`\n收到 ${signal}，正在关闭服务器...`);
+      try {
         await realtimeEngine.stop();
         await deviceSync.close();
         await dataStorage.close();
@@ -440,18 +399,17 @@ async function shutdownServices(signal = 'manual') {
             httpServer = null;
         }
 
-        // 关闭日志系统
-        if (logger) {
-            logger.close();
-        }
-
         console.log('服务器关闭完成');
-    } catch (error) {
-        console.error('关闭过程中发生错误:', error);
+        if (logger) await logger.close();
+      } catch (error) {
+        console.error('关闭过程中发生错误，服务保持运行以便恢复:', error);
         throw error;
-    } finally {
-        isShuttingDown = false;
-    }
+      }
+    })().finally(() => {
+      isShuttingDown = false;
+      shutdownPromise = null;
+    });
+    return shutdownPromise;
 }
 
 function setupGracefulShutdown() {
@@ -460,7 +418,7 @@ function setupGracefulShutdown() {
             await shutdownServices(signal);
             process.exit(0);
         } catch (error) {
-            process.exit(1);
+            console.error('[server.js] 关闭未完成，未强制退出进程');
         }
     };
 
@@ -471,76 +429,55 @@ function setupGracefulShutdown() {
 // ==================== Camera Server 管理 ====================
 
 function startCameraServer() {
-    return new Promise((resolve, reject) => {
+    if (cameraServerProcess?.state === 'ready') return Promise.resolve(cameraServerProcess);
+    if (cameraServerProcess?.child) return Promise.reject(new Error('摄像头旧进程尚未退出，请先重试关闭'));
+    return (async () => {
         try {
             console.log('[server.js] 正在启动 camera_server...');
 
             const { command, args } = getPythonCommand(CAMERA_SERVER_SCRIPT);
-            cameraServerProcess = spawn(command, args, { env: PYTHON_ENV });
-
-            cameraServerProcess.on('spawn', () => {
-                console.log('[server.js] ✅ camera_server 已启动');
-                resolve();
+            cameraServerProcess = new ManagedProcess({
+                name: 'camera_server', command, args, env: PYTHON_ENV,
+                readyPorts: 8768
             });
-
-            // 接收 Python 脚本的输出
-            cameraServerProcess.stdout.on('data', (data) => {
-                const output = data.toString().trim();
-                if (output) console.log(`[camera_server] ${output}`);
-            });
-
-            cameraServerProcess.stderr.on('data', (data) => {
-                const output = data.toString().trim();
-                if (output) console.log(`[camera_server] ${output}`);
-            });
-
-            cameraServerProcess.on('error', (error) => {
-                console.error('[server.js] ❌ camera_server 启动失败:', error);
-                reject(error);
-            });
-
-            cameraServerProcess.on('exit', (code, signal) => {
+            cameraServerProcess.on('close', ({ code, signal }) => {
                 console.log(`[server.js] camera_server 进程退出, code: ${code}, signal: ${signal}`);
                 cameraServerProcess = null;
             });
-
+            await cameraServerProcess.start();
+            console.log('[server.js] ✅ camera_server 已就绪 (端口: 8768)');
+            return cameraServerProcess;
         } catch (error) {
             console.error('[server.js] 启动 camera_server 时出错:', error);
-            reject(error);
+            try {
+                await cameraServerProcess?.stop();
+                cameraServerProcess = null;
+            } catch (stopError) {
+                console.error('[server.js] 摄像头启动清理失败，保留句柄:', stopError);
+            }
+            throw error;
         }
-    });
+    })();
 }
 
-function stopCameraServer() {
-    return new Promise((resolve) => {
-        if (cameraServerProcess) {
-            console.log('[server.js] 正在停止 camera_server...');
-            const proc = cameraServerProcess;
-            let resolved = false;
-            const finish = () => {
-                if (resolved) return;
-                resolved = true;
-                resolve();
-            };
-            proc.once('exit', finish);
-            proc.kill('SIGTERM');
-            setTimeout(() => {
-                if (!resolved && cameraServerProcess === proc) {
-                    console.warn('[server.js] camera_server 仍未退出，强制结束（可能仍有未完成视频压缩）');
-                    proc.kill('SIGKILL');
-                }
-                finish();
-            }, 300000);
-        } else {
-            resolve();
-        }
-    });
+async function stopCameraServer() {
+    if (!cameraServerProcess) return;
+    const service = cameraServerProcess;
+    await service.stop({ timeoutMs: 30000 });
+    if (cameraServerProcess === service) cameraServerProcess = null;
 }
 
 // ==================== End Camera Server ====================
 
 // 启动服务器
 async function startServer() {
+    if (httpServer) return httpServer;
+    if (startPromise) return startPromise;
+    startPromise = startServerInternal().finally(() => { startPromise = null; });
+    return startPromise;
+}
+
+async function startServerInternal() {
     try {
 
 
@@ -552,50 +489,62 @@ async function startServer() {
         await deviceSync.initialize();
         console.log('[server.js] deviceSync 启动成功');
 
-        // 【新增】启动 camera_server
-        await startCameraServer();
-        console.log('[server.js] camera_server 启动成功');
-
         // 启动dataStorage模块(dataStorage模块启动storage_server模块)
         await dataStorage.initialize();
         console.log('[server.js] dataStorage 启动成功');
+
+        // Camera is optional; BLE/storage remain mandatory.
+        try {
+            await startCameraServer();
+            console.log('[server.js] camera_server 启动成功');
+        } catch (error) {
+            console.warn(`[server.js] camera_server不可用，已降级: ${error.message}`);
+        }
         
         // 启动HTTP服务器
-        const server = app.listen(PORT, () => {
-            console.log(`数据采集系统已启动，访问地址：http://localhost:${PORT}`);
-            //console.log('EMG数据API: http://localhost:' + PORT + '/api/emg-data');
-            console.log('设备状态API: http://localhost:' + PORT + '/api/device-status');
-            
-            //仅在非 Electron 环境下自动打开浏览器
-            if (!process.env.ELECTRON_MODE) {
-            openBrowser(); // 非 Electron 启动时（如 npm start 单独运行服务）才打开浏览器
-            }
+        const server = app.listen(PORT);
+        await new Promise((resolve, reject) => {
+            const onListening = () => { cleanup(); resolve(); };
+            const onError = error => { cleanup(); reject(error); };
+            const cleanup = () => { server.off('listening', onListening); server.off('error', onError); };
+            server.once('listening', onListening);
+            server.once('error', onError);
         });
-        
+        console.log(`数据采集系统已启动，访问地址：http://localhost:${PORT}`);
+        console.log('设备状态API: http://localhost:' + PORT + '/api/device-status');
+        if (!process.env.ELECTRON_MODE && !process.env.SEMG_NO_BROWSER) openBrowser();
+
+        httpServer = server;
         return server;
         
     } catch (error) {
         console.error('服务器启动失败:', error);
-        process.exit(1);
+        // Stop ingestion before its sinks. Every owned resource gets a cleanup
+        // attempt even if an earlier shutdown step fails.
+        for (const cleanup of [() => stopCameraServer(), () => realtimeEngine.stop(),
+                               () => dataStorage.close(), () => deviceSync.close()]) {
+            try { await cleanup(); }
+            catch (cleanupError) { console.error('启动回滚失败:', cleanupError); }
+        }
+        throw error;
     }
 }
 
 // 启动服务器
 setupGracefulShutdown();
-startServer().then(server => {
-    httpServer = server;
-    console.log('服务器启动完成');
-
-    // 8秒后打印各模块连接状态汇总（等待所有连接建立）
-    setTimeout(() => {
-        printSystemStatus();
-    }, 8000);
-}).catch(error => {
-    console.error('服务器启动失败:', error);
-});
+if (!process.env.SEMG_NO_AUTO_START && !process.env.ELECTRON_MODE) {
+    startServer().then(() => printSystemStatus()).catch(error => {
+        console.error('服务器启动失败:', error);
+        process.exitCode = 1;
+    });
+}
 
 module.exports = {
-    shutdown: shutdownServices
+    app,
+    startServer,
+    shutdown: shutdownServices,
+    listStorageFiles,
+    getStorageFilesCached
 };
 
 // 打印系统状态汇总

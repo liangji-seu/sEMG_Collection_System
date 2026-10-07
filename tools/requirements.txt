@@ -1,17 +1,3 @@
-# EMG数据采集系统 Python依赖
-# 安装命令: pip install -r requirements.txt
-
-# ===== 通信相关 =====
-websockets>=11.0          # WebSocket服务器/客户端
-pyzmq>=25.0               # ZeroMQ进程间通信
-msgpack-python>=1.0       # 高效二进制序列化
-
-# ===== 蓝牙相关 =====
-bleak>=0.21.0             # 跨平台BLE蓝牙库
-
-# ===== 数据处理 =====
-numpy>=1.24.0             # 数值计算基础库
-scipy>=1.11.0             # 信号处理/滤波器
-
-# ===== 数据存储 =====
-h5py>=3.9.0               # HDF5文件读写
+# Shared collection/offline runtime dependencies. Resolve relative to this file.
+# Install: python -m pip install -r tools/requirements.txt
+-r ../requirements.txt

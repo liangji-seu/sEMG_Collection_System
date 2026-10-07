@@ -27,6 +27,7 @@ BLE Server for ESP32S3_EMG Device (Dual Device + Dual WebSocket)
 """
 
 import asyncio
+import contextlib
 import struct
 import time
 import traceback
@@ -39,6 +40,7 @@ from queue import PriorityQueue
 from datetime import datetime
 import threading
 import itertools
+from contextvars import ContextVar
 
 import msgpack
 import json
@@ -55,8 +57,11 @@ except ImportError:
     print("[警告] scipy未安装，滤波功能不可用。请运行: pip install scipy numpy", file=sys.stderr)
 
 # ================= 编码配置 =================
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+try:
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    sys.stderr.reconfigure(encoding='utf-8', line_buffering=True)
+except (AttributeError, ValueError):
+    pass
 
 # ================= 服务配置 =================
 WEBSOCKET_HOST = "localhost"
@@ -499,6 +504,12 @@ class ServerState:
         self.msg_queue = PriorityQueue()
         self.queue_seq = itertools.count()
         self.main_loop = None
+        self.queue_task = None
+        self.queue_limit = 1000
+        self.queue_low_limit = 500
+        self.queue_lock = threading.Lock()
+        self.transport_fault_dropped = 0
+        self.transport_fault_last_emit = 0.0
 
         # 数据发送线程
         self.data_thread = None
@@ -528,6 +539,7 @@ class ServerState:
 
 
 state = ServerState()
+_control_request_id = ContextVar('ble_control_request_id', default=None)
 
 
 # ================= 工具函数 =================
@@ -818,6 +830,7 @@ def create_status_handler(dev: DeviceState):
 def enqueue_raw_packet(dev: DeviceState, ts: float, data: bytearray):
     if len(dev.raw_buffer) >= dev.raw_buffer.maxlen:
         dev.raw_dropped_packets += 1
+        _report_transport_drop(f'Dev{dev.device_id} 原始数据缓冲溢出')
     dev.raw_buffer.append((ts, bytes(data)))
 
 
@@ -884,6 +897,8 @@ def finalize_parsed_packet(dev: DeviceState, parsed: dict, ts: float):
         # 与 EMG 同一条单调时间轴，避免 IMU 侧再出现墙钟回退
         parsed['imu_t'] = [emg_t[-1]] * len(parsed['imu'])
 
+    if len(dev.data_buffer) >= dev.data_buffer.maxlen:
+        _report_transport_drop(f'Dev{dev.device_id} 解析数据缓冲溢出')
     dev.data_buffer.append(parsed)
 
 
@@ -906,60 +921,6 @@ def clear_stream_buffers(dev: DeviceState):
     reset_callback_timing(dev.device_id)
 
 
-def _legacy_create_notification_handler(dev: DeviceState):
-    def handler(sender: int, data: bytearray):
-        try:
-            ts = _precise_time()  # 高精度时间戳
-
-            # 【诊断】检测回调间隔异常
-            device_key = dev.device_id
-            if device_key in _last_callback_time:
-                interval = ts - _last_callback_time[device_key]
-                # 正常情况下，250Hz的数据应该每4ms收到一包，9帧/包约36ms
-                # 如果间隔超过100ms，说明有问题
-                if interval > 0.1 and not _callback_interval_warning_printed.get(device_key):
-                    log(f"[Dev{dev.device_id}] ⚠️ 回调间隔异常: {interval*1000:.1f}ms (正常应<40ms)")
-                    _callback_interval_warning_printed[device_key] = True
-                elif interval < 0.1:
-                    _callback_interval_warning_printed[device_key] = False
-            _last_callback_time[device_key] = ts
-
-            dev.last_data_time = ts  # 【新增】记录最后收到数据的时间
-            if dev.is_streaming:
-                enqueue_raw_packet(dev, ts, data)
-            return
-            parsed = parse_packet(data, dev)
-            if parsed:
-                parsed['t'] = ts
-
-                # 【调试】每100个包打印一次日志
-                if dev.total_frames % 100 == 0:
-                    log(f"[Dev{dev.device_id}] 已收到 {dev.total_frames} 帧, 丢帧: {dev.lost_frames}, 缓冲区: {len(dev.data_buffer)}")
-
-                # 生成每帧EMG的时间戳
-                # 注意：BLE传输的是250Hz数据（2kHz降采样8倍），所以时间间隔是1/250=0.004秒
-                fpkt = parsed.get('n', 9)
-                ble_sample_rate = 250  # BLE传输频率固定为250Hz
-                frame_interval = 1.0 / ble_sample_rate  # 0.004秒
-
-                # 为每帧生成时间戳（从当前时间向前推算）
-                emg_timestamps = []
-                for i in range(fpkt):
-                    # 最后一帧的时间是ts，往前推算
-                    frame_ts = ts - (fpkt - 1 - i) * frame_interval
-                    emg_timestamps.append(frame_ts)
-                parsed['emg_t'] = emg_timestamps
-
-                # IMU时间戳（每包 N 个 IMU，随 BLE 包接收，约 27.8Hz）
-                # V1: 2 个 IMU, V2: 0-3 个 IMU
-                if parsed.get('imu'):
-                    imu_timestamps = [ts] * len(parsed['imu'])
-                    parsed['imu_t'] = imu_timestamps
-                
-                dev.data_buffer.append(parsed)
-        except Exception as e:
-            log(f"[Dev{dev.device_id}] 回调错误: {e}")
-    return handler
 
 
 # ================= 消息队列 =================
@@ -1109,27 +1070,55 @@ def data_sender_thread():
     log("数据发送线程结束")
 
 
+def _schedule_queue_locked():
+    if state.main_loop and not getattr(state, 'queue_wake_pending', False):
+        state.queue_wake_pending = True
+        try:
+            state.main_loop.call_soon_threadsafe(_ensure_process_queue)
+        except RuntimeError:
+            state.queue_wake_pending = False
+
+
+def _report_transport_drop(error):
+    with state.queue_lock:
+        _report_transport_drop_locked(error)
+
+
+def _report_transport_drop_locked(error):
+    state.transport_fault_dropped += 1
+    now = time.monotonic()
+    if now - state.transport_fault_last_emit >= 1.0 and state.msg_queue.qsize() < state.queue_limit:
+        count = state.transport_fault_dropped
+        state.transport_fault_dropped = 0
+        state.transport_fault_last_emit = now
+        state.msg_queue.put((PRIORITY_HIGH, next(state.queue_seq), 'broadcast', {
+            'type': 'transport_fault', 'source': 'ble', 'error': error, 'dropped': count}, None))
+        _schedule_queue_locked()
+
+
 def add_to_queue(priority: int, msg_type: str, data: dict, target_ws=None):
-    """添加消息到队列"""
-    try:
-        q = state.msg_queue
-        
-        if priority == PRIORITY_LOW and q.qsize() > 500:
-            try:
-                old = q.get_nowait()
-                if old[0] <= PRIORITY_HIGH:
-                    q.put(old)
-            except:
-                pass
-        
-        seq = next(state.queue_seq)
-        q.put((priority, seq, msg_type, data, target_ws))
-        
-        if state.main_loop:
-            asyncio.run_coroutine_threadsafe(process_queue(), state.main_loop)
-            
-    except Exception as e:
-        log(f"入队错误: {e}")
+    """Bound both the message queue and cross-thread loop wakeups."""
+    with state.queue_lock:
+        size = state.msg_queue.qsize()
+        if priority == PRIORITY_LOW and size >= state.queue_low_limit:
+            _report_transport_drop_locked('BLE发送队列数据溢出')
+            return False
+        if size >= state.queue_limit:
+            log(f'发送队列已满，拒绝 {msg_type} 消息')
+            if target_ws is not None and state.main_loop:
+                state.main_loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(target_ws.close(code=1013, reason='发送队列已满')))
+            return False
+        state.msg_queue.put((priority, next(state.queue_seq), msg_type, data, target_ws))
+        _schedule_queue_locked()
+    return True
+
+
+def _ensure_process_queue():
+    with state.queue_lock:
+        state.queue_wake_pending = False
+        if state.queue_task is None or state.queue_task.done():
+            state.queue_task = asyncio.create_task(process_queue())
 
 
 async def process_queue():
@@ -1150,37 +1139,45 @@ async def process_queue():
                     for ws in targets:
                         if ws:
                             try:
-                                await ws.send(payload)
-                            except:
-                                pass
+                                await asyncio.wait_for(ws.send(payload), timeout=1.0)
+                            except Exception:
+                                state.control_clients.discard(ws)
                 
                 elif msg_type == 'data':
                     # 数据 -> 发送到数据端
                     for ws in list(state.data_clients):
                         try:
-                            await ws.send(payload)
-                        except:
-                            pass
+                            await asyncio.wait_for(ws.send(payload), timeout=1.0)
+                        except Exception:
+                            state.data_clients.discard(ws)
                 
                 elif msg_type == 'broadcast':
                     # 广播 -> 发送到所有客户端
                     all_clients = list(state.control_clients) + list(state.data_clients)
                     for ws in all_clients:
                         try:
-                            await ws.send(payload)
-                        except:
-                            pass
+                            await asyncio.wait_for(ws.send(payload), timeout=1.0)
+                        except Exception:
+                            state.control_clients.discard(ws)
+                            state.data_clients.discard(ws)
                             
             except Exception as e:
                 log(f"发送错误: {e}")
                 
     except Exception as e:
         log(f"队列处理错误: {e}")
+    finally:
+        state.queue_task = None
+        if not state.stop_thread and not q.empty() and state.main_loop:
+            _ensure_process_queue()
 
 
 async def send_to_control(ws, action: str, data: dict):
     """发送响应到控制端"""
     msg = {'type': 'response', 'action': action, **data}
+    request_id = _control_request_id.get()
+    if request_id is not None:
+        msg['request_id'] = request_id
     add_to_queue(PRIORITY_HIGH, 'control', msg, ws)
 
 
@@ -2269,6 +2266,7 @@ async def handle_control_client(websocket):
                 else:
                     data = json.loads(message)
 
+                _control_request_id.set(data.get('request_id'))
                 action = data.get('action', '')
                 # 不打印 status 命令，减少日志噪音
                 if action != 'status':
@@ -2600,6 +2598,10 @@ async def main():
         state.stop_thread = True
         if state.data_thread:
             state.data_thread.join(timeout=2.0)
+        if state.queue_task:
+            state.queue_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await state.queue_task
         log("服务已停止")
 
 

@@ -38,10 +38,14 @@ import math
 import sys
 import io
 import threading
+from collections import deque
 
 # 编码配置
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+try:
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    sys.stderr.reconfigure(encoding='utf-8', line_buffering=True)
+except (AttributeError, ValueError):
+    pass
 
 try:
     import numpy as np
@@ -201,7 +205,8 @@ class BaseMocapReceiver:
         self.latest_markers = {}
         self.latest_frame = 0
         self.latest_timestamp = 0
-        self._frame_buffer = []
+        self._frame_buffer = deque(maxlen=1000)
+        self._dropped_frames = 0
         self._buffer_lock = threading.Lock()
         self._last_print_time = 0
         self._print_interval = 1.0
@@ -236,9 +241,21 @@ class BaseMocapReceiver:
     def get_buffered_frames(self):
         """获取并清空缓冲区中的所有帧"""
         with self._buffer_lock:
-            frames = self._frame_buffer.copy()
+            frames = list(self._frame_buffer)
             self._frame_buffer.clear()
             return frames
+
+    def _append_frame(self, frame):
+        with self._buffer_lock:
+            if len(self._frame_buffer) >= self._frame_buffer.maxlen:
+                self._dropped_frames += 1
+            self._frame_buffer.append(frame)
+
+    def pop_dropped_frames(self):
+        with self._buffer_lock:
+            count = self._dropped_frames
+            self._dropped_frames = 0
+            return count
 
     def connect(self):
         """连接数据源（子类实现）"""
@@ -306,8 +323,7 @@ class NokovSDKReceiver(BaseMocapReceiver):
 
             self.latest_markers = markers
 
-            with self._buffer_lock:
-                self._frame_buffer.append({
+            self._append_frame({
                     "markers": markers.copy(),
                     "frame": frame_no,
                     "time": timestamp,            # SDK 相对时间戳（动捕系统启动后的秒数）
@@ -419,8 +435,7 @@ class SimulatorReceiver(BaseMocapReceiver):
                             self.latest_timestamp = timestamp
                             self.latest_markers = markers
 
-                            with self._buffer_lock:
-                                self._frame_buffer.append({
+                            self._append_frame({
                                     "markers": markers.copy(),
                                     "frame": frame_no,
                                     "time": timestamp,            # 模拟器时间戳
@@ -688,9 +703,10 @@ class MocapServer:
         interval = 1.0 / self.send_rate
 
         while self._running:
-            if self.clients and self.sdk_connected:
+            if self.sdk_connected:
                 self.update_from_mocap()
                 buffered_frames = self.receiver.get_buffered_frames()
+                dropped_frames = self.receiver.pop_dropped_frames()
 
                 data = {
                     'type': 'mocap',
@@ -708,19 +724,30 @@ class MocapServer:
                         for name, ch in self.channels.items()
                     },
                     'frames': buffered_frames,
-                    'frame_count': len(buffered_frames)
+                    'frame_count': len(buffered_frames),
+                    'dropped_frames': dropped_frames
                 }
                 message = json.dumps(data)
 
                 disconnected = set()
-                for client in self.clients:
+                for client in list(self.clients):
                     try:
-                        await client.send(message)
-                    except websockets.exceptions.ConnectionClosed:
+                        await asyncio.wait_for(client.send(message), timeout=1.0)
+                    except Exception:
                         disconnected.add(client)
 
                 for client in disconnected:
                     await self.unregister(client)
+                if dropped_frames and self.clients:
+                    fault = json.dumps({
+                        'type': 'transport_fault', 'source': 'mocap',
+                        'error': 'mocap frame buffer overflow', 'dropped': dropped_frames
+                    })
+                    for client in list(self.clients):
+                        try:
+                            await asyncio.wait_for(client.send(fault), timeout=1.0)
+                        except Exception:
+                            await self.unregister(client)
 
             await asyncio.sleep(interval)
 
@@ -737,7 +764,7 @@ class MocapServer:
         broadcast_task = asyncio.create_task(self.broadcast_data())
 
         try:
-            await asyncio.Future()
+            await broadcast_task
         except asyncio.CancelledError:
             pass
         finally:
@@ -745,6 +772,10 @@ class MocapServer:
             if self.sdk_connected:
                 self.receiver.disconnect()
             broadcast_task.cancel()
+            try:
+                await broadcast_task
+            except asyncio.CancelledError:
+                pass
             server.close()
             await server.wait_closed()
             print("[MocapServer] 服务器已停止")

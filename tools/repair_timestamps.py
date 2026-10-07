@@ -23,7 +23,17 @@ import numpy as np
 import os
 import shutil
 import sys
+import tempfile
+from contextlib import ExitStack
 from pathlib import Path
+try:
+    from .alignment import unwrap_u32_strict
+except ImportError:
+    from alignment import unwrap_u32_strict
+try:
+    from .file_access import h5_transaction, logical_h5_path, exclusive_file, FileBusyError
+except ImportError:
+    from file_access import h5_transaction, logical_h5_path, exclusive_file, FileBusyError
 
 # 需要修复的数据集（EMG + IMU 时间戳字段）
 DATASET_CONFIG = {
@@ -64,25 +74,18 @@ def repair_with_frame_counter(times, frame_ids, sample_rate):
 
     frame_interval = 1.0 / sample_rate
 
-    # 处理 sd_frame_id 计数器溢出复位
-    # ESP32 固件计数器可能溢出归零，表现为大幅回跳（>100k）
-    ids_i64 = frame_ids.astype(np.int64).copy()
-    adjusted_ids = np.zeros(n, dtype=np.int64)
-    adjusted_ids[0] = ids_i64[0]
-    overflow = np.int64(0)
-    prev_raw = ids_i64[0]
-
-    for i in range(1, n):
-        raw = ids_i64[i]
-        if raw < prev_raw - 100000:  # 检测到溢出复位（下降超过10万）
-            overflow += prev_raw
-        adjusted_ids[i] = raw + overflow
-        prev_raw = raw
+    if len(frame_ids) != n or not np.all(np.isfinite(times)):
+        raise ValueError('times and frame_ids must have equal lengths and finite timestamps')
+    if not np.isfinite(sample_rate) or sample_rate <= 0:
+        raise ValueError('sample_rate must be positive and finite')
+    adjusted_ids = unwrap_u32_strict(frame_ids)
 
     # 用修正后的 ID 计算精确时间戳
     time_base = times[0]
     frame_base = adjusted_ids[0]
     corrected = time_base + (adjusted_ids.astype(np.float64) - frame_base) * frame_interval
+    if np.any(np.diff(corrected) <= 0):
+        raise ValueError('counter-derived timestamps are not strictly increasing')
 
     # 统计回退
     diffs_orig = np.diff(times)
@@ -186,7 +189,7 @@ def _write_time_field(h5f, ds_name, corrected_times):
         new_ds.attrs[k] = v
 
 
-def repair_file(input_path, output_path=None, dry_run=False):
+def _repair_file_impl(input_path, output_path=None, dry_run=False):
     """修复单个 H5 文件的时间戳"""
     print(f'\n{"=" * 70}')
     print(f'文件: {input_path}')
@@ -226,26 +229,12 @@ def repair_file(input_path, output_path=None, dry_run=False):
                 frame_ids = ds['sd_frame_id'][:]
                 id_diffs = np.diff(frame_ids.astype(np.int64))
                 n_bad = int(np.sum(id_diffs <= 0))
-                # 允许少量非单调点（ESP32 计数器溢出复位），仍可使用精确修复
-                # repair_with_frame_counter 内部已处理溢出复位
-                id_usable = n_bad == 0 or (n_bad <= 5 and np.any(id_diffs < -100000))
-
-                if id_usable:
-                    # ===== 精确修复模式 =====
-                    # sd_frame_id 是 ESP32 SD 卡记录的帧计数器
-                    # sd_id_rate: sd_frame_id 递增速率（配置中指定）
-                    #   EMG: 2000Hz（无论 2kHz 还是 250Hz 数据集）
-                    #   IMU 100Hz: 100Hz
-                    sd_sample_rate = cfg.get('sd_id_rate', cfg.get('expected_rate', 2000))
-                    corrected, stats = repair_with_frame_counter(times, frame_ids, sd_sample_rate)
-                    tag = '精确' if n_bad == 0 else f'精确(溢出修复)'
-                    method = f'sd_frame_id@{sd_sample_rate}Hz ({tag})'
-                else:
-                    # sd_frame_id 严重损坏，回退到单调化
-                    expected_rate = cfg.get('expected_rate', 2000)
-                    frame_interval = 1.0 / expected_rate
-                    corrected, stats = monotonize_timestamps(times, frame_interval, mode='strict')
-                    method = f'monotonize (sd_frame_id严重异常:{n_bad}处)'
+                # A reset/duplicate needs explicit segment evidence; silently
+                # falling back to synthetic spacing would conceal data loss.
+                sd_sample_rate = cfg.get('sd_id_rate', cfg.get('expected_rate', 2000))
+                corrected, stats = repair_with_frame_counter(times, frame_ids, sd_sample_rate)
+                tag = '精确' if n_bad == 0 else '精确(u32回绕)'
+                method = f'sd_frame_id@{sd_sample_rate}Hz ({tag})'
             else:
                 # 无 sd_frame_id，使用单调化
                 expected_rate = cfg.get('expected_rate')
@@ -261,6 +250,8 @@ def repair_file(input_path, output_path=None, dry_run=False):
             # 验证修正结果
             diffs_fixed = np.diff(corrected)
             n_backward_fixed = int(np.sum(diffs_fixed < 0))
+            if not np.all(np.isfinite(corrected)) or (cfg.get('mono_mode') == 'strict' and np.any(diffs_fixed <= 0)):
+                raise ValueError(f'{ds_name}: repaired timestamps are not finite and strictly increasing')
             dur_orig = times[-1] - times[0]
             dur_fixed = corrected[-1] - corrected[0]
 
@@ -298,6 +289,87 @@ def repair_file(input_path, output_path=None, dry_run=False):
         return False
 
     return True
+
+
+class _RepairRollback(Exception):
+    pass
+
+
+def _file_stamp(path):
+    """Stable source identity used by distinct-output copy-on-write."""
+    stat = os.stat(path)
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _validate_saved_h5(path):
+    """Open and traverse a repaired copy before it replaces its destination."""
+    with h5py.File(path, 'r') as handle:
+        handle.visititems(lambda _name, _obj: None)
+
+
+def repair_file(input_path, output_path=None, dry_run=False):
+    """Repair timestamps with copy-on-write semantics.
+
+    In-place edits use the shared H5 transaction.  A distinct output is first
+    repaired in a same-directory temporary copy, validated, fsynced, and then
+    atomically replaced.  ``dry_run`` remains strictly read-only.
+    """
+    if dry_run:
+        return _repair_file_impl(input_path, None, dry_run=True)
+
+    input_key = os.path.normcase(os.path.realpath(os.fspath(input_path)))
+    output_key = (os.path.normcase(os.path.realpath(os.fspath(output_path)))
+                  if output_path else None)
+    if output_key is None or output_key == input_key:
+        try:
+            with h5_transaction(input_path) as staged:
+                ok = _repair_file_impl(staged, None, dry_run=False)
+                if not ok:
+                    raise _RepairRollback()
+                return True
+        except _RepairRollback:
+            return False
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f'.{output.stem}.repair-',
+                                      suffix=output.suffix or '.h5',
+                                      dir=output.parent)
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        # Hold both logical source and destination locks for the entire
+        # copy/repair/validate/replace sequence.  Lock order is stable so
+        # two simultaneous cross-output repairs cannot deadlock.
+        source_key = os.path.normcase(os.path.realpath(os.fspath(input_path)))
+        dest_key = os.path.normcase(os.path.realpath(os.fspath(output)))
+        lock_order = [(source_key, input_path), (dest_key, output)]
+        lock_order.sort(key=lambda item: item[0])
+        with ExitStack() as locks:
+            for _, lock_path in lock_order:
+                locks.enter_context(exclusive_file(lock_path))
+            source_stamp = _file_stamp(input_path)
+            with h5py.File(input_path, 'r'):
+                shutil.copy2(input_path, temp_path)
+            ok = _repair_file_impl(str(temp_path), None, dry_run=False)
+            if not ok:
+                raise _RepairRollback()
+            _validate_saved_h5(temp_path)
+            # A cooperating writer must not replace a source that changed
+            # after the copy, even though the sidecar lock normally prevents
+            # that race.  This also protects against non-cooperating writers.
+            if _file_stamp(input_path) != source_stamp:
+                raise FileBusyError(
+                    f'源文件在另名修复期间发生变化，未替换输出：{input_path}')
+            with open(temp_path, 'r+b') as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, output)
+            return True
+    except _RepairRollback:
+        return False
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def main():

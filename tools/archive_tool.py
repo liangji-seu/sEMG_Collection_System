@@ -52,6 +52,7 @@ EXPECTED_H5_PER_CONFIG = 6
 STATUS_SYNCED   = 'synced'      # 🟢 green
 STATUS_PENDING  = 'pending'     # 🟡 amber
 STATUS_FAILED   = 'sync_failed' # 🔴 red
+STATUS_UNVERIFIED = 'unverified' # ⚪ legacy or incomplete aggregate metadata
 STATUS_NONE     = 'none'        # ⚪ grey (no H5 metadata / unknown)
 
 LEGEND_HTML = """
@@ -85,6 +86,10 @@ def read_h5_status(h5_path: str) -> dict:
         'bin_refs':          [],
         'video_refs':        [],
         'video_compressed':  False,
+        'sync_aggregate_status': '',
+        'sync_required_devices': [],
+        'sync_device_results': [],
+        'sync_traceability': False,
     }
     if not HAS_H5PY or not os.path.isfile(h5_path):
         return result
@@ -119,10 +124,27 @@ def read_h5_status(h5_path: str) -> dict:
                 or any(ref.lower().endswith('.mp4') for ref in result['video_refs'])
             )
 
-            # Check for 2kHz sync datasets
-            if 'emg1_2khz_adc' in f or 'emg2_2khz_adc' in f:
-                if result['sync_status'] == STATUS_NONE:
-                    result['sync_status'] = STATUS_SYNCED
+            aggregate = _attr_to_str(attrs.get('sync_aggregate_status', '')).lower()
+            result['sync_aggregate_status'] = aggregate
+            required_raw = _attr_to_str(attrs.get('sync_required_devices', ''))
+            details_raw = _attr_to_str(attrs.get('sync_device_results', ''))
+            try:
+                result['sync_required_devices'] = [int(v) for v in json.loads(required_raw)] if required_raw else []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result['sync_required_devices'] = []
+            try:
+                result['sync_device_results'] = json.loads(details_raw) if details_raw else []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result['sync_device_results'] = []
+
+            try:
+                from .bin_sync_tool import sync_status_summary
+            except ImportError:
+                from bin_sync_tool import sync_status_summary
+            summary = sync_status_summary(f)
+            result['sync_required_devices'] = summary['required_devices']
+            result['sync_traceability'] = summary['verified']
+            result['sync_status'] = summary['status']
 
             # Detect compression: check if datasets use compression filters
             compressed_count = 0
@@ -217,6 +239,8 @@ def status_color(status: str) -> QColor:
     """Map status string to QColor."""
     return {
         STATUS_SYNCED:  QColor('#16a34a'),  # green
+        'partial': QColor('#f97316'),
+        STATUS_UNVERIFIED: QColor('#9ca3af'),  # gray
         STATUS_PENDING: QColor('#f97316'),  # amber
         STATUS_FAILED:  QColor('#ef4444'),  # red
         'abnormal_interrupted': QColor('#3b82f6'),  # blue
@@ -228,6 +252,8 @@ def status_icon(status: str) -> str:
     """Map status string to icon character."""
     m = {
         STATUS_SYNCED:  '🟢',
+        'partial': '🟠',
+        STATUS_UNVERIFIED: '⚪',
         STATUS_PENDING: '🟠',
         STATUS_FAILED:  '🔴',
         'abnormal_interrupted': '🔵',
@@ -240,6 +266,8 @@ def status_text(status: str) -> str:
     """Map status string to Chinese label."""
     return {
         STATUS_SYNCED:  '已同步',
+        'partial': '部分设备完成',
+        STATUS_UNVERIFIED: '待核验',
         STATUS_PENDING: '待同步',
         STATUS_FAILED:  '同步失败',
         'abnormal_interrupted': '异常中断',
