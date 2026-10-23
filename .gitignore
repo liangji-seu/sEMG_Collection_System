@@ -1,6 +1,7 @@
 storage/
 log/
-config/
+config/*
+!config/内采v2_1-连续运动-FB_20261023.json
 node_modules/
 dist/
 build/
