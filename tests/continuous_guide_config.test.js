@@ -62,15 +62,17 @@ function setup() {
     manager.currentTemplate = {
         tasks: [
             { id: 'continual_gesture_1', name: '连续手势采集1', enabled: true },
-            { id: 'continual_gesture_2', name: '连续手势采集2', enabled: true }
+            { id: 'continual_gesture_2', name: '连续手势采集2', enabled: true },
+            { id: 'continual_gesture_3', name: '连续手势采集3', enabled: true }
         ],
         gestures: { discrete: [] },
         execution: {
             continual_gesture_1: { trialsPerStage: 5, stageTimeout: 120, expandDuration: 3, holdDuration: 1, contractDuration: 3, restBetweenTrials: 1, preparationTime: 3, speedLevels: [0.5, 1, 2], trialSpeedSequence: [] },
-            continual_gesture_2: { trialsPerStage: 5, stageTimeout: 120, expandDuration: 3, holdDuration: 1, contractDuration: 3, restBetweenTrials: 1, preparationTime: 3, speedLevels: [0.5, 1, 2], trialSpeedSequence: [] }
+            continual_gesture_2: { trialsPerStage: 5, stageTimeout: 120, expandDuration: 3, holdDuration: 1, contractDuration: 3, restBetweenTrials: 1, preparationTime: 3, speedLevels: [0.5, 1, 2], trialSpeedSequence: [] },
+            continual_gesture_3: { trialsPerStage: 5, stageTimeout: 120, guideSpeed: 0.15, guideSize: 0.15, holdDuration: 1, restBetweenTrials: 1, preparationTime: 3 }
         }
     };
-    return { manager, container, storage };
+    return { manager, container, storage, estimation: elements.timeEstimationContent };
 }
 
 test('continuous task form writes boolean toggles, validated values, and legacy speed sequence', () => {
@@ -134,6 +136,25 @@ test('new defaults are present for both tasks and randomized timing is labeled a
     const estimate = manager.renderTimeEstimation();
     assert.match(estimate, /估算约/);
     assert.match(estimate, /Stage超时可能提前终止/);
+});
+test('continuous 1/2 remove hold controls and ignore legacy hold time in stage estimates; task 3 keeps endpoint hold', () => {
+    const { manager, container, estimation } = setup();
+    manager.ensureTemplateFields();
+    manager.renderExecutionTab();
+    for (const taskId of ['continual_gesture_1', 'continual_gesture_2']) {
+        assert.equal(container.querySelector(`[data-task="${taskId}"][data-param="holdDuration"]`), null);
+        assert.equal(manager.currentTemplate.execution[taskId].holdDuration, undefined);
+    }
+    assert.ok(container.querySelector('[data-task="continual_gesture_3"][data-param="holdDuration"]'));
+
+    manager.currentTemplate.tasks = [{ id: 'continual_gesture_1', name: '连续手势采集1', enabled: true }];
+    manager.currentTemplate.execution.continual_gesture_1 = {
+        trialsPerStage: 5, preparationTime: 3, expandDuration: 3, contractDuration: 3,
+        restBetweenTrials: 1, holdDuration: 999
+    };
+    const html = manager.renderTimeEstimation();
+    assert.match(html, /37秒/, '5 x (3s expansion + 3s contraction), 4 between-trial rests, and 3s preparation');
+    assert.match(html, /单次动作: 7秒/, 'single-trial estimate has no legacy hold duration');
 });
 test('random fields reject values below their minimum, above limits, and unsafe millisecond conversions', () => {
     const { manager, container } = setup();

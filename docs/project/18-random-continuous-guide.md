@@ -15,12 +15,16 @@
 | `pauseDurationMin` / `pauseDurationMax` | 0.3 / 1.2 | 单次冻结秒数 |
 | `pauseIntervalMin` / `pauseIntervalMax` | 1 / 3 | 两次冻结间的有效运动秒数 |
 
-所有范围内均匀抽样。倍率允许 0.01–100；冻结时长允许 0.01–86400 秒；间隔允许 0.1–86400 秒。上下限相同表示该项固定。旧模板未设置开关时，沿用原有速度序列和动作流程。
+所有范围内均匀抽样。倍率允许 0.01–100；冻结时长允许 0.01–86400 秒；间隔允许 0.1–86400 秒。上下限相同表示该项固定。旧模板未设置随机开关时，随机功能默认关闭并沿用速度序列；旧 `holdDuration` 不再影响连续手势1和2。
 
 随机时长下的时间只作估算；Stage安全超时仍可能提前结束动作。请为随机配置留出足够超时时间。以上硬件行为尚未完成设备验收。
 随机事件会与原有提示记录一同写入 H5：`prompts/names` 中使用 `guide_motion:JSON` 保存事件内容，事件时刻记录在 `prompts/times`。事件包含 `type`（`speed_change`、`pause_start`、`pause_end`）、1起始的 `trial`、`phase` 和 `speedMultiplier`；`pause_start` 另含 `durationMs`。原有 `start` / `end` 提示记录保持不变。
 
-每次进入扩张或收缩阶段，都会重新抽取该阶段的速度、变速间隔和冻结间隔；计时不会跨阶段或Trial累计。保持阶段不随机变速或冻结。
+连续手势1和2现在从扩张结束直接进入收缩，Trial仅包含扩张与收缩；随机变速和随机冻结仍可作用于两个运动阶段，Trial间休息保持原配置。旧配置中的 `holdDuration` 会被忽略，不再增加动画或时间估算时长。连续手势3的端点停留不变。
+
+取消固定保持阶段的改动已通过完整 JavaScript 回归 67 项（无失败或跳过）及源码契约检查 3 项；提交前再次运行完整 JavaScript 67 项和本地 Conda Python 120 项回归，均通过。测试包含旧 `holdDuration=999` 时直接收缩、最大半径处衔接、扩张/收缩两阶段的随机停顿事件、停止重启、时间估算，以及任务3仍保留端点停留控件。结果见 `tmp/continuous-no-hold-review/` 和 `tmp/continuous-no-hold-final-review/`；本次未新增硬件联机验收。
+
+每次进入扩张或收缩阶段，都会重新抽取该阶段的速度、变速间隔和冻结间隔；计时不会跨阶段或Trial累计。
 
 实现位于共享 `public/scripts/continuous-guide-motion.js`，由两个连续手势动画模块调用。当前采集快照统一决定全部运动参数，避免与后台模板混用。停止和重置会清理尚未开始的 Trial 定时器。
 

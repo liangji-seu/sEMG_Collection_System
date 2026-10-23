@@ -130,7 +130,6 @@
                 preparationTimeMax: 3.0,       // 【新增】准备时间最大值（秒）
                 restBetweenTrials: 1,          // 【新增】试次间隔休息时间（秒）
                 expandDuration: 3.0,           // 扩张阶段时长（秒）- 基准时长
-                holdDuration: 1.0,             // 保持阶段时长（秒）
                 contractDuration: 3.0,         // 收缩阶段时长（秒）- 基准时长
                 guideBandWidth: 10,            // 引导区域宽度（像素，半径±此值）
                 maxRadius: 150,                // 同心圆最大半径（像素）
@@ -157,7 +156,6 @@
                 preparationTimeMax: 3.0,       // 【新增】准备时间最大值（秒）
                 restBetweenTrials: 1,          // 【新增】试次间隔休息时间（秒）
                 expandDuration: 3.0,           // 扩张阶段时长（秒）- 基准时长
-                holdDuration: 1.0,             // 保持阶段时长（秒）
                 contractDuration: 3.0,         // 收缩阶段时长（秒）- 基准时长
                 guideBandWidth: 10,            // 引导区域宽度（像素）
                 maxRadius: 150,                // 同心圆最大半径（像素）
@@ -364,7 +362,6 @@
                             stageTimeout: 120,
                             preparationTime: oldExec.preparationTime || 3.0,
                             expandDuration: 3.0,
-                            holdDuration: 1.0,
                             contractDuration: 3.0,
                             guideBandWidth: 10,
                             maxRadius: 150
@@ -374,7 +371,6 @@
                             stageTimeout: 120,
                             preparationTime: oldExec.preparationTime || 3.0,
                             expandDuration: 3.0,
-                            holdDuration: 1.0,
                             contractDuration: 3.0,
                             guideBandWidth: 10,
                             maxRadius: 150
@@ -401,7 +397,6 @@
                                 stageTimeout: stageTimeout,
                                 preparationTime: preparationTime,
                                 expandDuration: 3.0,
-                                holdDuration: 1.0,
                                 contractDuration: 3.0,
                                 guideBandWidth: 10,
                                 maxRadius: 150
@@ -437,6 +432,8 @@
             ['continual_gesture_1', 'continual_gesture_2'].forEach(taskId => {
                 const taskConfig = this.currentTemplate.execution[taskId];
                 const defaults = DEFAULT_TEMPLATE.execution[taskId];
+                // 旧连续手势 1/2 配置中的 holdDuration 已弃用，加载时忽略。
+                delete taskConfig.holdDuration;
                 taskConfig.randomSpeedEnabled = taskConfig.randomSpeedEnabled === true;
                 taskConfig.randomPauseEnabled = taskConfig.randomPauseEnabled === true;
 
@@ -1799,7 +1796,7 @@
                             <input type="number" data-task="${task.id}" data-param="trialsPerStage"
                                    value="${taskExec.trialsPerStage || 5}" min="1" max="1000" step="1">
                             <span class="param-unit">次</span>
-                            <span class="param-hint">（扩张+保持+收缩为一次）</span>
+                            <span class="param-hint">（扩张+收缩为一次）</span>
                         </div>
                         <div class="config-param-item">
                             <label>Stage超时时间</label>
@@ -1843,13 +1840,6 @@
                             <span class="param-hint">（引导圆从0扩大到最大）</span>
                         </div>
                         <div class="config-param-item">
-                            <label>保持阶段时长</label>
-                            <input type="number" data-task="${task.id}" data-param="holdDuration"
-                                   value="${taskExec.holdDuration || 1.0}" min="0.5" max="5" step="0.5">
-                            <span class="param-unit">秒</span>
-                            <span class="param-hint">（在最大半径保持）</span>
-                        </div>
-                        <div class="config-param-item">
                             <label>收缩阶段时长</label>
                             <input type="number" data-task="${task.id}" data-param="contractDuration"
                                    value="${taskExec.contractDuration || 3.0}" min="1" max="10" step="0.5">
@@ -1877,7 +1867,7 @@
                         </div>
                         <div class="config-param-item config-random-guide-param">
                             <label><input type="checkbox" data-task="${task.id}" data-param="randomSpeedEnabled" data-type="boolean" ${taskExec.randomSpeedEnabled === true ? 'checked' : ''}> 动作途中随机变速</label>
-                            <span class="param-hint">只在扩张和收缩过程中变速，保持阶段不变；设备持续记录。每次进入扩张或收缩都会重新抽取速度和计时，不跨阶段或Trial累计。启用后优先使用随机速度，关闭后恢复下方原速度序列。</span>
+                            <span class="param-hint">只在扩张和收缩过程中变速；设备持续记录。每次进入扩张或收缩都会重新抽取速度和计时，不跨阶段或Trial累计。启用后优先使用随机速度，关闭后恢复下方原速度序列。</span>
                         </div>
                         <div class="config-param-item config-random-guide-param">
                             <label>随机速度倍率范围（最小值）</label>
@@ -1898,7 +1888,7 @@
                         </div>
                         <div class="config-param-item config-random-guide-param">
                             <label><input type="checkbox" data-task="${task.id}" data-param="randomPauseEnabled" data-type="boolean" ${taskExec.randomPauseEnabled === true ? 'checked' : ''}> 动作途中随机冻结引导圆</label>
-                            <span class="param-hint">只在扩张和收缩过程中随机暂停引导动画，保持阶段不变，不影响设备采集；两只手看到同一个目标圆。每次进入扩张或收缩都会重抽冻结间隔，不跨阶段或Trial累计。</span>
+                            <span class="param-hint">只在扩张和收缩过程中随机暂停引导动画，不影响设备采集；两只手看到同一个目标圆。每次进入扩张或收缩都会重抽冻结间隔，不跨阶段或Trial累计。</span>
                         </div>
                         <div class="config-param-item config-random-guide-param">
                             <label>每次冻结时长（最短）</label>
@@ -2187,14 +2177,12 @@
                     const trialsPerStage = taskExec.trialsPerStage || 5;
                     const preparationTime = taskExec.preparationTime || 3.0;
                     const expandDuration = taskExec.expandDuration || 3.0;
-                    const holdDuration = taskExec.holdDuration || 1.0;
                     const contractDuration = taskExec.contractDuration || 3.0;
-                    const restBetweenTrials = taskExec.restBetweenTrials || 1;
+                    const restBetweenTrials = taskExec.restBetweenTrials ?? 1;
 
-                    // 单次动作耗时 = 扩张 + 保持 + 收缩 + 间隔
-                    const singleTrialTime = expandDuration + holdDuration + contractDuration + restBetweenTrials;
-                    // 单个Stage时间 = 所有动作时间 + 准备时间
-                    singleStageTime = trialsPerStage * singleTrialTime + preparationTime;
+                    // 单次动作耗时 = 扩张 + 收缩 + 试次间休息；Stage不计最后一次休息
+                    const singleTrialTime = expandDuration + contractDuration + restBetweenTrials;
+                    singleStageTime = trialsPerStage * (expandDuration + contractDuration) + Math.max(0, trialsPerStage - 1) * restBetweenTrials + preparationTime;
 
                     taskDetails = `
                         <div class="estimation-detail">

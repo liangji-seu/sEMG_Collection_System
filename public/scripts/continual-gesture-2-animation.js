@@ -7,11 +7,11 @@
  * - 引导同心圆：半径从0逐渐增加到maxRadius，引导区域是 r±guideBandWidth
  * - 用户通过鼠标滚轮控制另一个同心圆的半径（滚轮向后=半径增大）
  * - 受试者需要让自己控制的圆尽量保持在引导区域内
- * - 一次采集周期：引导圆从0→maxRadius（扩张），保持holdDuration，然后maxRadius→0（收缩）
+ * - 一次采集周期：引导圆连续从0→maxRadius（扩张）再从maxRadius→0（收缩）
  * 
  * Stage结构：
  * - 每个Stage包含多个Trial（采集周期）
- * - 每个Trial = 扩张阶段 + 保持阶段 + 收缩阶段
+ * - 每个Trial = 扩张阶段 + 收缩阶段
  */
 
 (function() {
@@ -46,10 +46,9 @@
             this.userRadius = 0;               // 兼容旧接口（取左手值）
             
             // 动画阶段
-            this.phase = 'idle';               // 'idle' | 'expand' | 'hold' | 'contract'
+            this.phase = 'idle';               // 'idle' | 'expand' | 'contract'
             this.phaseStartTime = 0;           // 当前阶段开始时间
             this.expandDuration = 3000;        // 扩张阶段时长（ms）
-            this.holdDuration = 1000;          // 保持阶段时长（ms）
             this.contractDuration = 3000;      // 收缩阶段时长（ms）
             
             // Trial计数
@@ -154,7 +153,6 @@
             this.guideMotionParams = templateConfig || {};
             this.baseExpandDuration = 3000;
             this.baseContractDuration = 3000;
-            this.holdDuration = 1000;
             this.restBetweenTrials = 1;
             if (templateConfig) {
                 this.maxTrials = templateConfig.trialsPerStage || 5;
@@ -166,9 +164,6 @@
                 if (templateConfig.expandDuration !== undefined) {
                     this.baseExpandDuration = templateConfig.expandDuration * 1000;
                     this.expandDuration = this.baseExpandDuration;
-                }
-                if (templateConfig.holdDuration !== undefined) {
-                    this.holdDuration = templateConfig.holdDuration * 1000;
                 }
                 if (templateConfig.contractDuration !== undefined) {
                     this.baseContractDuration = templateConfig.contractDuration * 1000;
@@ -190,7 +185,6 @@
                     stageTimeout: this.stageTimeout,
                     restBetweenTrials: this.restBetweenTrials,
                     baseExpandDuration: this.baseExpandDuration,
-                    holdDuration: this.holdDuration,
                     baseContractDuration: this.baseContractDuration,
                     guideBandWidth: this.guideBandWidth,
                     maxRadius: this.maxRadius,
@@ -463,18 +457,12 @@
                 if (state.complete) {
                     this._guidePaused = false;
                     if (this.phase === 'expand') {
-                        this.phase = 'hold';
-                        this.phaseStartTime = now;
                         this.guideRadius = this.maxRadius;
+                        this.beginGuidePhase('contract');
                     } else {
                         this.guideRadius = 0;
                         this.completeTrial();
                     }
-                }
-            } else if (this.phase === 'hold') {
-                this.guideRadius = this.maxRadius;
-                if (now - this.phaseStartTime >= this.holdDuration) {
-                    this.beginGuidePhase('contract');
                 }
             }
         }
@@ -726,7 +714,6 @@
             const phaseText = {
                 'idle': '准备中...',
                 'expand': '扩张阶段 ↗',
-                'hold': '保持阶段 ●',
                 'contract': '收缩阶段 ↘'
             };
             ctx.fillStyle = this.config.colors.text;

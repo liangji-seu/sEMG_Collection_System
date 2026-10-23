@@ -43,10 +43,10 @@ function load(task, template = {}) {
 }
 
 for (const task of [1, 2]) {
-    test(`gesture ${task}: old configuration uses its own sequence and full phase durations`, () => {
+    test(`gesture ${task}: legacy holdDuration is ignored and expansion joins contraction at max radius`, () => {
         const h = load(task, { expandDuration: 20, randomSpeedEnabled: true, randomSpeedMin: 99 });
         let completed = 0;
-        const params = { trialsPerStage: 1, expandDuration: 4, holdDuration: 0.5,
+        const params = { trialsPerStage: 1, expandDuration: 4, holdDuration: 999,
             contractDuration: 4, speedLevels: [2], trialSpeedSequence: [1] };
         h.animation.start({ name: 'test' }, () => completed++, () => {}, params);
         assert.equal(h.animation.baseExpandDuration, 4000);
@@ -55,12 +55,13 @@ for (const task of [1, 2]) {
         h.advance(1000);
         assert.ok(Math.abs(h.animation.guideRadius - h.animation.maxRadius / 2) < 1e-8);
         h.advance(2000);
-        assert.equal(h.animation.phase, 'hold');
-        h.advance(2500);
         assert.equal(h.animation.phase, 'contract');
-        h.advance(3500);
+        assert.equal(h.animation.guideRadius, h.animation.maxRadius, 'the transition frame reaches the maximum radius');
+        h.advance(2001);
+        assert.ok(h.animation.guideRadius < h.animation.maxRadius, 'contraction starts on the next frame');
+        h.advance(3000);
         assert.ok(Math.abs(h.animation.guideRadius - h.animation.maxRadius / 2) < 1e-8);
-        h.advance(4500);
+        h.advance(4000);
         assert.equal(completed, 1);
         assert.equal(h.animation.isRunning, false);
         assert.deepEqual(h.sent.filter(p => p.type === 'prompt').map(p => p.name), ['start', 'end']);
@@ -86,11 +87,26 @@ for (const task of [1, 2]) {
         assert.equal(h.animation.guideRadius, radius);
         h.advance(1600);
         assert.ok(h.animation.guideRadius > radius);
+        // Continue through both motion phases, including the random freezes.
+        let time = 1600;
+        while (h.animation.phase === 'expand' && time < 30000) {
+            time += 500;
+            h.advance(time);
+        }
+        assert.equal(h.animation.phase, 'contract');
+        while (h.animation.phase === 'contract' && time < 60000) {
+            time += 500;
+            h.advance(time);
+        }
+        assert.equal(h.animation.phase, 'rest', 'finishing contraction advances the Trial into its inter-trial rest');
         const events = h.sent.filter(p => p.name?.startsWith('guide_motion:'));
         const details = events.map(p => JSON.parse(p.name.slice('guide_motion:'.length)));
-        assert.ok(details.some(p => p.type === 'speed_change' && p.speedMultiplier === 2));
-        assert.ok(details.some(p => p.type === 'pause_start' && p.durationMs === 1000));
-        assert.ok(details.some(p => p.type === 'pause_end'));
+        assert.ok(details.some(p => p.type === 'speed_change' && p.speedMultiplier === 2 && p.phase === 'expand'));
+        assert.ok(details.some(p => p.type === 'pause_start' && p.durationMs === 1000 && p.phase === 'expand'));
+        assert.ok(details.some(p => p.type === 'pause_end' && p.phase === 'expand'));
+        assert.ok(details.some(p => p.type === 'speed_change' && p.phase === 'contract'));
+        assert.ok(details.some(p => p.type === 'pause_start' && p.phase === 'contract'));
+        assert.ok(details.some(p => p.type === 'pause_end' && p.phase === 'contract'));
         assert.ok(events.every(p => Number.isFinite(p.timestamp)));
         assert.ok(h.sent.every(p => p.type === 'prompt'));
         h.animation.stop();
