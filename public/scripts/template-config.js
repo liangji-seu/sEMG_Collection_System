@@ -136,7 +136,17 @@
                 maxRadius: 150,                // 同心圆最大半径（像素）
                 // 【新增】速度变化配置
                 speedLevels: [0.5, 1.0, 1.5, 2.0],  // 速度等级（倍率：0.5=慢速2倍时间，2.0=快速一半时间）
-                trialSpeedSequence: []         // 每个Trial的速度等级索引（1-based），空=全部使用1.0倍率
+                trialSpeedSequence: [],        // 每个Trial的速度等级索引（1-based），空=全部使用1.0倍率
+                randomSpeedEnabled: false,
+                randomSpeedMin: 0.5,
+                randomSpeedMax: 2,
+                speedChangeIntervalMin: 0.5,
+                speedChangeIntervalMax: 1.5,
+                randomPauseEnabled: false,
+                pauseDurationMin: 0.3,
+                pauseDurationMax: 1.2,
+                pauseIntervalMin: 1,
+                pauseIntervalMax: 3
             },
             // 连续手势2采集参数（同心圆引导动画）
             continual_gesture_2: {
@@ -153,7 +163,17 @@
                 maxRadius: 150,                // 同心圆最大半径（像素）
                 // 【新增】速度变化配置
                 speedLevels: [0.5, 1.0, 1.5, 2.0],  // 速度等级
-                trialSpeedSequence: []         // 每个Trial的速度等级索引
+                trialSpeedSequence: [],        // 每个Trial的速度等级索引
+                randomSpeedEnabled: false,
+                randomSpeedMin: 0.5,
+                randomSpeedMax: 2,
+                speedChangeIntervalMin: 0.5,
+                speedChangeIntervalMax: 1.5,
+                randomPauseEnabled: false,
+                pauseDurationMin: 0.3,
+                pauseDurationMax: 1.2,
+                pauseIntervalMin: 1,
+                pauseIntervalMax: 3
             },
             // 连续手势3采集参数（手掌反转引导）
             continual_gesture_3: {
@@ -411,6 +431,39 @@
                 console.log('[TemplateConfig] 补充缺失的 gestures');
                 this.currentTemplate.gestures = JSON.parse(JSON.stringify(DEFAULT_TEMPLATE.gestures));
             }
+
+            // Normalize only the new continuous-guide random fields. Older templates
+            // keep their existing settings and get the new toggles defaulted off.
+            ['continual_gesture_1', 'continual_gesture_2'].forEach(taskId => {
+                const taskConfig = this.currentTemplate.execution[taskId];
+                const defaults = DEFAULT_TEMPLATE.execution[taskId];
+                taskConfig.randomSpeedEnabled = taskConfig.randomSpeedEnabled === true;
+                taskConfig.randomPauseEnabled = taskConfig.randomPauseEnabled === true;
+
+                const bounds = {
+                    randomSpeedMin: [0.01, 100], randomSpeedMax: [0.01, 100],
+                    speedChangeIntervalMin: [0.1, 86400], speedChangeIntervalMax: [0.1, 86400],
+                    pauseDurationMin: [0.01, 86400], pauseDurationMax: [0.01, 86400],
+                    pauseIntervalMin: [0.1, 86400], pauseIntervalMax: [0.1, 86400]
+                };
+                Object.entries(bounds).forEach(([field, [min, max]]) => {
+                    const value = taskConfig[field];
+                    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max || !Number.isFinite(value * 1000)) {
+                        taskConfig[field] = defaults[field];
+                    }
+                });
+
+                [
+                    ['randomSpeedMin', 'randomSpeedMax'],
+                    ['speedChangeIntervalMin', 'speedChangeIntervalMax'],
+                    ['pauseDurationMin', 'pauseDurationMax'],
+                    ['pauseIntervalMin', 'pauseIntervalMax']
+                ].forEach(([minField, maxField]) => {
+                    if (taskConfig[minField] > taskConfig[maxField]) {
+                        [taskConfig[minField], taskConfig[maxField]] = [taskConfig[maxField], taskConfig[minField]];
+                    }
+                });
+            });
         }
 
         getEnabledDiscreteGestures() {
@@ -1744,7 +1797,7 @@
                         <div class="config-param-item">
                             <label>每个Stage的动作次数</label>
                             <input type="number" data-task="${task.id}" data-param="trialsPerStage"
-                                   value="${taskExec.trialsPerStage || 5}" min="1" max="20">
+                                   value="${taskExec.trialsPerStage || 5}" min="1" max="1000" step="1">
                             <span class="param-unit">次</span>
                             <span class="param-hint">（扩张+保持+收缩为一次）</span>
                         </div>
@@ -1818,11 +1871,55 @@
                             <span class="param-hint">（圆的最大尺寸）</span>
                         </div>
 
-                        <!-- 【新增】速度变化配置区域 -->
+                        <!-- 动作途中随机变化配置 -->
                         <div class="config-section-divider">
-                            <span class="divider-title">速度变化配置</span>
+                            <span class="divider-title">动作途中随机变化（两个开关可独立启用）</span>
                         </div>
-                        <div class="config-param-item">
+                        <div class="config-param-item config-random-guide-param">
+                            <label><input type="checkbox" data-task="${task.id}" data-param="randomSpeedEnabled" data-type="boolean" ${taskExec.randomSpeedEnabled === true ? 'checked' : ''}> 动作途中随机变速</label>
+                            <span class="param-hint">只在扩张和收缩过程中变速，保持阶段不变；设备持续记录。每次进入扩张或收缩都会重新抽取速度和计时，不跨阶段或Trial累计。启用后优先使用随机速度，关闭后恢复下方原速度序列。</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label>随机速度倍率范围（最小值）</label>
+                            <input type="number" data-task="${task.id}" data-param="randomSpeedMin" value="${taskExec.randomSpeedMin !== undefined ? taskExec.randomSpeedMin : 0.5}" min="0.01" max="100" step="0.01"><span class="param-unit">倍速</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label>随机速度倍率范围（最大值）</label>
+                            <input type="number" data-task="${task.id}" data-param="randomSpeedMax" value="${taskExec.randomSpeedMax !== undefined ? taskExec.randomSpeedMax : 2}" min="0.01" max="100" step="0.01"><span class="param-unit">倍速</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label>两次变速间隔（最短有效运动时间）</label>
+                            <input type="number" data-task="${task.id}" data-param="speedChangeIntervalMin" value="${taskExec.speedChangeIntervalMin !== undefined ? taskExec.speedChangeIntervalMin : 0.5}" min="0.1" max="86400" step="0.1"><span class="param-unit">秒</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label>两次变速间隔（最长有效运动时间）</label>
+                            <input type="number" data-task="${task.id}" data-param="speedChangeIntervalMax" value="${taskExec.speedChangeIntervalMax !== undefined ? taskExec.speedChangeIntervalMax : 1.5}" min="0.1" max="86400" step="0.1"><span class="param-unit">秒</span>
+                            <span class="param-hint">暂停期间不计入有效运动时间；最大值86400秒。</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label><input type="checkbox" data-task="${task.id}" data-param="randomPauseEnabled" data-type="boolean" ${taskExec.randomPauseEnabled === true ? 'checked' : ''}> 动作途中随机冻结引导圆</label>
+                            <span class="param-hint">只在扩张和收缩过程中随机暂停引导动画，保持阶段不变，不影响设备采集；两只手看到同一个目标圆。每次进入扩张或收缩都会重抽冻结间隔，不跨阶段或Trial累计。</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label>每次冻结时长（最短）</label>
+                            <input type="number" data-task="${task.id}" data-param="pauseDurationMin" value="${taskExec.pauseDurationMin !== undefined ? taskExec.pauseDurationMin : 0.3}" min="0.01" max="86400" step="0.01"><span class="param-unit">秒</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label>每次冻结时长（最长）</label>
+                            <input type="number" data-task="${task.id}" data-param="pauseDurationMax" value="${taskExec.pauseDurationMax !== undefined ? taskExec.pauseDurationMax : 1.2}" min="0.01" max="86400" step="0.01"><span class="param-unit">秒</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label>两次冻结间隔（最短有效运动时间）</label>
+                            <input type="number" data-task="${task.id}" data-param="pauseIntervalMin" value="${taskExec.pauseIntervalMin !== undefined ? taskExec.pauseIntervalMin : 1}" min="0.1" max="86400" step="0.1"><span class="param-unit">秒</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
+                            <label>两次冻结间隔（最长有效运动时间）</label>
+                            <input type="number" data-task="${task.id}" data-param="pauseIntervalMax" value="${taskExec.pauseIntervalMax !== undefined ? taskExec.pauseIntervalMax : 3}" min="0.1" max="86400" step="0.1"><span class="param-unit">秒</span>
+                        </div>
+                        <div class="config-section-divider">
+                            <span class="divider-title">原速度序列（随机变速关闭时使用）</span>
+                        </div>
+                        <div class="config-param-item config-random-guide-param">
                             <label>速度等级（倍率）</label>
                             <input type="text" data-task="${task.id}" data-param="speedLevels" data-type="array"
                                    value="${(taskExec.speedLevels || [0.5, 1.0, 1.5, 2.0]).join(', ')}"
@@ -1948,7 +2045,9 @@
                     const dataType = e.target.dataset.type;  // 【新增】获取数据类型
 
                     let value;
-                    if (dataType === 'array') {
+                    if (dataType === 'boolean' || e.target.type === 'checkbox') {
+                        value = e.target.checked;
+                    } else if (dataType === 'array') {
                         // 【新增】处理数组类型输入（逗号分隔的数字）
                         const strValue = e.target.value.trim();
                         if (strValue === '') {
@@ -1967,7 +2066,67 @@
                         if (!this.currentTemplate.execution[taskId]) {
                             this.currentTemplate.execution[taskId] = {};
                         }
-                        this.currentTemplate.execution[taskId][param] = value;
+                        const taskConfig = this.currentTemplate.execution[taskId];
+                        const previousValue = taskConfig[param];
+                        if (dataType !== 'array' && dataType !== 'boolean' && e.target.type !== 'checkbox') {
+                            const isNewRandomField = ['randomSpeedMin', 'randomSpeedMax', 'speedChangeIntervalMin', 'speedChangeIntervalMax', 'pauseDurationMin', 'pauseDurationMax', 'pauseIntervalMin', 'pauseIntervalMax'].includes(param);
+                            const isTrialsCount = param === 'trialsPerStage' && (taskId === 'continual_gesture_1' || taskId === 'continual_gesture_2');
+                            const minimum = param === 'speedChangeIntervalMin' || param === 'speedChangeIntervalMax' || param === 'pauseIntervalMin' || param === 'pauseIntervalMax' ? 0.1 : 0.01;
+                            const isSpeedField = param === 'randomSpeedMin' || param === 'randomSpeedMax';
+                            const maximum = isSpeedField ? 100 : 86400;
+                            const millisecondsAreSafe = isSpeedField || (Number.isFinite(value * 1000) && value * 1000 <= Number.MAX_SAFE_INTEGER);
+                            const randomFieldDefaults = DEFAULT_TEMPLATE.execution[taskId] || {};
+                            const isValidRandomField = (field, candidate) => {
+                                if (typeof candidate !== 'number' || !Number.isFinite(candidate)) return false;
+                                const lower = field === 'speedChangeIntervalMin' || field === 'speedChangeIntervalMax' || field === 'pauseIntervalMin' || field === 'pauseIntervalMax' ? 0.1 : 0.01;
+                                const upper = field === 'randomSpeedMin' || field === 'randomSpeedMax' ? 100 : 86400;
+                                return candidate >= lower && candidate <= upper && Number.isFinite(candidate * 1000);
+                            };
+                            const effectiveCurrentValue = isNewRandomField
+                                ? (isValidRandomField(param, previousValue) ? previousValue : randomFieldDefaults[param])
+                                : previousValue;
+                            if (isNewRandomField) taskConfig[param] = effectiveCurrentValue;
+                            if ((isNewRandomField && (!Number.isFinite(value) || value < minimum || value > maximum || !millisecondsAreSafe)) ||
+                                (isTrialsCount && (!Number.isInteger(value) || value < 1 || value > 1000))) {
+                                e.target.value = isNewRandomField ? effectiveCurrentValue : (previousValue !== undefined ? previousValue : (isTrialsCount ? 5 : minimum));
+                                this.showToast(isTrialsCount ? '动作次数必须是1到1000之间的整数' : (isSpeedField ? `速度倍率必须在${minimum}到${maximum}之间` : `时间必须在${minimum}到${maximum}秒之间，且毫秒换算不能溢出`), 'warning');
+                                return;
+                            }
+
+                            const rangePairs = {
+                                randomSpeedMin: 'randomSpeedMax', randomSpeedMax: 'randomSpeedMin',
+                                speedChangeIntervalMin: 'speedChangeIntervalMax', speedChangeIntervalMax: 'speedChangeIntervalMin',
+                                pauseDurationMin: 'pauseDurationMax', pauseDurationMax: 'pauseDurationMin',
+                                pauseIntervalMin: 'pauseIntervalMax', pauseIntervalMax: 'pauseIntervalMin'
+                            };
+                            const pairedParam = rangePairs[param];
+                            if (pairedParam) {
+                                let pairedValue = taskConfig[pairedParam];
+                                if (!isValidRandomField(pairedParam, pairedValue)) {
+                                    pairedValue = randomFieldDefaults[pairedParam];
+                                    taskConfig[pairedParam] = pairedValue;
+                                }
+                                const isMin = param.endsWith('Min');
+                                if ((isMin && value > pairedValue) || (!isMin && value < pairedValue)) {
+                                    taskConfig[param] = pairedValue;
+                                    taskConfig[pairedParam] = value;
+                                    const pairedInput = container.querySelector(`input[data-task="${taskId}"][data-param="${pairedParam}"]`);
+                                    if (pairedInput) pairedInput.value = value;
+                                    e.target.value = pairedValue;
+                                    this.showToast('范围上下限已交换，保持最小值不大于最大值', 'warning');
+                                } else {
+                                    taskConfig[param] = value;
+                                }
+                            } else if (!Number.isFinite(value)) {
+                                e.target.value = previousValue !== undefined ? previousValue : '';
+                                this.showToast('请输入有效数字', 'warning');
+                                return;
+                            } else {
+                                taskConfig[param] = value;
+                            }
+                        } else {
+                            taskConfig[param] = value;
+                        }
                         this.isDirty = true;
 
                         // 更新时间估算
@@ -1996,6 +2155,7 @@
 
             let html = '<div class="estimation-grid">';
             let maxStageTime = 0; // 记录最长的单个Stage时间
+            let hasRandomizedContinuousTask = false;
 
             enabledTasks.forEach(task => {
                 const taskExec = exec[task.id] || {};
@@ -2023,6 +2183,7 @@
                         </div>
                     `;
                 } else if (task.id === 'continual_gesture_1' || task.id === 'continual_gesture_2') {
+                    hasRandomizedContinuousTask = hasRandomizedContinuousTask || taskExec.randomSpeedEnabled === true || taskExec.randomPauseEnabled === true;
                     const trialsPerStage = taskExec.trialsPerStage || 5;
                     const preparationTime = taskExec.preparationTime || 3.0;
                     const expandDuration = taskExec.expandDuration || 3.0;
@@ -2039,6 +2200,7 @@
                         <div class="estimation-detail">
                             <span>动作数量: ${trialsPerStage}次</span>
                             <span>单次动作: ${formatTime(singleTrialTime)}</span>
+                            ${(taskExec.randomSpeedEnabled === true || taskExec.randomPauseEnabled === true) ? '<span>随机动作时长仅作估算；Stage超时可能提前终止</span>' : ''}
                         </div>
                     `;
                 } else if (task.id === 'continual_gesture_3') {
@@ -2069,7 +2231,7 @@
                     <div class="estimation-item estimation-task">
                         <div class="estimation-task-header">
                             <span class="estimation-label">${task.name}</span>
-                            <span class="estimation-value estimation-stage-time">${formatTime(singleStageTime)}</span>
+                            <span class="estimation-value estimation-stage-time">${(task.id === 'continual_gesture_1' || task.id === 'continual_gesture_2') && (taskExec.randomSpeedEnabled === true || taskExec.randomPauseEnabled === true) ? `估算约 ${formatTime(singleStageTime)}` : formatTime(singleStageTime)}</span>
                         </div>
                         ${taskDetails}
                     </div>
@@ -2081,7 +2243,7 @@
                 html += `
                     <div class="estimation-item estimation-summary">
                         <span class="estimation-label">单个Stage总耗时（所有任务）</span>
-                        <span class="estimation-value estimation-stage-time">${formatTime(maxStageTime * enabledTasks.length)}</span>
+                        <span class="estimation-value estimation-stage-time">${hasRandomizedContinuousTask ? `估算约 ${formatTime(maxStageTime * enabledTasks.length)}` : formatTime(maxStageTime * enabledTasks.length)}</span>
                     </div>
                 `;
             }

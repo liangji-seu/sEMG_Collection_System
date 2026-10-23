@@ -115,7 +115,7 @@
         /**
          * 从配置加载
          */
-        loadConfig() {
+        loadConfig(executionParams) {
             console.log('[ContinualGesture2Animation] loadConfig() 开始');
             
             let templateConfig = null;
@@ -149,10 +149,17 @@
                 }
             }
             
+            // 使用本次采集的快照，避免速度参数与后台模板混用。
+            if (executionParams) templateConfig = { ...executionParams };
+            this.guideMotionParams = templateConfig || {};
+            this.baseExpandDuration = 3000;
+            this.baseContractDuration = 3000;
+            this.holdDuration = 1000;
+            this.restBetweenTrials = 1;
             if (templateConfig) {
                 this.maxTrials = templateConfig.trialsPerStage || 5;
                 this.stageTimeout = (templateConfig.stageTimeout || 120) * 1000;
-                this.restBetweenTrials = templateConfig.restBetweenTrials || 1;  // 【新增】试次间隔休息时间
+                this.restBetweenTrials = templateConfig.restBetweenTrials ?? 1;
                 this.preparationTime = (templateConfig.preparationTime || 3) * 1000;
 
                 // 同心圆动画特有配置 - 【修改】保存基准时长
@@ -193,8 +200,8 @@
             } else {
                 console.log('[ContinualGesture2Animation] 未找到配置，使用默认值');
                 // 设置默认的基准值
-                this.baseExpandDuration = this.expandDuration;
-                this.baseContractDuration = this.contractDuration;
+                this.expandDuration = this.baseExpandDuration;
+                this.contractDuration = this.baseContractDuration;
                 this.speedLevels = [0.5, 1.0, 1.5, 2.0];
                 this.trialSpeedSequence = [];
             }
@@ -294,6 +301,7 @@
          * 重置状态
          */
         reset() {
+            this.stop();
             console.log('[ContinualGesture2Animation] 重置状态');
             this.trial = 0;
             this.guideRadius = 0;
@@ -330,40 +338,8 @@
                 }
             }
             
-            // 先加载配置
-            this.loadConfig();
-            
-            // 如果传入了executionParams，使用它来覆盖配置
-            if (executionParams) {
-                console.log('[ContinualGesture2Animation] 使用传入的executionParams:', executionParams);
-                if (executionParams.trialsPerStage !== undefined) {
-                    this.maxTrials = executionParams.trialsPerStage;
-                }
-                if (executionParams.stageTimeout !== undefined) {
-                    this.stageTimeout = executionParams.stageTimeout * 1000;
-                }
-                if (executionParams.restBetweenTrials !== undefined) {
-                    this.restBetweenTrials = executionParams.restBetweenTrials;  // 【新增】
-                }
-                if (executionParams.preparationTime !== undefined) {
-                    this.preparationTime = executionParams.preparationTime * 1000;
-                }
-                if (executionParams.expandDuration !== undefined) {
-                    this.expandDuration = executionParams.expandDuration * 1000;
-                }
-                if (executionParams.holdDuration !== undefined) {
-                    this.holdDuration = executionParams.holdDuration * 1000;
-                }
-                if (executionParams.contractDuration !== undefined) {
-                    this.contractDuration = executionParams.contractDuration * 1000;
-                }
-                if (executionParams.guideBandWidth !== undefined) {
-                    this.guideBandWidth = executionParams.guideBandWidth;
-                }
-                if (executionParams.maxRadius !== undefined) {
-                    this.maxRadius = executionParams.maxRadius;
-                }
-            }
+            // 本次采集快照覆盖模板，所有参数使用同一来源。
+            this.loadConfig(executionParams);
 
             console.log('[ContinualGesture2Animation] ★★★ 最终参数 ★★★');
             console.log('[ContinualGesture2Animation] maxTrials:', this.maxTrials);
@@ -377,6 +353,10 @@
             
             // 重置状态
             this.reset();
+            this._motionWallOffset = Date.now() / 1000 - performance.now() / 1000;
+            this._guideMotion = new window.ContinuousGuideMotion(this.guideMotionParams, {
+                onEvent: event => this.recordGuideMotionEvent(event)
+            });
             this.isRunning = true;
             this.startTime = Date.now();
             this.remainingTime = this.stageTimeout;
@@ -392,7 +372,8 @@
 
             // 【修复】延迟开始第一个Trial，等待H5文件打开
             // stage_start 命令是异步的，需要等文件创建完成
-            setTimeout(() => {
+            this._trialTimer = setTimeout(() => {
+                this._trialTimer = null;
                 if (this.isRunning) {
                     this.startTrial();
                 }
@@ -412,6 +393,7 @@
          * 开始一个新的Trial（采集周期）
          */
         startTrial() {
+            if (!this.isRunning) return;
             console.log(`[ContinualGesture2Animation] 开始Trial ${this.trial + 1}/${this.maxTrials}`);
 
             // 【新增】根据速度序列计算当前Trial的实际时间参数
@@ -428,8 +410,7 @@
                 });
             }
 
-            this.phase = 'expand';
-            this.phaseStartTime = performance.now();
+            this.beginGuidePhase('expand');
             this.guideRadius = 0;
             this.trackingData_L = [];
             this.trackingData_R = [];
@@ -455,6 +436,7 @@
                 }
             }
 
+            if (!Number.isFinite(multiplier) || multiplier <= 0) multiplier = 1;
             this.currentSpeedMultiplier = multiplier;
 
             // 应用倍率：倍率越大，时间越短（速度越快）
@@ -472,38 +454,53 @@
          */
         updateGuideRadius() {
             const now = performance.now();
-            const elapsed = now - this.phaseStartTime;
-            
-            switch (this.phase) {
-                case 'expand':
-                    const expandProgress = Math.min(1, elapsed / this.expandDuration);
-                    this.guideRadius = this.maxRadius * this.easeInOutSine(expandProgress);
-                    
-                    if (elapsed >= this.expandDuration) {
+            if (this.phase === 'expand' || this.phase === 'contract') {
+                const state = this._guideMotion.advance(now);
+                this._guidePaused = state.paused;
+                this.currentSpeedMultiplier = state.speedMultiplier;
+                const progress = this.easeInOutSine(state.progress);
+                this.guideRadius = this.maxRadius * (this.phase === 'expand' ? progress : 1 - progress);
+                if (state.complete) {
+                    this._guidePaused = false;
+                    if (this.phase === 'expand') {
                         this.phase = 'hold';
                         this.phaseStartTime = now;
                         this.guideRadius = this.maxRadius;
-                    }
-                    break;
-                    
-                case 'hold':
-                    this.guideRadius = this.maxRadius;
-                    
-                    if (elapsed >= this.holdDuration) {
-                        this.phase = 'contract';
-                        this.phaseStartTime = now;
-                    }
-                    break;
-                    
-                case 'contract':
-                    const contractProgress = Math.min(1, elapsed / this.contractDuration);
-                    this.guideRadius = this.maxRadius * (1 - this.easeInOutSine(contractProgress));
-                    
-                    if (elapsed >= this.contractDuration) {
+                    } else {
+                        this.guideRadius = 0;
                         this.completeTrial();
                     }
-                    break;
+                }
+            } else if (this.phase === 'hold') {
+                this.guideRadius = this.maxRadius;
+                if (now - this.phaseStartTime >= this.holdDuration) {
+                    this.beginGuidePhase('contract');
+                }
             }
+        }
+
+        beginGuidePhase(phase) {
+            this.phase = phase;
+            this.phaseStartTime = performance.now();
+            this._guidePaused = false;
+            const duration = phase === 'expand' ? this.baseExpandDuration : this.baseContractDuration;
+            this._guideMotion.beginPhase(duration, this.phaseStartTime, this.currentSpeedMultiplier || 1);
+        }
+
+        recordGuideMotionEvent(event) {
+            const params = this.guideMotionParams;
+            if (params.randomSpeedEnabled !== true && params.randomPauseEnabled !== true) return;
+            // 沿用 prompts/names 与 prompts/times，不改变原 start/end 标签。
+            const details = {
+                type: event.type, trial: this.trial + 1, phase: this.phase,
+                speedMultiplier: event.speedMultiplier
+            };
+            if (event.durationMs !== undefined) details.durationMs = event.durationMs;
+            window.collectionController?.sendToRealtimeEngine('prompt', {
+                name: 'guide_motion:' + JSON.stringify(details),
+                stageName: this.currentStage?.name || 'unknown',
+                timestamp: this._motionWallOffset + event.timeMs / 1000
+            });
         }
 
         /**
@@ -563,10 +560,11 @@
             } else {
                 // 【修改】使用配置的试次间隔休息时间
                 this.phase = 'rest';
-                const restTime = (this.restBetweenTrials || 1) * 1000;  // 默认1秒
+                const restTime = (this.restBetweenTrials ?? 1) * 1000;  // 默认1秒
                 console.log(`[ContinualGesture2Animation] 休息 ${restTime/1000} 秒后开始下一个Trial`);
 
-                setTimeout(() => {
+                this._trialTimer = setTimeout(() => {
+                    this._trialTimer = null;
                     if (this.isRunning) {
                         this.startTrial();
                     }
@@ -655,6 +653,7 @@
 
             this.remainingTime = Math.max(0, this.stageTimeout - (Date.now() - this.startTime));
             this.updateGuideRadius();
+            if (!this.isRunning) return;
 
             // 从输入接口更新用户控制的半径（双手）
             if (this.inputInterface) {
@@ -732,7 +731,7 @@
             };
             ctx.fillStyle = this.config.colors.text;
             ctx.font = '600 16px ui-sans-serif, system-ui';
-            ctx.fillText(phaseText[this.phase] || '', 20, 72);
+            ctx.fillText(this._guidePaused ? '引导停顿中，请保持当前位置' : (phaseText[this.phase] || ''), 20, 72);
             
             const seconds = Math.ceil(this.remainingTime / 1000);
             const timeColor = seconds <= 10 ? this.config.colors.warning : this.config.colors.muted;
@@ -987,6 +986,13 @@
         stop() {
             console.log('[ContinualGesture2Animation] 停止动画');
             this.isRunning = false;
+            this._guideMotion?.stop();
+            this._guideMotion = null;
+            this._guidePaused = false;
+            if (this._trialTimer != null) {
+                clearTimeout(this._trialTimer);
+                this._trialTimer = null;
+            }
             
             if (this.animationId) {
                 cancelAnimationFrame(this.animationId);

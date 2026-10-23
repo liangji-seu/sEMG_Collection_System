@@ -41,6 +41,21 @@ function loadEngineWithoutNativeSockets() {
 
 const engine = loadEngineWithoutNativeSockets();
 
+test('random guide markers retain their payload and occurrence time through the storage path', async () => {
+    const e = loadEngineWithoutNativeSockets();
+    e.isCollecting = true;
+    e.stageFileOpen = true;
+    e.storageFileToken = 'random-guide-stage';
+    let stored;
+    e.saveDataToStorage = async data => { stored = data; };
+    const name = 'guide_motion:' + JSON.stringify({ type: 'pause_start', trial: 2,
+        phase: 'contract', speedMultiplier: 1.25, durationMs: 750 });
+    await e.onPrompt(name, 'continuous-stage', 1700000000.125);
+    assert.equal(stored.prompt_name, name);
+    assert.equal(stored.prompt_time, 1700000000.125);
+    assert.equal(stored.prompt_stage, 'continuous-stage');
+});
+
 test('REP fallback shares PUSH ordering, file identity and the close barrier', async () => {
     const e = loadEngineWithoutNativeSockets();
     e.streamMode = 'collection'; e.stageFileOpen = true;
