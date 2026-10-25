@@ -3093,38 +3093,11 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
             if (stop) {
                 stop.disabled = state === 'stopping';
                 stop.textContent = state === 'save_failed' ? '重试保存' : '停止';
-                let recover = document.getElementById('finalizeIncompleteBtn');
-                if (!recover && stop.parentNode) {
-                    recover = document.createElement('button');
-                    recover.id = 'finalizeIncompleteBtn';
-                    recover.className = stop.className;
-                    recover.textContent = '保留为不完整采集并结束';
-                    recover.addEventListener('click', () => this.finalizeIncomplete());
-                    stop.parentNode.appendChild(recover);
-                }
-                if (recover) recover.hidden = state !== 'save_failed';
             }
             if (state === 'stopping') this.updateStatus('正在保存，请等待');
             if (state === 'save_failed') {
                 this.updateStatus('保存失败，可重试');
                 this.showToast(error || '保存未完成', 'error');
-            }
-        }
-
-        async finalizeIncomplete() {
-            if (this._saveState !== 'save_failed') return;
-            this._setSaveState('stopping');
-            try {
-                await this.sendToRealtimeEngineAndWait('finalize_incomplete', { reason: '操作员选择保留为不完整采集' });
-                this._isRunning = false;
-                this._retrySave = null;
-                this._setSaveState('idle');
-                this.cancelAllSessionsMode();
-                this.updateControlButtons(false);
-                this.updateStatus('已保留不完整采集');
-                if (window.BleControl?.isConnected) await window.BleControl.stopCollectionStream();
-            } catch (error) {
-                this._setSaveState('save_failed', error.message);
             }
         }
 

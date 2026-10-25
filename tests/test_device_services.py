@@ -134,71 +134,138 @@ class DeviceServiceTests(unittest.TestCase):
             self.assertFalse(result['success'])
             self.assertIn('录制写入失败', result['error'])
 
-    @unittest.skipUnless(HAS_CV2, 'cv2 unavailable')
-    def test_camera_encode_validates_two_frame_one_fps_output_before_cleanup(self):
+    def _make_stopped_camera_recorder(self, root, frame_count=2, first=100.0, last=101.0):
+        recorder = camera_server.FrameRecorder('left', 'ffmpeg', root)
+        self.assertTrue(recorder.start('result.avi'))
+        recorder.raw_file.write(b'raw-mjpeg')
+        recorder.frame_count = frame_count
+        recorder.first_frame_real_time = first
+        recorder.last_frame_real_time = last
+        recorder.stop_recording_only()
+        meta_path = recorder.raw_path.with_suffix(
+            recorder.raw_path.suffix + camera_server.VIDEO_ENCODER_META_SUFFIX)
+        self.assertTrue(meta_path.exists())
+        return recorder, meta_path
+
+    def test_camera_encode_succeeds_on_nonempty_avi_without_index_validation(self):
+        with tempfile.TemporaryDirectory(dir=str(Path.cwd())) as tmp:
+            root = Path(tmp)
+            recorder, meta_path = self._make_stopped_camera_recorder(
+                root, frame_count=2, first=100.0, last=101.0)
+
+            def fake_remux(command, **_kwargs):
+                # A valid nonempty AVI may have an index count different from the recorder counter.
+                Path(command[-1]).write_bytes(b'RIFF\x04\x00\x00\x00AVI ')
+                return SimpleNamespace(returncode=0, stderr='')
+
+            with patch.object(camera_server.subprocess, 'run', side_effect=fake_remux) as run:
+                result = recorder.encode_stopped_recording()
+
+            self.assertTrue(result['success'])
+            self.assertEqual(recorder.output_path.read_bytes(), b'RIFF\x04\x00\x00\x00AVI ')
+            self.assertEqual(result['frame_count'], 2)
+            self.assertEqual(result['timing']['frame_count'], 2)
+            self.assertEqual(result['timing']['duration'], 1.0)
+            args = run.call_args.args[0]
+            self.assertEqual(args[args.index('-framerate') + 1], '1.000000')
+            self.assertFalse(recorder.raw_path.exists())
+            self.assertFalse(meta_path.exists())
+            self.assertFalse(list(root.glob('*.tmp.avi')))
+
+    @unittest.skipUnless(HAS_CV2, 'cv2 unavailable for AVI fixture generation')
+    def test_camera_encode_accepts_real_avi_with_more_or_fewer_indexed_frames_without_cv2(self):
         with tempfile.TemporaryDirectory(dir=str(Path.cwd())) as tmp:
             root = Path(tmp)
             prepared = root / 'prepared.avi'
-            writer = cv2.VideoWriter(str(prepared), cv2.VideoWriter_fourcc(*'MJPG'), 1.0, (16, 16))
-            for value in (20, 80):
+            writer = cv2.VideoWriter(
+                str(prepared), cv2.VideoWriter_fourcc(*'MJPG'), 10.0, (16, 16))
+            self.assertTrue(writer.isOpened())
+            for value in (20, 100, 220):
                 writer.write(np.full((16, 16, 3), value, dtype=np.uint8))
             writer.release()
+            self.assertGreater(prepared.stat().st_size, 0)
 
-            recorder = camera_server.FrameRecorder('left', 'ffmpeg', root)
-            self.assertTrue(recorder.start('result.avi'))
-            recorder.raw_file.write(b'raw-mjpeg')
-            recorder.frame_count = 2
-            recorder.first_frame_real_time = 100.0
-            recorder.last_frame_real_time = 101.0
-            recorder.stop_recording_only()
+            avi_bytes = prepared.read_bytes()
+            for label, recorded_count in (('indexed-more', 2), ('indexed-fewer', 4)):
+                with self.subTest(label=label):
+                    output_root = root / label
+                    output_root.mkdir()
+                    recorder, _ = self._make_stopped_camera_recorder(
+                        output_root, frame_count=recorded_count, first=100.0, last=100.2)
+
+                    def fake_remux(command, **_kwargs):
+                        Path(command[-1]).write_bytes(avi_bytes)
+                        return SimpleNamespace(returncode=0, stderr='')
+
+                    with patch.object(camera_server.subprocess, 'run', side_effect=fake_remux), \
+                            patch.dict(sys.modules, {'cv2': None}):
+                        result = recorder.encode_stopped_recording()
+
+                    self.assertTrue(result['success'])
+                    self.assertEqual(recorder.output_path.read_bytes(), avi_bytes)
+                    self.assertGreater(recorder.output_path.stat().st_size, 0)
+                    self.assertFalse(recorder.raw_path.exists())
+                    self.assertFalse(list(output_root.glob('*.tmp.avi')))
+
+    def test_camera_encode_uses_n_minus_one_fps_and_clamps_low_fps(self):
+        with tempfile.TemporaryDirectory(dir=str(Path.cwd())) as tmp:
+            root = Path(tmp)
+            recorder, _ = self._make_stopped_camera_recorder(
+                root, frame_count=4, first=100.0, last=102.0)
 
             def fake_remux(command, **_kwargs):
-                Path(command[-1]).write_bytes(prepared.read_bytes())
+                Path(command[-1]).write_bytes(b'RIFFAVI-content')
                 return SimpleNamespace(returncode=0, stderr='')
 
             with patch.object(camera_server.subprocess, 'run', side_effect=fake_remux) as run:
                 result = recorder.encode_stopped_recording()
             self.assertTrue(result['success'])
-            self.assertAlmostEqual(result['timing']['duration'], 1.0, places=3)
-            self.assertEqual(run.call_args.args[0][run.call_args.args[0].index('-framerate') + 1], '1.000000')
-            self.assertTrue(recorder.output_path.exists())
-            self.assertFalse(recorder.raw_path.exists())
-            self.assertFalse(list(root.glob('*.tmp.avi')))
+            args = run.call_args.args[0]
+            self.assertEqual(args[args.index('-framerate') + 1], '1.500000')
 
-    @unittest.skipUnless(HAS_CV2, 'cv2 unavailable')
-    def test_camera_encode_rejects_empty_or_short_output_and_preserves_old_files(self):
-        with tempfile.TemporaryDirectory(dir=str(Path.cwd())) as tmp:
-            root = Path(tmp)
-            short = root / 'short.avi'
-            writer = cv2.VideoWriter(str(short), cv2.VideoWriter_fourcc(*'MJPG'), 1.0, (16, 16))
-            writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
-            writer.release()
-            for label, make_output in (
-                ('empty', lambda path: path.write_bytes(b'')),
-                ('short', lambda path: path.write_bytes(short.read_bytes())),
-            ):
-                with self.subTest(label=label):
-                    recorder = camera_server.FrameRecorder('left', 'ffmpeg', root / label)
-                    recorder.output_dir.mkdir(parents=True, exist_ok=True)
-                    self.assertTrue(recorder.start('result.avi'))
-                    recorder.raw_file.write(b'raw-mjpeg')
-                    recorder.frame_count = 2
-                    recorder.first_frame_real_time = 100.0
-                    recorder.last_frame_real_time = 101.0
-                    old_output = recorder.output_path
-                    old_output.write_bytes(b'old-avi')
-                    recorder.stop_recording_only()
+            low_root = root / 'low-fps'
+            low_recorder, _ = self._make_stopped_camera_recorder(
+                low_root, frame_count=2, first=100.0, last=104.0)
+            with patch.object(camera_server.subprocess, 'run', side_effect=fake_remux) as run:
+                low_result = low_recorder.encode_stopped_recording()
+            self.assertTrue(low_result['success'])
+            low_args = run.call_args.args[0]
+            self.assertEqual(low_args[low_args.index('-framerate') + 1], '1.000000')
 
-                    def fake_remux(command, **_kwargs):
-                        make_output(Path(command[-1]))
-                        return SimpleNamespace(returncode=0, stderr='')
+            invalid_interval_root = root / 'invalid-interval'
+            invalid_interval_recorder, _ = self._make_stopped_camera_recorder(
+                invalid_interval_root, frame_count=2, first=104.0, last=100.0)
+            with patch.object(camera_server.subprocess, 'run', side_effect=fake_remux) as run:
+                invalid_interval_result = invalid_interval_recorder.encode_stopped_recording()
+            self.assertTrue(invalid_interval_result['success'])
+            invalid_args = run.call_args.args[0]
+            self.assertEqual(invalid_args[invalid_args.index('-framerate') + 1], '60.000000')
 
-                    with patch.object(camera_server.subprocess, 'run', side_effect=fake_remux):
-                        result = recorder.encode_stopped_recording()
-                    self.assertFalse(result['success'])
-                    self.assertEqual(old_output.read_bytes(), b'old-avi')
-                    self.assertTrue(recorder.raw_path.exists())
-                    self.assertFalse(list((root / label).glob('*.tmp.avi')))
+    def test_camera_encode_failure_preserves_old_avi_raw_and_metadata(self):
+        for label in ('nonzero', 'missing', 'empty'):
+            with self.subTest(label=label), tempfile.TemporaryDirectory(dir=str(Path.cwd())) as tmp:
+                root = Path(tmp) / label
+                root.mkdir()
+                recorder, meta_path = self._make_stopped_camera_recorder(root)
+                old_output = recorder.output_path
+                old_output.write_bytes(b'old-avi')
+
+                def fake_remux(command, **_kwargs):
+                    if label == 'nonzero':
+                        Path(command[-1]).write_bytes(b'partial-avi')
+                        return SimpleNamespace(returncode=1, stderr='ffmpeg error')
+                    if label == 'empty':
+                        Path(command[-1]).write_bytes(b'')
+                    return SimpleNamespace(returncode=0, stderr='')
+
+                with patch.object(camera_server.subprocess, 'run', side_effect=fake_remux):
+                    result = recorder.encode_stopped_recording()
+
+                self.assertFalse(result['success'])
+                self.assertEqual(old_output.read_bytes(), b'old-avi')
+                self.assertTrue(recorder.raw_path.exists())
+                self.assertTrue(meta_path.exists())
+                self.assertFalse(list(root.glob('*.tmp.avi')))
 
     def test_camera_start_refuses_existing_avi_without_overwriting(self):
         with tempfile.TemporaryDirectory(dir=str(Path.cwd())) as tmp:

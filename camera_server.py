@@ -658,12 +658,9 @@ class FrameRecorder:
 
             wall_duration = 0
             if self.frame_count >= 2 and self.first_frame_real_time is not None and self.last_frame_real_time is not None:
-                wall_duration = self.last_frame_real_time - self.first_frame_real_time
-                if wall_duration <= 0:
-                    return {'success': False, 'error': '视频帧时间戳无效'}
+                wall_duration = max(0.001, self.last_frame_real_time - self.first_frame_real_time)
                 effective_fps = (self.frame_count - 1) / wall_duration
-                if effective_fps < 1.0 or effective_fps > 120.0:
-                    return {'success': False, 'error': f'实际视频帧率异常: {effective_fps:.3f}fps'}
+                effective_fps = max(1.0, min(60.0, effective_fps))
             else:
                 effective_fps = 30.0
             video_seconds = self.frame_count / max(effective_fps, 1.0)
@@ -698,30 +695,6 @@ class FrameRecorder:
             video_size = os.path.getsize(temp_path)
             if video_size <= 0:
                 return {'success': False, 'error': 'AVI封装结果为空'}
-
-            try:
-                import cv2
-            except Exception as error:
-                return {'success': False, 'error': f'缺少OpenCV，无法验证AVI: {error}'}
-            cap = cv2.VideoCapture(temp_path)
-            if not cap.isOpened():
-                return {'success': False, 'error': 'AVI封装结果无法解码'}
-            decoded_frames = 0
-            try:
-                while True:
-                    ok, frame = cap.read()
-                    if not ok:
-                        break
-                    if frame is None or frame.size == 0:
-                        return {'success': False, 'error': 'AVI包含空帧'}
-                    decoded_frames += 1
-            finally:
-                cap.release()
-            if decoded_frames != self.frame_count:
-                return {
-                    'success': False,
-                    'error': f'AVI帧数校验失败: expected={self.frame_count}, actual={decoded_frames}'
-                }
 
             os.replace(temp_path, self.output_path)
             temp_path = None

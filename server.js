@@ -26,6 +26,8 @@ const PORT = process.env.PORT || 3000;
 let httpServer = null;
 let isShuttingDown = false;
 let shutdownPromise = null;
+let forceCleanupPromise = null;
+let shutdownStepPromises = new Map();
 
 // 引入设备协同模块
 const deviceSync = require('./deviceSync');
@@ -387,29 +389,133 @@ function shutdownServices(signal = 'manual') {
     if (shutdownPromise) return shutdownPromise;
     isShuttingDown = true;
     shutdownPromise = (async () => {
-      console.log(`\n收到 ${signal}，正在关闭服务器...`);
-      try {
-        await realtimeEngine.stop();
-        await deviceSync.close();
-        await dataStorage.close();
-        await stopCameraServer();  // 【新增】停止 camera_server
+        console.log(`\n收到 ${signal}，正在关闭服务器...`);
+        const errors = [];
+        const attempt = async (name, cleanup) => {
+            let pending = shutdownStepPromises.get(name);
+            if (!pending) {
+                pending = Promise.resolve().then(cleanup);
+                shutdownStepPromises.set(name, pending);
+            }
+            try { await pending; }
+            catch (error) { errors.push(new Error(`${name}: ${error.message || error}`)); }
+        };
 
-        if (httpServer) {
-            await new Promise(resolve => httpServer.close(resolve));
-            httpServer = null;
+        await attempt('realtimeEngine', () => realtimeEngine.stop());
+        await attempt('deviceSync', () => closeDeviceSyncServices());
+        // Keep camera available until its recording finalization has completed.
+        await attempt('cameraServer', () => closeCameraService());
+        await attempt('dataStorage', () => closeStorageService());
+        await attempt('httpServer', () => closeHttpServer());
+        await attempt('logger', () => logger?.close());
+
+        if (errors.length) {
+            const error = new Error(`服务关闭完成，但有 ${errors.length} 项清理失败: ${errors.map(item => item.message).join('; ')}`);
+            error.causes = errors;
+            throw error;
         }
-
         console.log('服务器关闭完成');
-        if (logger) await logger.close();
-      } catch (error) {
-        console.error('关闭过程中发生错误，服务保持运行以便恢复:', error);
-        throw error;
-      }
-    })().finally(() => {
-      isShuttingDown = false;
-      shutdownPromise = null;
-    });
+    })().finally(() => { isShuttingDown = false; });
     return shutdownPromise;
+}
+
+function closeHttpServer() {
+    const server = httpServer;
+    if (!server) return Promise.resolve();
+    httpServer = null;
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            try { server.closeAllConnections?.(); } catch (_) {}
+            resolve();
+        }, 3000);
+        try {
+            server.close(error => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (error && error.code !== 'ERR_SERVER_NOT_RUNNING') reject(error);
+                else resolve();
+            });
+        } catch (error) {
+            clearTimeout(timer);
+            settled = true;
+            if (error.code === 'ERR_SERVER_NOT_RUNNING') resolve(); else reject(error);
+        }
+    });
+}
+
+// Used only after Electron's outer shutdown budget expires. It skips engine
+// finalization and stops only services/processes owned by this application.
+function forceCleanupOwnedResources() {
+    if (forceCleanupPromise) return forceCleanupPromise;
+    forceCleanupPromise = (async () => {
+        const errors = [];
+        const ownedProcesses = [
+            ['mocap_server', deviceSync.mocapProcess],
+            ['ble_server', deviceSync.pythonProcess],
+            ['camera_server', cameraServerProcess],
+            ['storage_server', dataStorage.pythonProcess]
+        ];
+        for (const [name, service] of ownedProcesses) {
+            if (!service?.child) continue;
+            try {
+                await service.stop({ timeoutMs: 5000 });
+                if (name === 'camera_server' && cameraServerProcess === service) cameraServerProcess = null;
+                if (name === 'ble_server' && deviceSync.pythonProcess === service) deviceSync.pythonProcess = null;
+                if (name === 'mocap_server' && deviceSync.mocapProcess === service) deviceSync.mocapProcess = null;
+                if (name === 'storage_server' && dataStorage.pythonProcess === service) dataStorage.pythonProcess = null;
+            } catch (error) { errors.push(new Error(`${name}: ${error.message || error}`)); }
+        };
+        try { await closeHttpServer(); }
+        catch (error) { errors.push(new Error(`httpServer: ${error.message || error}`)); }
+        try { await logger?.close(); }
+        catch (error) { errors.push(new Error(`logger: ${error.message || error}`)); }
+        if (errors.length) {
+            const error = new Error(`强制释放自有服务时有 ${errors.length} 项清理失败: ${errors.map(item => item.message).join('; ')}`);
+            error.causes = errors;
+            throw error;
+        }
+    })();
+    return forceCleanupPromise;
+}
+
+async function closeDeviceSyncServices() {
+    let firstError = null;
+    try { await deviceSync.close(); }
+    catch (error) { firstError = error; }
+    for (const service of [deviceSync.mocapProcess, deviceSync.pythonProcess]) {
+        if (!service?.child) continue;
+        try { await service.stop(); }
+        catch (error) { firstError = firstError || error; }
+    }
+    if (firstError) throw firstError;
+}
+
+async function closeCameraService() {
+    const service = cameraServerProcess;
+    let firstError = null;
+    try { await stopCameraServer(); }
+    catch (error) { firstError = error; }
+    if (service?.child) {
+        try { await service.stop({ timeoutMs: 30000 }); }
+        catch (error) { firstError = firstError || error; }
+    }
+    if (firstError) throw firstError;
+}
+
+async function closeStorageService() {
+    let firstError = null;
+    try { await dataStorage.close(); }
+    catch (error) { firstError = error; }
+    const service = dataStorage.pythonProcess;
+    if (service?.child) {
+        try { await service.stop(); }
+        catch (error) { firstError = firstError || error; }
+    }
+    if (firstError) throw firstError;
 }
 
 function setupGracefulShutdown() {
@@ -418,7 +524,8 @@ function setupGracefulShutdown() {
             await shutdownServices(signal);
             process.exit(0);
         } catch (error) {
-            console.error('[server.js] 关闭未完成，未强制退出进程');
+            console.error('[server.js] 服务已尝试清理，关闭时存在错误:', error.message || error);
+            process.exit(1);
         }
     };
 
@@ -473,6 +580,11 @@ async function stopCameraServer() {
 async function startServer() {
     if (httpServer) return httpServer;
     if (startPromise) return startPromise;
+    if (shutdownPromise && !isShuttingDown) {
+        shutdownPromise = null;
+        forceCleanupPromise = null;
+        shutdownStepPromises = new Map();
+    }
     startPromise = startServerInternal().finally(() => { startPromise = null; });
     return startPromise;
 }
@@ -543,6 +655,7 @@ module.exports = {
     app,
     startServer,
     shutdown: shutdownServices,
+    forceCleanupOwnedResources,
     listStorageFiles,
     getStorageFilesCached
 };

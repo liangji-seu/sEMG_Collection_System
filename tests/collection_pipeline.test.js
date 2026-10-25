@@ -25,7 +25,7 @@ function loadEngineWithoutNativeSockets() {
     const module = { exports: {} };
     const source = fs.readFileSync(require.resolve('../realtimeEngine.js'), 'utf8');
     const context = {
-        Buffer, Date, JSON, Math, Number, Promise, Set, String,
+        AggregateError, Buffer, Date, JSON, Math, Number, Promise, Set, String,
         console, clearTimeout, setTimeout,
         require(name) {
             if (name === 'events') return require('events');
@@ -40,6 +40,37 @@ function loadEngineWithoutNativeSockets() {
 }
 
 const engine = loadEngineWithoutNativeSockets();
+
+test('engine stop preserves terminal camera failure as incomplete and still releases sockets', async () => {
+    const e = loadEngineWithoutNativeSockets();
+    e.collectionCommandChain = Promise.resolve();
+    e.stageFileOpen = true;
+    e.videoRecordingStarted = true;
+    e.videoFileNames = { left: 'trial-left.avi', right: null };
+    e.videoStopOperationId = 'trial-stop';
+    e.sendCameraCommand = async () => ({ success: false, error: 'AVI帧数校验失败' });
+    const closes = [];
+    e.closeStageFile = async (params, incomplete) => {
+        closes.push({ params, incomplete });
+        return { status: 'success' };
+    };
+    e.clients = new Set([{ readyState: 1, close: () => closes.push('client') }]);
+    e.websocket_server = { close: callback => { closes.push('websocket-server'); callback(); } };
+    e.ble_client = { close: () => closes.push('ble') };
+    e.mocap_client = { close: () => closes.push('mocap') };
+    e.camera_client = { close: () => closes.push('camera') };
+    e.storage_push_socket = { close: () => closes.push('push') };
+    e.storage_server_socket = { close: () => closes.push('storage') };
+
+    await assert.rejects(e.stop(), /AVI帧数校验失败/);
+    const incompleteClose = closes.find(item => item && item.incomplete === true);
+    assert.ok(incompleteClose, 'H5 finalization should be attempted with incomplete=true');
+    assert.equal(incompleteClose.params.collection_status, 'incomplete');
+    assert.match(incompleteClose.params.error_reason, /AVI帧数校验失败/);
+    assert.deepEqual(closes.slice(-5), ['ble', 'mocap', 'camera', 'push', 'storage']);
+    assert.equal(e.websocket_server, null);
+    assert.equal(e.videoRecordingStarted, false);
+});
 
 test('random guide markers retain their payload and occurrence time through the storage path', async () => {
     const e = loadEngineWithoutNativeSockets();
@@ -314,7 +345,7 @@ test('PUSH pending limit rejects data and makes close fail without sending', asy
     assert.equal(closeResult.status, 'error');
 });
 
-test('stop waits for opening close and leaves sockets open on close failure', async () => {
+test('stop waits for opening close, tries incomplete finalization, and releases sockets on close failure', async () => {
     const localEngine = loadEngineWithoutNativeSockets();
     let releaseOpen;
     const opening = new Promise(resolve => { releaseOpen = resolve; });
@@ -336,7 +367,7 @@ test('stop waits for opening close and leaves sockets open on close failure', as
     localEngine.stageFileOpening = false;
     releaseOpen();
     await assert.rejects(stopPromise, /disk full/);
-    assert.deepEqual(events, ['close']);
+    assert.deepEqual(events, ['close', 'finalize_incomplete', 'push-close', 'req-close']);
 });
 
 test('opening failure makes collection stop return error', async () => {
@@ -513,14 +544,14 @@ test('slow preview clients are byte bounded and transport fault is fatal for col
     assert.equal((await e.onCollectionStop(true)).status, 'error');
 });
 
-function loadCollectionPrototype() {
+function loadCollectionPrototype(document = { readyState: 'loading', addEventListener() {}, getElementById() { return null; } }) {
     const window = {};
     const source = fs.readFileSync(require.resolve('../public/scripts/collection-controller.js'), 'utf8')
         .replace('    function initController() {', '    window.TestController = CollectionController;\n    function initController() {');
     const context = { window, console, Date, Math, JSON, setTimeout, clearTimeout, clearInterval,
-        WebSocket: { OPEN: 1 }, document: { readyState: 'loading', addEventListener() {}, getElementById() { return null; } } };
+        WebSocket: { OPEN: 1 }, document };
     vm.runInNewContext(source, context);
-    return { controller: Object.create(window.TestController.prototype), window };
+    return { controller: Object.create(window.TestController.prototype), window, document };
 }
 
 class BrowserSocket extends require('events') {
@@ -541,7 +572,8 @@ test('frontend control RPC rejects immediately on disconnect and removes listene
 });
 
 test('frontend stop failure stays failed and retry only restores preview after ACK', async () => {
-    const { controller: c } = loadCollectionPrototype(); let preview = 0; let attempts = 0;
+    const { controller: c, window } = loadCollectionPrototype(); let preview = 0; let attempts = 0;
+    window.BleControl = { isConnected: true };
     Object.assign(c, { _isRunning: true, _isAllSessionsMode: false,
         cancelAllSessionsMode() {}, hideGestureGif() {}, _disableSpaceKey() {}, resetDisplay() {},
         updateNextStageButton() {}, updateGestureList() {}, updateStatus() {}, showToast() {},
@@ -549,7 +581,136 @@ test('frontend stop failure stays failed and retry only restores preview after A
         _resumePreviewAfterCollection() { preview++; }
     });
     await c.stopTask(); assert.equal(c._saveState, 'save_failed'); assert.equal(preview, 0);
+    assert.equal(c._isRunning, false); assert.equal(typeof c._retrySave, 'function');
     await c.stopTask(); assert.equal(c._saveState, 'idle'); assert.equal(attempts, 2);
+    assert.equal(c._isRunning, false); assert.equal(preview, 1);
+});
+
+test('save states never add an incomplete-finalization button', () => {
+    const appended = [];
+    const stop = { parentNode: { appendChild: el => appended.push(el) } };
+    const document = { readyState: 'loading', addEventListener() {},
+        getElementById(id) { return id === 'stopTaskBtn' ? stop : null; },
+        createElement() { throw new Error('save state must not create a button'); } };
+    const { controller: c } = loadCollectionPrototype(document);
+    for (const state of ['idle', 'starting', 'stopping', 'save_failed']) c._setSaveState(state);
+    assert.deepEqual(appended, []);
+    assert.equal(stop.textContent, '重试保存');
+});
+
+test('continuous stage completion follows normal all-session rest and single-session completion paths', async () => {
+    const elements = new Map(['sessionSwitchSelect', 'stageSwitchSelect'].map(id => [id, { disabled: true }]));
+    const document = { readyState: 'loading', addEventListener() {}, getElementById(id) { return elements.get(id) || null; } };
+    const makeController = allSessions => {
+        for (const el of elements.values()) el.disabled = true;
+        const { controller: c } = loadCollectionPrototype(document);
+        Object.assign(c, { _isRunning: true, _isAllSessionsMode: allSessions,
+            currentSessionIndex: 0, sessionCount: 2, currentStageIndex: 0, stages: [{ name: 'Stage 1' }, { name: 'Stage 2' }],
+            sendToRealtimeEngine() {}, sendToRealtimeEngineAndWait: async () => {}, hideGestureGif() {},
+            updateGestureDisplay() {}, _clearBreakpointState() {}, updateControlButtons() {}, updateGestureList() {},
+            updateStatus() {}, _resumePreviewAfterCollection() {}, showToast() {}, showRestCountdownAndContinue() {} });
+        return c;
+    };
+    const allSessions = makeController(true); let restCalls = 0; let allSessionButtonUpdates = 0;
+    allSessions.showRestCountdownAndContinue = () => restCalls++;
+    allSessions.updateNextStageButton = () => allSessionButtonUpdates++;
+    await allSessions.onContinualStageComplete();
+    assert.equal(restCalls, 1); assert.equal(allSessionButtonUpdates, 1);
+    assert.equal(allSessions._saveState, 'idle'); assert.equal(allSessions._isRunning, false);
+    assert.equal(elements.get('sessionSwitchSelect').disabled, false);
+    assert.equal(elements.get('stageSwitchSelect').disabled, false);
+
+    const retrying = makeController(true); let attempts = 0; let retryRestCalls = 0;
+    retrying.sendToRealtimeEngineAndWait = async () => { if (++attempts === 1) throw new Error('disk full'); };
+    retrying.showRestCountdownAndContinue = () => retryRestCalls++;
+    retrying.updateNextStageButton = () => {};
+    await retrying.onContinualStageComplete();
+    assert.equal(retrying._saveState, 'save_failed'); assert.equal(retryRestCalls, 0);
+    assert.equal(elements.get('sessionSwitchSelect').disabled, true);
+    assert.equal(elements.get('stageSwitchSelect').disabled, true);
+    await retrying.stopTask();
+    assert.equal(attempts, 2); assert.equal(retrying._saveState, 'idle');
+    assert.equal(retrying._isRunning, false); assert.equal(retryRestCalls, 1);
+    assert.equal(elements.get('sessionSwitchSelect').disabled, false);
+    assert.equal(elements.get('stageSwitchSelect').disabled, false);
+
+    const singleSession = makeController(false); let singleButtonUpdates = 0;
+    singleSession.updateNextStageButton = () => singleButtonUpdates++;
+    await singleSession.onContinualStageComplete();
+    assert.equal(singleButtonUpdates, 1); assert.equal(singleSession._saveState, 'idle');
+    assert.equal(singleSession._isRunning, false);
+    assert.equal(elements.get('sessionSwitchSelect').disabled, false);
+    assert.equal(elements.get('stageSwitchSelect').disabled, false);
+});
+
+function makeDiscreteCompletionController({ allSessions = false } = {}) {
+    const elements = new Map(['sessionSwitchSelect', 'stageSwitchSelect'].map(id => [id, { disabled: true }]));
+    const document = { readyState: 'loading', addEventListener() {}, getElementById(id) { return elements.get(id) || null; } };
+    const { controller: c } = loadCollectionPrototype(document);
+    Object.assign(c, {
+        _isRunning: true, _isAllSessionsMode: allSessions, _saveState: 'collecting',
+        currentSessionIndex: 0, sessionCount: 2, currentStageIndex: 0,
+        stages: [{ name: '离散Stage' }], currentPhase: 'gesture', _shuffleMode: false,
+        sendToRealtimeEngine() {}, hideGestureGif() {}, _clearBreakpointState() {},
+        updateControlButtons() {}, updateNextStageButton() {}, updateGestureList() {},
+        updateStatus() {}, updateGestureDisplay() {}, _resumePreviewAfterCollection() {},
+        showToast() {}, showRestCountdownAndContinue() {}
+    });
+    return { controller: c, elements };
+}
+
+test('discrete completion waits for stop ACK before clearing running state and unlocking selectors', async () => {
+    const { controller: c, elements } = makeDiscreteCompletionController();
+    const stopAck = gate(); let stopRequest;
+    c.sendToRealtimeEngineAndWait = (action, data) => { stopRequest = { action, data }; return stopAck.promise; };
+
+    const completing = c.onAllGesturesComplete();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(stopRequest.action, 'collection_stop_and_wait');
+    assert.equal(stopRequest.data.completed, true);
+    assert.equal(c._saveState, 'stopping');
+    assert.equal(c._isRunning, true);
+    assert.equal(elements.get('sessionSwitchSelect').disabled, true);
+    assert.equal(elements.get('stageSwitchSelect').disabled, true);
+
+    stopAck.resolve({ status: 'success' });
+    await completing;
+    assert.equal(c._saveState, 'idle');
+    assert.equal(c._isRunning, false);
+    assert.equal(elements.get('sessionSwitchSelect').disabled, false);
+    assert.equal(elements.get('stageSwitchSelect').disabled, false);
+});
+
+test('discrete completion failure stays locked until stopTask retry is ACKed, then enters rest', async () => {
+    const { controller: c, elements } = makeDiscreteCompletionController({ allSessions: true });
+    const retryAck = gate(); let attempts = 0; let restCalls = 0;
+    c.sendToRealtimeEngineAndWait = async () => {
+        if (++attempts === 1) throw new Error('video frame count mismatch');
+        return retryAck.promise;
+    };
+    c.showRestCountdownAndContinue = () => { restCalls++; };
+
+    await c.onAllGesturesComplete();
+    assert.equal(c._saveState, 'save_failed');
+    assert.equal(c._isRunning, true);
+    assert.equal(restCalls, 0);
+    assert.equal(elements.get('sessionSwitchSelect').disabled, true);
+    assert.equal(elements.get('stageSwitchSelect').disabled, true);
+
+    const retry = c.stopTask();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 2);
+    assert.equal(c._saveState, 'stopping');
+    assert.equal(c._isRunning, true);
+    assert.equal(restCalls, 0);
+
+    retryAck.resolve({ status: 'success' });
+    await retry;
+    assert.equal(c._saveState, 'idle');
+    assert.equal(c._isRunning, false);
+    assert.equal(restCalls, 1);
+    assert.equal(elements.get('sessionSwitchSelect').disabled, false);
+    assert.equal(elements.get('stageSwitchSelect').disabled, false);
 });
 
 

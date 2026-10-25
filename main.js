@@ -93,15 +93,18 @@ app.on('before-quit', async (event) => {
     const completed = await Promise.race([shutdown.then(() => true), timeout.then(() => false)]);
     clearTimeout(timeoutId);
     if (!completed) {
-      gracefulQuitStarted = false;
-      console.error('[Main] 优雅关闭超时，保留服务以便恢复');
-      return;
+      console.error('[Main] 优雅关闭超时，开始释放应用自有服务');
+      try {
+        if (serverModule && typeof serverModule.forceCleanupOwnedResources === 'function') {
+          await serverModule.forceCleanupOwnedResources();
+        }
+      } catch (cleanupError) {
+        console.error('[Main] 强制释放应用自有服务失败:', cleanupError);
+      }
     }
   } catch (error) {
     clearTimeout(timeoutId);
     console.error('[Main] 优雅关闭采集服务失败:', error);
-    gracefulQuitStarted = false;
-    return;
   }
 
   allowWindowClose = true;
@@ -111,7 +114,7 @@ app.on('before-quit', async (event) => {
 // 捕获未处理的异常，确保清理
 process.on('uncaughtException', (error) => {
   console.error('[Main] 未捕获的异常:', error);
-  // Keep the process tree available for recovery; service-process owns only its children.
+  app.quit();
 });
 
 // 捕获 SIGINT (Ctrl+C)

@@ -147,6 +147,9 @@ class RealtimeEngine extends EventEmitter {
         return new Promise((resolve, reject) => {
             try {
                 this.stopping = false;
+                if (!this.storage_server_socket || this.storage_server_socket.closed) this.storage_server_socket = new zmq.Request();
+                if (!this.storage_push_socket || this.storage_push_socket.closed) this.storage_push_socket = new zmq.Push();
+                this._configureStorageSockets();
                 this.connectTimeoutTimer = setTimeout(() => this.ble_server_connect(), 0);
                 this.mocapConnectTimeoutTimer = setTimeout(() => this.mocap_server_connect(), 0);
                 this.cameraConnectTimeoutTimer = setTimeout(() => this.camera_server_connect(), 0);
@@ -1834,46 +1837,96 @@ class RealtimeEngine extends EventEmitter {
     }
 
     async _stopInternal() {
-            this.stopping = true;
+        this.stopping = true;
+        let saveError = null;
+        const cleanupErrors = [];
+        const closeSocket = async (socket, label) => {
+            if (!socket) return;
+            try { socket.close(1000); }
+            catch (error) { cleanupErrors.push(new Error(`${label}: ${error.message}`)); }
+        };
+        try {
             for (const name of ['connectTimeoutTimer', 'mocapConnectTimeoutTimer',
-                'cameraConnectTimeoutTimer', 'reconnectTimer', 'mocap_reconnectTimer', 'camera_reconnectTimer']) {
+                'cameraConnectTimeoutTimer', 'reconnectTimer', 'mocap_reconnectTimer', 'camera_reconnectTimer',
+                'realtimeDataTimer']) {
                 clearTimeout(this[name]); this[name] = null;
             }
             this.isRunning = false;
             this.isCollecting = false;
             this.collectionPaused = true;
 
-            await this.collectionCommandChain;
-            if (this.stageFileOpen || this.stageFileOpening || this.stageFileOpenPromise || this.isClosingStageFile || this.stageFileCreateFailed || this.videoRecordingStarted) {
-                const result = await this.onCollectionStop(false);
-                if (result.status !== 'success') throw new Error(result.msg || '采集收尾失败');
+            try {
+                await this.collectionCommandChain;
+                if (this.stageFileOpen || this.stageFileOpening || this.stageFileOpenPromise || this.isClosingStageFile || this.stageFileCreateFailed || this.videoRecordingStarted) {
+                    const result = await this.onCollectionStop(false);
+                    if (result.status !== 'success') throw new Error(result.msg || '采集收尾失败');
+                }
+            } catch (error) {
+                saveError = error;
+                // A failed normal stop must still preserve the open H5 as incomplete.
+                // This path also retries a terminal camera save failure using its cached result.
+                if (this.stageFileOpen || this.stageFileOpening || this.stageFileOpenPromise || this.isClosingStageFile || this.stageFileCreateFailed || this.videoRecordingStarted) {
+                    try {
+                        const result = await this.finalizeIncomplete({ reason: error.message || String(error) });
+                        if (result.status !== 'success') {
+                            console.error('[realtimeEngine] 不完整收尾失败:', result.msg || '未知错误');
+                        }
+                    } catch (incompleteError) {
+                        console.error('[realtimeEngine] 不完整收尾异常:', incompleteError);
+                    }
+                }
+            }
+        } catch (error) {
+            saveError = saveError || error;
+        } finally {
+            this.isRunning = false;
+            this.isCollecting = false;
+            this.collectionPaused = true;
+            for (const name of ['connectTimeoutTimer', 'mocapConnectTimeoutTimer',
+                'cameraConnectTimeoutTimer', 'reconnectTimer', 'mocap_reconnectTimer', 'camera_reconnectTimer',
+                'realtimeDataTimer']) {
+                clearTimeout(this[name]); this[name] = null;
             }
 
-            this.clients.forEach(client => {
-                if (client.readyState === WebSocket.OPEN) client.close(1001, '服务器关闭');
-            });
-            this.clients.clear();
+            for (const client of this.clients || []) {
+                try { if (client.readyState === WebSocket.OPEN) client.close(1001, '服务器关闭'); }
+                catch (error) { cleanupErrors.push(new Error(`WebSocket客户端关闭失败: ${error.message}`)); }
+            }
+            this.clients?.clear();
 
-            if (this.websocket_server) await new Promise(resolve => {
-                const closeTimeout = setTimeout(resolve, 3000);
-                this.websocket_server.close(() => { clearTimeout(closeTimeout); resolve(); });
-            });
+            if (this.websocket_server) {
+                try {
+                    await new Promise((resolve, reject) => {
+                        const closeTimeout = setTimeout(resolve, 3000);
+                        try {
+                            this.websocket_server.close(error => {
+                                clearTimeout(closeTimeout);
+                                if (error) reject(error); else resolve();
+                            });
+                        } catch (error) { clearTimeout(closeTimeout); reject(error); }
+                    });
+                } catch (error) { cleanupErrors.push(new Error(`WebSocket服务关闭失败: ${error.message}`)); }
+                this.websocket_server = null;
+            }
 
-            if (this.ble_client) { this.ble_client.close(1000); this.ble_client = null; }
-            if (this.mocap_client) { this.mocap_client.close(1000); this.mocap_client = null; }
-            if (this.camera_client) { this.camera_client.close(1000); this.camera_client = null; }
+            await closeSocket(this.ble_client, 'BLE连接关闭失败'); this.ble_client = null;
+            await closeSocket(this.mocap_client, '动捕连接关闭失败'); this.mocap_client = null;
+            await closeSocket(this.camera_client, '相机连接关闭失败'); this.camera_client = null;
             this.camera_connected = this.mocap_connected = false;
             this.storage_connected = this.storage_push_connected = false;
-
-            // 【新增】关闭 ZMQ sockets
-            try {
-                if (this.storage_push_socket) { this.storage_push_socket.close(); }
-                if (this.storage_server_socket) { this.storage_server_socket.close(); }
-            } catch (e) {}
-
-            clearTimeout(this.reconnectTimer);
-            clearTimeout(this.mocap_reconnectTimer);
-            return { status: 'success' };
+            for (const [socketName, label] of [['storage_push_socket', 'Storage PUSH socket关闭失败'],
+                ['storage_server_socket', 'Storage REQ socket关闭失败']]) {
+                try { this[socketName]?.close(); }
+                catch (error) { cleanupErrors.push(new Error(`${label}: ${error.message}`)); }
+                this[socketName] = null;
+            }
+        }
+        if (saveError) {
+            if (cleanupErrors.length) console.error('[realtimeEngine] 收尾清理也发生错误:', cleanupErrors);
+            throw saveError;
+        }
+        if (cleanupErrors.length) throw new AggregateError(cleanupErrors, '实时引擎资源清理失败');
+        return { status: 'success' };
     }
 }
 

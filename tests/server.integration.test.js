@@ -68,15 +68,40 @@ startServer().then(() => {
 });
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', async data => {
-  if (!data.includes('shutdown') || stopping) return;
+  if ((!data.includes('shutdown') && !data.includes('restart-cycle')) || stopping) return;
   stopping = true;
   try {
+    if (data.includes('restart-cycle')) {
+      const engine = require('./realtimeEngine');
+      const stopEngine = engine.stop.bind(engine);
+      engine.stop = async () => {
+        await stopEngine();
+        engine.stop = stopEngine;
+        throw new Error('TEST_ENGINE_STOP_FAILURE');
+      };
+      try { await shutdown(); }
+      catch (error) { console.error('TEST_FIRST_SHUTDOWN_ERROR:' + error.message); }
+      engine.stop = stopEngine;
+      console.log('TEST_FIRST_SHUTDOWN_ATTEMPTED');
+      await startServer();
+      console.log('TEST_RESTARTED');
+      stopping = false;
+      return;
+    }
+    if (data.includes('shutdown-error')) {
+      const engine = require('./realtimeEngine');
+      const stopEngine = engine.stop.bind(engine);
+      engine.stop = async () => {
+        await stopEngine();
+        throw new Error('TEST_ENGINE_STOP_FAILURE');
+      };
+    }
     await Promise.all([shutdown(), shutdown()]);
     console.log('TEST_SHUTDOWN');
     process.exitCode = 0;
   } catch (error) {
     console.error('TEST_SHUTDOWN_ERROR:' + error.message);
-    process.exitCode = 18;
+    process.exitCode = data.includes('shutdown-error') ? 0 : 18;
   }
   process.stdin.destroy();
 });
@@ -221,5 +246,26 @@ test('HTTP port collision rolls back all services without touching the owner', a
     } finally {
         await stopOwnedChild(child);
         await new Promise(resolve => occupied.close(resolve));
+    }
+});
+
+test('shutdown rejection still releases services and same process can restart on the original port', async t => {
+    if (await skipIfServicePortsBusy(t)) return;
+    const port = await findFreePort();
+    const child = spawnServer(port);
+    try {
+        await waitForOutput(child, 'TEST_STARTED');
+        await waitForReadyHealth(port);
+        child.stdin.write('restart-cycle\n');
+        const output = await waitForOutput(child, 'TEST_RESTARTED');
+        assert.match(output, /TEST_FIRST_SHUTDOWN_ERROR:服务关闭完成/);
+        assert.match(output, /TEST_ENGINE_STOP_FAILURE/);
+        await waitForReadyHealth(port);
+        child.stdin.write('shutdown\n');
+        await waitForOutput(child, 'TEST_SHUTDOWN');
+        assert.equal(await waitForExit(child), 0);
+        assert.equal(await waitForPortsFree([port, ...SERVICE_PORTS]), true);
+    } finally {
+        await stopOwnedChild(child);
     }
 });
