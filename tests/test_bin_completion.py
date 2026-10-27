@@ -1,5 +1,6 @@
 """Regression tests for the BLE-anchor/bin-output contract."""
 
+import json
 import struct
 import sys
 import tempfile
@@ -94,6 +95,25 @@ class BinCompletionTests(unittest.TestCase):
         with h5py.File(h5_path, 'r') as handle:
             for sample, source_id in zip(handle['emg1_2khz_adc'][:], source_ids):
                 np.testing.assert_array_equal(sample['channels'], rows[int(source_id)])
+
+    def test_gui_deferred_aggregate_keeps_alignment_provenance(self):
+        ids = list(range(1000, 1200))
+        bin_path, rows = self._write_bin(ids)
+        h5_path = self._write_h5(rows, list(range(1007, 1192, 8)), base=1000)
+
+        result = sync.sync_h5_one_to_one(
+            str(h5_path), str(bin_path), verify=True, set_synced=False)
+
+        self.assertEqual(result['status'], 'success')
+        with h5py.File(h5_path, 'r') as handle:
+            self.assertEqual(handle.attrs['sync_mode'], 'one_to_one')
+            self.assertEqual(handle.attrs['sync_time_alignment'], 'anchor_sample')
+            self.assertEqual(handle.attrs['sync_bin_align_offset_dev1'], 1000)
+            self.assertTrue(handle.attrs['sync_device_validation_dev1'])
+            history = json.loads(handle.attrs['sync_history'])
+            self.assertEqual(history[-1]['status'], 'success')
+            self.assertEqual(history[-1]['details']['device_id'], 1)
+            self.assertTrue(history[-1]['details']['emg_validation_passed'])
 
     def test_compatibility_entrypoint_uses_full_paired_bin_contract(self):
         ids = list(range(300, 420))
@@ -213,6 +233,41 @@ class BinCompletionTests(unittest.TestCase):
             self.assertEqual(result['imu_filled'], 2)
             np.testing.assert_array_equal(handle['imu1a_100hz']['sd_frame_id'], [0, 1])
             np.testing.assert_allclose(handle['imu1a_100hz']['time'], [100., 100.01])
+
+    def test_full_bin_imu_keeps_source_edges_without_ble_anchors(self):
+        data = np.zeros(40, dtype=[('sd_frame_id', '<i8'), ('time', '<f8')])
+        data['sd_frame_id'] = -1
+        data['sd_frame_id'][:2] = [20, 40]
+        data['time'] = 100.0 + np.arange(40) / 2000.0
+        frames = {}
+        for fid in range(6):
+            frames[fid] = [
+                {'acc': [fid + 1., fid + 2., fid + 3.],
+                 'gyr': [fid + 4., fid + 5., fid + 6.],
+                 'mag': [fid + 7., fid + 8., fid + 9.]},
+                {'acc': [fid + 11., fid + 12., fid + 13.],
+                 'gyr': [fid + 14., fid + 15., fid + 16.],
+                 'mag': [fid + 17., fid + 18., fid + 19.]},
+            ]
+        parser = SimpleNamespace(num_imus=2, bin_path='imu.bin', frames=frames)
+        with h5py.File(self.directory / 'full-imu.h5', 'w') as handle:
+            with patch.object(sync, '_build_imu_frame_axis_from_ble', return_value=None):
+                result = sync._sync_imu_100hz(
+                    handle, None, parser, data, 1, full_bin=True)
+            self.assertEqual(result['imu_status'], 'success')
+            for label, sensor_index in (('a', 0), ('b', 1)):
+                ds = handle[f'imu1{label}_100hz']
+                np.testing.assert_array_equal(ds['sd_frame_id'], np.arange(6))
+                self.assertTrue(np.all(np.isfinite(ds['time'])))
+                self.assertTrue(np.all(np.diff(ds['time']) > 0))
+                self.assertEqual(ds.attrs['sync_source_frame_count'], 6)
+                self.assertEqual(ds.attrs['sync_output_frame_count'], 6)
+                self.assertTrue(ds.attrs['sync_full_bin_preserved'])
+                for row, fid in zip(ds, range(6)):
+                    source = frames[fid][sensor_index]
+                    np.testing.assert_allclose(row['acc'], source['acc'])
+                    np.testing.assert_allclose(row['gyr'], source['gyr'])
+                    np.testing.assert_allclose(row['mag'], source['mag'])
 
 
 if __name__ == '__main__':

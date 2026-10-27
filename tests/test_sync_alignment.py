@@ -116,8 +116,12 @@ class AlignmentTests(unittest.TestCase):
                 with h5py.File(hp, 'r') as handle:
                     for label in 'abc'[:imu_count]:
                         ds = handle[f'imu1{label}_100hz']
-                        self.assertEqual(len(ds), 24)
-                        np.testing.assert_array_equal(ds['sd_frame_id'], np.arange(24))
+                        # The IMU source has 30 records, including six beyond
+                        # the EMG range. A paired copy must retain all of them.
+                        self.assertEqual(len(ds), 30)
+                        np.testing.assert_array_equal(ds['sd_frame_id'], np.arange(30))
+                        self.assertTrue(ds.attrs['sync_full_bin_preserved'])
+                        self.assertEqual(ds.attrs['sync_source_frame_count'], 30)
                 repeat = sync.sync_h5_one_to_one(str(hp), str(bp), str(ip), manual_num_imus=imu_count)
                 self.assertEqual(repeat['status'], 'skipped')
 

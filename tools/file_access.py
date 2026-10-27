@@ -21,8 +21,36 @@ class FileBusyError(RuntimeError):
 _active = threading.local()
 
 
+def _ordinary_path(path):
+    """Return a normal Windows spelling for identity and user-facing paths."""
+    value = os.fspath(path)
+    if os.name != 'nt' or not isinstance(value, str):
+        return value
+    lowered = value.lower()
+    if lowered.startswith('\\\\?\\unc\\'):
+        return '\\\\' + value[8:]
+    if lowered.startswith('\\\\?\\'):
+        return value[4:]
+    return value
+
+
+def _io_path(path):
+    """Return an absolute path accepted by Windows APIs beyond MAX_PATH."""
+    value = os.fspath(path)
+    if os.name != 'nt' or not isinstance(value, str):
+        return value
+    if value.startswith('\\\\?\\'):
+        return value
+    value = os.path.abspath(value)
+    if value.startswith('\\\\'):
+        return '\\\\?\\UNC\\' + value[2:]
+    return '\\\\?\\' + value
+
+
 def _key(path):
-    return os.path.normcase(os.path.realpath(os.fspath(path)))
+    ordinary = _ordinary_path(path)
+    resolved = os.path.realpath(ordinary)
+    return os.path.normcase(_ordinary_path(resolved))
 
 
 def logical_h5_path(path):
@@ -48,7 +76,7 @@ def exclusive_file(path):
     """Acquire immediately or fail with an actionable error; no GUI blocking."""
     target = Path(_key(path))
     lock_path = target.with_name(target.name + '.offline.lock')
-    with open(lock_path, 'a+b') as handle:
+    with open(_io_path(lock_path), 'a+b') as handle:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
             handle.write(b'\0')
@@ -107,40 +135,44 @@ def h5_transaction(path, validate=None):
             raise
         return
     with exclusive_file(path) as original:
-        stamp = _stamp(original)
-        required = original.stat().st_size
-        if shutil.disk_usage(original.parent).free < required + 1024 * 1024:
+        original_io = _io_path(original)
+        stamp = _stamp(original_io)
+        required = os.stat(original_io).st_size
+        if shutil.disk_usage(_io_path(original.parent)).free < required + 1024 * 1024:
             raise OSError(f'没有足够空间创建安全编辑副本：{original}')
         fd, name = tempfile.mkstemp(prefix=f'.{original.stem}.edit-', suffix='.h5',
-                                    dir=original.parent)
+                                    dir=_io_path(original.parent))
         os.close(fd)
-        staged = Path(name)
+        staged = _io_path(name)
         staged_key = _key(staged)
-        active[key] = active[staged_key] = str(staged)
+        active[key] = active[staged_key] = staged
         logical[key] = key
         logical[staged_key] = key
         try:
             import h5py
-            with h5py.File(original, 'r'):
-                shutil.copy2(original, staged)
-            yield str(staged)
+            with h5py.File(original_io, 'r'):
+                shutil.copy2(original_io, staged)
+            yield staged
             if failures.get(key):
                 raise RuntimeError('嵌套离线操作失败，已取消整个文件的提交')
             _validate_h5(staged)
             if validate:
-                validate(str(staged))
-            if _stamp(original) != stamp:
+                validate(staged)
+            if _stamp(original_io) != stamp:
                 raise FileBusyError(f'源文件在编辑期间发生变化，未提交：{original}')
             with open(staged, 'r+b') as handle:
                 os.fsync(handle.fileno())
-            os.replace(staged, original)
+            os.replace(staged, original_io)
         finally:
             active.pop(key, None)
             active.pop(staged_key, None)
             logical.pop(key, None)
             logical.pop(staged_key, None)
             failures.pop(key, None)
-            staged.unlink(missing_ok=True)
+            try:
+                os.unlink(staged)
+            except FileNotFoundError:
+                pass
 
 
 def transactional_h5(function):

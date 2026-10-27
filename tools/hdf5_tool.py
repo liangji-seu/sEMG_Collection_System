@@ -156,7 +156,9 @@ def ensure_h5_openable(h5_path):
     except Exception as e:
         if not _is_h5_stale_write_error(e):
             return False, str(e)
-        return False, 'HDF5 文件可能仍在采集或被其他程序占用，请先停止采集并关闭占用程序后重试'
+        return False, ('HDF5 文件可能仍在采集或被其他程序占用，也可能是上次异常退出遗留了写入标记。'
+                       '请先停止采集并关闭占用程序后重试；若仍报错，请保留原文件，'
+                       '确认没有写入进程后再备份检查写入标记。')
 
 
 def _sync_output_is_valid(h5_path, device_id, result, require_imu=False):
@@ -285,18 +287,28 @@ def _iter_non_preview_bin_files(bin_dir):
         return
     for root, _dirs, files in os.walk(bin_dir):
         for name in files:
-            if 'PREVIEW_' in name:
+            if 'preview_' in name.casefold():
                 continue
-            if name.endswith('.bin'):
+            if name.casefold().endswith('.bin'):
                 yield root, name, os.path.join(root, name)
 
 
 def _find_named_file_recursive(base_dir, target_name):
     """Find target_name anywhere under base_dir."""
+    target_key = str(target_name).casefold()
+    exact_matches = []
+    folded_matches = []
     for _root, name, path in _iter_non_preview_bin_files(base_dir):
         if name == target_name:
-            return path
-    return None
+            exact_matches.append(path)
+        elif name.casefold() == target_key:
+            folded_matches.append(path)
+    # Prefer exact spelling only when the case-insensitive basename is unique.
+    # Duplicate basenames remain unresolved instead of selecting arbitrarily.
+    all_matches = exact_matches + folded_matches
+    if len(all_matches) != 1:
+        return None
+    return all_matches[0]
 
 
 _H5_SESSION_NAME_RE = re.compile(
@@ -359,7 +371,7 @@ def _resolve_time_matched_bin_pair(bin_dir, h5_path, device_id,
 
     side = 'L' if int(device_id) == 1 else 'R' if int(device_id) == 2 else None
     legacy = _parse_bin_filename(f'{legacy_prefix}_emg.bin') if legacy_prefix else None
-    if legacy is not None and legacy['subject'] == session['subject']:
+    if legacy is not None and legacy['subject'].casefold() == session['subject'].casefold():
         side = legacy['side']
 
     legacy_emg = (_find_named_file_recursive(bin_dir, f'{legacy_prefix}_emg.bin')
@@ -367,7 +379,8 @@ def _resolve_time_matched_bin_pair(bin_dir, h5_path, device_id,
     legacy_imu = (_find_named_file_recursive(bin_dir, f'{legacy_prefix}_imu.bin')
                   if legacy_prefix else None)
     legacy_info = _parse_bin_filename(legacy_emg) if legacy_emg else legacy
-    if (legacy_emg and legacy_info and legacy_info['subject'] == session['subject']
+    if (legacy_emg and legacy_info
+            and legacy_info['subject'].casefold() == session['subject'].casefold()
             and legacy_info['side'] == side and legacy_info['date'] == session['date']):
         legacy_delta = abs((legacy_info['timestamp'] - session['timestamp']).total_seconds())
         if legacy_delta <= max_delta_seconds:
@@ -383,7 +396,8 @@ def _resolve_time_matched_bin_pair(bin_dir, h5_path, device_id,
         info = _parse_bin_filename(path)
         if info is None:
             continue
-        if (info['subject'] != session['subject'] or info['side'] != side
+        if (info['subject'].casefold() != session['subject'].casefold()
+                or info['side'] != side
                 or info['date'] != session['date']):
             continue
         info['delta_seconds'] = abs((info['timestamp'] - session['timestamp']).total_seconds())
@@ -420,16 +434,16 @@ def _count_bin_files_recursive(base_dir):
     emg_count = 0
     imu_count = 0
     for _root, name, _path in _iter_non_preview_bin_files(base_dir):
-        if name.endswith('_emg.bin'):
+        if name.casefold().endswith('_emg.bin'):
             emg_count += 1
-        elif name.endswith('_imu.bin'):
+        elif name.casefold().endswith('_imu.bin'):
             imu_count += 1
     return emg_count, imu_count
 
 
 def _contains_emg_bin_recursive(base_dir):
     """Whether a directory tree contains at least one EMG bin."""
-    return any(name.endswith('_emg.bin') for _root, name, _path in _iter_non_preview_bin_files(base_dir))
+    return any(name.casefold().endswith('_emg.bin') for _root, name, _path in _iter_non_preview_bin_files(base_dir))
 
 
 def _rebuild_time_from_counter(frame_ids, time_base, sd_rate, log_cb, ds_name):
@@ -1563,12 +1577,15 @@ class StatisticsPanel(QFrame):
 
             with h5py.File(file_path, 'r') as f:
                 # 读取同步状态 — 中文显示 + 颜色
-                sync_status = sync_status_summary(f)['status']
+                sync_summary = sync_status_summary(f)
+                sync_status = sync_summary['status']
                 if isinstance(sync_status, bytes):
                     sync_status = sync_status.decode('utf-8')
                 SYNC_LABELS = {
                     'synced': '✅ 已同步', 'pending': '⏳ 待同步',
                     'syncing': '🔄 同步中', 'failed': '❌ 同步失败',
+                    'sync_failed': '❌ 同步失败', 'unverified': '⚠️ 未验证',
+                    'partial': '⚠️ 部分同步',
                     'unknown': '❓ 未知',
                 }
                 sync_label = SYNC_LABELS.get(sync_status, sync_status)
@@ -1579,7 +1596,7 @@ class StatisticsPanel(QFrame):
                     self.labels['sync_status'].setStyleSheet('color: #f97316; font-weight: bold; font-size: 10pt;')
                 elif sync_status == 'syncing':
                     self.labels['sync_status'].setStyleSheet('color: #3b82f6; font-weight: bold; font-size: 10pt;')
-                elif sync_status == 'failed':
+                elif sync_status in ('failed', 'sync_failed'):
                     self.labels['sync_status'].setStyleSheet('color: #dc2626; font-weight: bold; font-size: 10pt;')
                 else:
                     self.labels['sync_status'].setStyleSheet('color: #9ca3af; font-size: 10pt;')
@@ -3172,14 +3189,17 @@ class SyncCalibrationTab(QWidget):
 
     def close_file(self):
         """关闭 H5 文件句柄（避免 Windows 文件锁冲突）"""
-        self._stop_playback()
-        self._close_videos()
-        if self.h5_file:
-            try:
-                self.h5_file.close()
-            except Exception:
-                pass
-            self.h5_file = None
+        try:
+            self._stop_playback()
+            self._close_videos()
+        finally:
+            if self.h5_file:
+                try:
+                    self.h5_file.close()
+                except Exception:
+                    pass
+                finally:
+                    self.h5_file = None
 
     def load_file(self, file_path):
         """加载 H5 文件及关联视频"""
@@ -3187,27 +3207,36 @@ class SyncCalibrationTab(QWidget):
 
         self.h5_path = file_path
         self.h5_file = h5py.File(file_path, 'r')
-        self.lbl_file.setText(os.path.basename(file_path))
-        self.lbl_file.setStyleSheet('color: #333; font-weight: bold;')
+        try:
+            self.lbl_file.setText(os.path.basename(file_path))
+            self.lbl_file.setStyleSheet('color: #333; font-weight: bold;')
 
-        # 读取同步 prompt 时间
-        self._load_sync_prompt()
+            # 读取同步 prompt 时间
+            self._load_sync_prompt()
 
-        # 加载视频
-        self._load_videos()
+            # 加载视频
+            self._load_videos()
 
-        # 读取已有的标定数据（如果已标定过）
-        self._load_existing_calibration()
+            # 读取已有的标定数据（如果已标定过）
+            self._load_existing_calibration()
 
-        self.btn_mark.setEnabled(self._sync_prompt_time is not None)
+            self.btn_mark.setEnabled(self._sync_prompt_time is not None)
 
-        if self._marked_frame.get('left') is not None or self._marked_frame.get('right') is not None:
-            self.btn_save.setEnabled(True)
-            self.lbl_status.setText(
-                '✅ 已有标定数据 — 可重新标定或直接使用现有偏移量')
-        else:
-            self.lbl_status.setText(
-                '就绪 — 点击"播放"查看视频，在标定动作帧处暂停并点击"标定打标"')
+            if self._marked_frame.get('left') is not None or self._marked_frame.get('right') is not None:
+                self.btn_save.setEnabled(True)
+                self.lbl_status.setText(
+                    '✅ 已有标定数据 — 可重新标定或直接使用现有偏移量')
+            else:
+                self.lbl_status.setText(
+                    '就绪 — 点击"播放"查看视频，在标定动作帧处暂停并点击"标定打标"')
+        except BaseException:
+            try:
+                self.close_file()
+            except BaseException:
+                # Keep the original load failure while close_file still makes
+                # its best effort to release the H5 handle in its finally.
+                pass
+            raise
 
     def _load_sync_prompt(self):
         """从 H5 读取 sync_alignment prompt 的 Unix 时间"""
@@ -3807,17 +3836,20 @@ class CalibrateTab(QWidget):
         """关闭 H5 文件句柄（避免 Windows 文件锁冲突）"""
         if self.calibrate_widget is not None:
             cw = self.calibrate_widget
-            if cw.is_playing:
-                cw._stop_playback()
-            if cw.is_full_playing:
-                cw._stop_full_playback()
-            cw._close_videos()
-            if cw.h5_file:
-                try:
-                    cw.h5_file.close()
-                except Exception:
-                    pass
-                cw.h5_file = None
+            try:
+                if cw.is_playing:
+                    cw._stop_playback()
+                if cw.is_full_playing:
+                    cw._stop_full_playback()
+                cw._close_videos()
+            finally:
+                if cw.h5_file:
+                    try:
+                        cw.h5_file.close()
+                    except Exception:
+                        pass
+                    finally:
+                        cw.h5_file = None
 
 
 class SyncTab(QWidget):

@@ -640,6 +640,52 @@ def _model_fit(series, present, h5_win, fs, highpass_hz):
     return float(np.nanmean(corr)), exact_frac, checked
 
 
+def _validate_independent_exact_anchors(emg_parser, channels_250hz, anchor_sd_frame_ids,
+                                        channel_map, anchor_position, bin_base, n_avg,
+                                        search_start, search_count, exact_threshold):
+    """Validate an exact alignment on uniformly spaced rows outside the search window."""
+    total = len(channels_250hz)
+    target_count = min(total, max(512, int(search_count) * 4))
+    if target_count == 0:
+        return {'passed': False, 'selected': 0, 'checked': 0, 'coverage': 0.0,
+                'row_match_rate': 0.0, 'matched': 0, 'reason': 'no H5 rows'}
+
+    probes = np.unique(np.rint(np.linspace(0, total - 1, target_count)).astype(np.int64))
+    search_end = int(search_start) + int(search_count)
+    probes = probes[(probes < search_start) | (probes >= search_end)]
+    if len(probes) == 0:
+        return {'passed': False, 'selected': 0, 'checked': 0, 'coverage': 0.0,
+                'row_match_rate': 0.0, 'matched': 0,
+                'reason': 'no independent probes outside the search window'}
+
+    series, present = _series_at_bin_base(
+        emg_parser, np.asarray(anchor_sd_frame_ids)[probes], int(bin_base),
+        channel_map, int(anchor_position), int(n_avg))
+    checked = int(np.count_nonzero(present))
+    coverage = checked / len(probes)
+    if checked:
+        row_matches = np.all(
+            np.abs(series[present] - np.asarray(channels_250hz)[probes][present]) <= 1.0,
+            axis=1,
+        )
+        matched = int(np.count_nonzero(row_matches))
+        row_match_rate = matched / checked
+    else:
+        matched = 0
+        row_match_rate = 0.0
+
+    min_checked = max(64, int(math.ceil(0.95 * len(probes))))
+    passed = checked >= min_checked and row_match_rate >= exact_threshold
+    reason = '' if passed else (
+        f'independent exact validation failed: checked={checked}/{len(probes)} '
+        f'(need {min_checked}), whole-row match={row_match_rate:.4f} '
+        f'(need {exact_threshold:.4f})'
+    )
+    return {'passed': bool(passed), 'selected': int(len(probes)), 'checked': checked,
+            'coverage': float(coverage), 'row_match_rate': float(row_match_rate),
+            'matched': matched, 'reason': reason}
+
+
 def _search_bin_offset_by_correlation(emg_parser, channels_250hz, anchor_sd_frame_ids,
                                       channel_map, anchor_position=0, sample_count=None,
                                       search_range=None, coarse_step=None, fine_radius=8,
@@ -694,6 +740,7 @@ def _search_bin_offset_by_correlation(emg_parser, channels_250hz, anchor_sd_fram
         'best_corr': 0.0, 'exact_frac': 0.0, 'prominence': 0.0, 'checked': 0,
         'threshold': threshold, 'min_prominence': min_prom,
         'curve': [], 'reason': '', 'report_lines': report,
+        'independent_exact_validation': None, 'ambiguous_candidates': [],
     }
 
     total = len(channels_250hz)
@@ -716,6 +763,7 @@ def _search_bin_offset_by_correlation(emg_parser, channels_250hz, anchor_sd_fram
     # 两个模型都扫，取峰值更高者——旧固件由 n_avg=1 胜出，新固件由 n_avg=8 胜出。
     best = {'corr': -np.inf, 'exact': 0.0, 'base': None, 'n_avg': None, 'prom': 0.0,
             'outside': 0.0, 'checked': 0, 'curve': {}}
+    evaluated = {}
 
     for n_avg in (8, 1):
         curve = {}
@@ -725,6 +773,7 @@ def _search_bin_offset_by_correlation(emg_parser, channels_250hz, anchor_sd_fram
                 series, present = _series_at_bin_base(
                     emg_parser, sd_ids, b, channel_map, anchor_position, n_avg)
                 curve[b] = _model_fit(series, present, h5_win, fs, highpass_hz)
+                evaluated[(n_avg, int(b))] = curve[b]
             return curve[b][0]
 
         coarse_bs = range(fid0 - int(search_range), fid0 + int(search_range) + 1, int(coarse_step))
@@ -762,8 +811,49 @@ def _search_bin_offset_by_correlation(emg_parser, channels_250hz, anchor_sd_fram
     model_name = '8点均值(新固件)' if model == 'boxcar' else '原样抽取(旧固件)'
     corr_ok = bool(best['corr'] >= threshold and best['prom'] >= min_prom)
     exact_ok = bool(best['exact'] >= exact_threshold)
-    passed = bool(corr_ok and exact_ok) or bool(corr_ok and best['corr'] >= 0.999)
-    tier = 'exact' if exact_ok else ('corr' if corr_ok else None)
+    search_coverage = best['checked'] / n_win if n_win else 0.0
+    search_coverage_ok = best['checked'] >= max(64, int(math.ceil(0.95 * n_win)))
+    exact_candidate = bool(best['corr'] >= threshold and search_coverage_ok and exact_ok)
+    independent_validation = None
+    ambiguous_candidates = []
+    exact_pass = False
+    if exact_candidate:
+        search_start = start
+        independent_validation = _validate_independent_exact_anchors(
+            emg_parser, channels_250hz, anchor_sd_frame_ids, channel_map,
+            anchor_position, best['base'], best['n_avg'], search_start, n_win,
+            exact_threshold,
+        )
+        if independent_validation['passed']:
+            for (candidate_avg, candidate_base), (candidate_corr, candidate_exact, candidate_checked) in evaluated.items():
+                if candidate_avg == best['n_avg'] and candidate_base == best['base']:
+                    continue
+                candidate_coverage_ok = candidate_checked >= max(64, int(math.ceil(0.95 * n_win)))
+                if (not np.isfinite(candidate_corr) or candidate_corr < threshold
+                        or not candidate_coverage_ok or candidate_exact < exact_threshold):
+                    continue
+                candidate_validation = _validate_independent_exact_anchors(
+                    emg_parser, channels_250hz, anchor_sd_frame_ids, channel_map,
+                    anchor_position, candidate_base, candidate_avg, search_start,
+                    n_win, exact_threshold,
+                )
+                if candidate_validation['passed']:
+                    ambiguous_candidates.append({
+                        'model': 'boxcar' if candidate_avg == 8 else 'pick',
+                        'bin_base': int(candidate_base),
+                        'corr': float(candidate_corr),
+                        'search_exact_frac': float(candidate_exact),
+                        'independent_row_match_rate': candidate_validation['row_match_rate'],
+                    })
+                    # One alternate proof already makes the alignment ambiguous.
+                    break
+            exact_pass = not ambiguous_candidates
+
+    # Exact identity must use the independent, ambiguity-checked proof. Keep
+    # the existing correlation/prominence fallback for approximate data.
+    legacy_pass = bool(corr_ok and exact_ok) or bool(corr_ok and best['corr'] >= 0.999)
+    passed = bool(exact_pass or legacy_pass)
+    tier = 'exact' if exact_pass or exact_ok else ('corr' if corr_ok else None)
     c_at_zero = best['curve'].get(fid0, (float('nan'), 0.0))[0]
 
     report.append(f"帧号偏移搜索 (窗口 {n_win} 行, anchor_position={anchor_position}, "
@@ -776,14 +866,47 @@ def _search_bin_offset_by_correlation(emg_parser, channels_250hz, anchor_sd_fram
     report.append(f"    峰值突出度 = {best['prom']:+.4f} (离峰 ±16 外最高 "
                   f"{best['outside']:+.4f})，阈值 {min_prom:.4f}")
 
-    if passed:
-        report.append(f"[PASS] {model_name} + bin_base={best['base']}，"
-                      f"命中率 {best['exact']:.2%}，相关 {best['corr']:.4f}")
+    if exact_ok:
+        report.append(
+            f"    搜索窗口有效覆盖 = {best['checked']}/{n_win} ({search_coverage:.2%})，"
+            f"要求 ≥95% 且至少64行: {'PASS' if search_coverage_ok else 'FAIL'}"
+        )
+    if exact_candidate:
+        if independent_validation is not None:
+            report.append(
+                f"    独立全H5均匀锚点（排除搜索窗口）= "
+                f"{independent_validation['matched']}/{independent_validation['checked']} "
+                f"整行命中，覆盖 {independent_validation['checked']}/"
+                f"{independent_validation['selected']} ({independent_validation['coverage']:.2%}): "
+                f"{'PASS' if independent_validation['passed'] else 'FAIL'}"
+            )
+            report.append(
+                f"    其他已评估且满足独立 exact 的候选至少 = {len(ambiguous_candidates)}"
+            )
+            if ambiguous_candidates:
+                report.append(f"    [FAIL] exact 对齐存在歧义: {ambiguous_candidates}")
+
+    if exact_pass:
+        report.append(f"[PASS] 独立 exact 验证唯一确认 {model_name} + bin_base={best['base']}，"
+                      f"窗口命中率 {best['exact']:.2%}，独立整行命中率 "
+                      f"{independent_validation['row_match_rate']:.2%}；无需 prominence 门槛")
+        reason = ''
+    elif passed:
+        path_name = 'legacy corr/prominence' if exact_ok else 'corr/prominence'
+        report.append(f"[PASS] {path_name}: {model_name} + bin_base={best['base']}，"
+                      f"命中率 {best['exact']:.2%}，相关 {best['corr']:.4f}，"
+                      f"突出度 {best['prom']:.4f}")
         reason = ''
     else:
         if not corr_ok:
             reason = (f"峰值带限相关 {best['corr']:.4f} < 阈值 {threshold:.4f} "
                       f"或突出度 {best['prom']:.4f} < {min_prom:.4f}")
+        elif exact_ok and not search_coverage_ok:
+            reason = f"搜索窗口有效覆盖 {best['checked']}/{n_win}，低于95%或不足64行"
+        elif exact_candidate and independent_validation is not None and not independent_validation['passed']:
+            reason = independent_validation['reason']
+        elif ambiguous_candidates:
+            reason = f"exact 对齐存在至少 {len(ambiguous_candidates)} 个不同偏移/模型候选"
         else:
             reason = (f"逐采样命中率 {best['exact']:.2%} < {exact_threshold:.0%}"
                       f"（相关虽高但数值口径不符）")
@@ -802,6 +925,8 @@ def _search_bin_offset_by_correlation(emg_parser, channels_250hz, anchor_sd_fram
         'threshold': float(threshold),
         'min_prominence': float(min_prom),
         'curve': sorted(best['curve'].items()),
+        'independent_exact_validation': independent_validation,
+        'ambiguous_candidates': ambiguous_candidates,
         'reason': reason,
         'report_lines': report,
     }
@@ -974,7 +1099,8 @@ class EMGBinParser:
     如需转换为μV，请使用: uv_value = raw_value * lsb_uv
     """
 
-    def __init__(self, bin_path, gain_override=None, lsb_uv_override=None):
+    def __init__(self, bin_path, gain_override=None, lsb_uv_override=None,
+                 allow_startup_reset=False):
         self.bin_path = bin_path
         self.sample_rate = 0
         self.gain = 12
@@ -983,6 +1109,10 @@ class EMGBinParser:
         self.bit_depth = 24
         self.lsb_uv = 0  # LSB系数，用于转换为μV
         self.timestamp_str = ""
+        self.allow_startup_reset = bool(allow_startup_reset)
+        self.counter_mode = 'strict'
+        self.raw_frame_ids = np.empty(0, dtype=np.uint32)
+        self.original_frame_ids = self.raw_frame_ids
         # Public Mapping adapter over sorted uint32 ids and int32 channels.
         self.frames = _CompactFrameMapping(np.empty(0, dtype=np.uint32),
                                            np.empty((0, 16), dtype=np.int32))
@@ -1062,7 +1192,11 @@ class EMGBinParser:
             # proportional to payload bytes, never to the counter span.
             rows = np.frombuffer(payload, dtype=np.uint8).reshape(payload_bytes // frame_size, frame_size)
             ids = rows[:, :4].copy().view('<u4').reshape(-1)
-            if len(ids) > 1:
+            startup_reset = bool(
+                len(ids) >= 3 and int(ids[0]) > 0 and int(ids[1]) == 0
+                and np.array_equal(ids[1:], np.arange(len(ids) - 1, dtype=np.uint32))
+            )
+            if len(ids) > 1 and not startup_reset:
                 for row, (previous_id, current_id) in enumerate(zip(ids[:-1], ids[1:]), start=1):
                     _check_bin_counter(int(previous_id), int(current_id), self.bin_path, row, frame_size)
             raw_data = rows[:, 4:]
@@ -1074,7 +1208,20 @@ class EMGBinParser:
                 channels[negative] -= 0x1000000
             else:
                 channels = raw_data.reshape(-1, 16, 2).copy().view('>i2').reshape(-1, 16).astype(np.int32)
-            self.frames = _CompactFrameMapping(ids, channels)
+            self.raw_frame_ids = np.asarray(ids, dtype=np.uint32).copy()
+            self.original_frame_ids = self.raw_frame_ids
+            if startup_reset and self.allow_startup_reset:
+                # Keep the isolated first record and preserve payload order. The
+                # raw counter is retained separately because ID 0..N-2 repeats
+                # one value from the isolated first segment.
+                physical_rows = np.arange(len(ids), dtype=np.uint32)
+                self.frames = _CompactFrameMapping(physical_rows, channels)
+                self.counter_mode = 'startup_reset_segments'
+            else:
+                if startup_reset:
+                    for row, (previous_id, current_id) in enumerate(zip(ids[:-1], ids[1:]), start=1):
+                        _check_bin_counter(int(previous_id), int(current_id), self.bin_path, row, frame_size)
+                self.frames = _CompactFrameMapping(ids, channels)
             self.frame_count = len(self.frames)
 
         if not self.frames:
@@ -1347,18 +1494,200 @@ def device_sync_record_valid(h5_file, device_id, source_path=None):
         (source_path is None or fingerprint == _sync_source_fingerprint(source_path)))
 
 
+def _sync_attr_text(value):
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    return str(value) if value is not None else ''
+
+
+def _sync_attr_bool(value, default=False):
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('true', '1', 'yes', 'y', 'verified', 'strict_verified'):
+            return True
+        if text in ('false', '0', 'no', 'n', 'unverified'):
+            return False
+    if isinstance(value, bytes):
+        return _sync_attr_bool(_sync_attr_text(value), default)
+    return bool(value) if value is not None else bool(default)
+
+
+def _sync_nonempty_dataset(h5_file, name):
+    return name in h5_file and isinstance(h5_file[name], h5py.Dataset) and h5_file[name].shape and h5_file[name].shape[0] > 0
+
+
+def _sync_imu_output_names(h5_file, device_id):
+    """Return non-empty synchronized 100 Hz datasets for one physical device."""
+    return [f'imu{device_id}{label}_100hz' for label in ('a', 'b', 'c', 'd')
+            if _sync_nonempty_dataset(h5_file, f'imu{device_id}{label}_100hz')]
+
+
+def _sync_imu_source_present(h5_file, device_id):
+    """Detect physical IMU evidence without treating an empty output as success."""
+    prefix = f'imu{device_id}'
+    recorded_status = _sync_attr_text(h5_file.attrs.get(
+        f'sync_device_imu_status_dev{device_id}', '')).lower()
+    if recorded_status in ('success', 'synced', 'completed', 'missing', 'skipped', 'error'):
+        return True
+    for key in (f'{prefix}_num_imus', f'{prefix}_sensor_count'):
+        try:
+            if int(h5_file.attrs.get(key, 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    # These attrs and raw/BLE datasets describe a physical source.  A 100 Hz
+    # output alone is also evidence that an IMU was expected, but its presence
+    # never proves that the synchronization operation completed successfully.
+    for key in (f'{prefix}_ble_channels', f'{prefix}_hw_version',
+                f'{prefix}_time_alignment', f'{prefix}_alignment_confidence'):
+        value = h5_file.attrs.get(key)
+        if value not in (None, '', b''):
+            return True
+    for name, dataset in h5_file.items():
+        if (name.startswith(prefix) and not name.endswith('_100hz') and
+                isinstance(dataset, h5py.Dataset) and dataset.shape and dataset.shape[0] > 0):
+            return True
+    return bool(_sync_imu_output_names(h5_file, device_id))
+
+
+def _sync_imu_required_output(h5_file, device_id):
+    """Check that every declared physical IMU has a non-empty 100 Hz output."""
+    names = _sync_imu_output_names(h5_file, device_id)
+    count = 0
+    for key in (f'imu{device_id}_num_imus', f'imu{device_id}_sensor_count'):
+        try:
+            count = int(h5_file.attrs.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            break
+    if count > 0:
+        if count > 4:
+            return False
+        expected = [f'imu{device_id}{label}_100hz' for label in ('a', 'b', 'c', 'd')[:count]]
+        return all(_sync_nonempty_dataset(h5_file, name) for name in expected)
+    return bool(names)
+
+
+def _sync_imu_ready_for_repeat(h5_file, device_id, imu_bin_path):
+    """Whether a requested IMU source is complete enough for an EMG skip."""
+    if not imu_bin_path:
+        return True
+    status = _sync_attr_text(h5_file.attrs.get(
+        f'sync_device_imu_status_dev{device_id}', '')).strip().lower()
+    if status in ('skipped', 'missing', 'error', 'failed'):
+        return False
+    if not _sync_imu_required_output(h5_file, device_id):
+        return False
+    # A paired one-to-one rerun must be allowed to upgrade outputs produced by
+    # older code.  Missing provenance attrs therefore deliberately mean
+    # "not ready" rather than an optimistic skip.
+    count = 0
+    for key in (f'imu{device_id}_num_imus', f'imu{device_id}_sensor_count'):
+        try:
+            count = int(h5_file.attrs.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            break
+    names = [f'imu{device_id}{label}_100hz' for label in ('a', 'b', 'c', 'd')[:count]]
+    if not names:
+        names = _sync_imu_output_names(h5_file, device_id)
+    for name in names:
+        ds = h5_file.get(name)
+        if ds is None or not bool(ds.attrs.get('sync_full_bin_preserved', False)):
+            return False
+        source_bin = _sync_attr_text(ds.attrs.get('source_bin', '')).strip()
+        if not source_bin or os.path.basename(source_bin) != os.path.basename(imu_bin_path):
+            return False
+        try:
+            source_count = int(ds.attrs['sync_source_frame_count'])
+            output_count = int(ds.attrs['sync_output_frame_count'])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if source_count <= 0 or output_count != len(ds) or output_count != source_count:
+            return False
+    return bool(names)
+
+
+def _sync_imu_strict_verified(h5_file, device_id):
+    value = h5_file.attrs.get(f'sync_device_imu_verified_dev{device_id}', None)
+    if value is None:
+        value = h5_file.attrs.get(f'imu{device_id}_verified', None)
+    if value is None:
+        confidence = _sync_attr_text(h5_file.attrs.get(f'imu{device_id}_alignment_confidence', '')).lower()
+        if not confidence:
+            for name in _sync_imu_output_names(h5_file, device_id):
+                confidence = _sync_attr_text(h5_file[name].attrs.get(
+                    'sync_anchor_confidence', '')).lower()
+                if confidence:
+                    break
+        if confidence:
+            return confidence in ('verified', 'strict_verified')
+        return False
+    return _sync_attr_bool(value)
+
+
+def _sync_imu_legacy_evidence(h5_file, device_id):
+    prefix = f'imu{device_id}'
+    if any(_sync_attr_text(h5_file.attrs.get(key, '')).strip()
+           for key in (f'{prefix}_time_alignment', f'{prefix}_alignment_confidence')):
+        return True
+    return bool(_sync_imu_output_names(h5_file, device_id) and any(
+        _sync_attr_text(h5_file[name].attrs.get(key, '')).strip()
+        for name in _sync_imu_output_names(h5_file, device_id)
+        for key in ('sync_source_mode', 'sync_anchor_confidence')) or any(
+        _sync_attr_text(h5_file.attrs.get(key, '')).strip()
+        for key in (f'{prefix}_time_alignment', f'{prefix}_alignment_confidence')))
+
+
 def sync_status_summary(h5_file):
     required = derive_required_sync_devices(h5_file)
-    complete = bool(required) and all(device_sync_record_valid(h5_file, d) for d in required)
-    verified = complete and all(bool(h5_file.attrs.get(
-        f'sync_device_imu_verified_dev{d}', False)) for d in required)
+    emg_valid = {d: device_sync_record_valid(h5_file, d) for d in required}
+    emg_complete = bool(required) and all(emg_valid.values())
+    imu_missing_devices = []
+    imu_unverified_devices = []
+    imu_evidence_missing_devices = []
+    physical_imu_devices = []
+    for device_id in required:
+        if not _sync_imu_source_present(h5_file, device_id):
+            continue
+        physical_imu_devices.append(device_id)
+        if not _sync_imu_required_output(h5_file, device_id):
+            imu_missing_devices.append(device_id)
+            continue
+        status = _sync_attr_text(h5_file.attrs.get(
+            f'sync_device_imu_status_dev{device_id}', '')).lower()
+        if status in ('skipped', 'missing', 'error'):
+            imu_missing_devices.append(device_id)
+            continue
+        legacy_evidence = _sync_imu_legacy_evidence(h5_file, device_id)
+        if status not in ('success', 'synced', 'completed') and not legacy_evidence:
+            imu_evidence_missing_devices.append(device_id)
+        if not _sync_imu_strict_verified(h5_file, device_id):
+            imu_unverified_devices.append(device_id)
+    imu_complete = bool(required) and not imu_missing_devices and not imu_evidence_missing_devices
+    complete = emg_complete and imu_complete
+    verified = complete and not imu_unverified_devices
     raw = h5_file.attrs.get('sync_status', 'unknown')
-    if isinstance(raw, bytes): raw = raw.decode('utf-8')
-    has_output = any(f'emg{d}_2khz_adc' in h5_file for d in (1, 2))
-    status = ('synced' if verified else 'unverified' if complete else
-              'partial' if any(device_sync_record_valid(h5_file, d) for d in required) else
-              'unverified' if has_output or raw in ('synced', 'unverified') else raw)
-    return dict(required_devices=required, complete=complete, verified=verified, status=status)
+    raw = _sync_attr_text(raw)
+    has_output = any(_sync_nonempty_dataset(h5_file, f'emg{d}_2khz_adc') for d in (1, 2))
+    if complete:
+        status = 'synced'
+    elif emg_complete and (imu_missing_devices or imu_evidence_missing_devices):
+        status = 'partial' if imu_missing_devices else 'unverified'
+    elif any(emg_valid.values()):
+        status = 'partial'
+    elif has_output or raw in ('synced', 'unverified', 'partial'):
+        status = 'unverified'
+    else:
+        status = raw
+    return dict(required_devices=required, complete=complete,
+                emg_complete=emg_complete, imu_complete=imu_complete,
+                physical_imu_devices=physical_imu_devices,
+                imu_unverified_devices=imu_unverified_devices,
+                imu_missing_devices=imu_missing_devices,
+                verified=verified, status=status)
 
 
 def update_sync_status(h5_file, device_id, *, source_path=None, imu_result=None,
@@ -1369,12 +1698,29 @@ def update_sync_status(h5_file, device_id, *, source_path=None, imu_result=None,
     prefix = 'sync_device_'
     h5_file.attrs[f'{prefix}status_dev{device_id}'] = 'synced'
     h5_file.attrs[f'{prefix}validation_dev{device_id}'] = bool(validation_passed)
-    # Missing an IMU bin is unverified if this source contains physical IMU data.
-    has_imu = any(name.startswith(f'imu{device_id}') and isinstance(ds, h5py.Dataset)
-                  and ds.shape and ds.shape[0] > 0 for name, ds in h5_file.items())
-    imu_verified = imu_result.get('imu_verified', not has_imu)
-    if has_imu and imu_result.get('imu_status') == 'skipped': imu_verified = False
-    h5_file.attrs[f'{prefix}imu_verified_dev{device_id}'] = bool(imu_verified)
+    incoming_imu_status = _sync_attr_text(imu_result.get('imu_status', '')).lower()
+    result_status = _sync_attr_text(imu_result.get('status', '')).lower()
+    result_reason = _sync_attr_text(imu_result.get('reason', '')).lower()
+    existing_imu_status = _sync_attr_text(h5_file.attrs.get(
+        f'{prefix}imu_status_dev{device_id}', '')).lower()
+    has_imu = _sync_imu_source_present(h5_file, device_id)
+    # A repeat request is deliberately read-only for IMU provenance: the
+    # skipped result must not erase a prior successful output or its confidence.
+    preserve_imu = (result_status == 'skipped' and
+                    result_reason in ('already_synced', 'already_validated') and
+                    not incoming_imu_status)
+    if not preserve_imu:
+        if incoming_imu_status == 'success':
+            imu_status = 'success'
+            imu_verified = _sync_attr_bool(imu_result.get('imu_verified', False))
+        elif has_imu:
+            imu_status = incoming_imu_status or 'missing'
+            imu_verified = False
+        else:
+            imu_status = 'not_present'
+            imu_verified = True
+        h5_file.attrs[f'{prefix}imu_status_dev{device_id}'] = imu_status
+        h5_file.attrs[f'{prefix}imu_verified_dev{device_id}'] = bool(imu_verified)
     if source_path:
         h5_file.attrs[f'{prefix}source_fingerprint_dev{device_id}'] = _sync_source_fingerprint(source_path)
     summary = sync_status_summary(h5_file)
@@ -1388,6 +1734,7 @@ def update_sync_status(h5_file, device_id, *, source_path=None, imu_result=None,
     details = []
     for did in summary['required_devices']:
         details.append(dict(device_id=did, valid=device_sync_record_valid(h5_file, did),
+            imu_status=_sync_attr_text(h5_file.attrs.get(f'{prefix}imu_status_dev{did}', '')),
             imu_verified=bool(h5_file.attrs.get(f'{prefix}imu_verified_dev{did}', False)),
             source_fingerprint=str(h5_file.attrs.get(f'{prefix}source_fingerprint_dev{did}', ''))))
     h5_file.attrs['sync_device_results'] = json.dumps(details, ensure_ascii=False)
@@ -2183,6 +2530,20 @@ def _get_250hz_anchor_sd_frame_ids(data_250hz, bin_offset=0):
             + int(bin_offset) + (DOWNSAMPLE_RATIO - 1)), 'row_index'
 
 
+def _anchor_ids_strictly_increasing(anchor_sd_frame_ids):
+    """Whether every currently supplied ADC anchor is strictly increasing."""
+    values = np.asarray(anchor_sd_frame_ids, dtype=np.int64)
+    return len(values) <= 1 or bool(np.all(np.diff(values) > 0))
+
+
+def _h5_counter_ids_strictly_increasing(data_250hz):
+    """Require every explicit H5 counter column to be monotonic."""
+    names = data_250hz.dtype.names or ()
+    counters = [np.asarray(data_250hz[name], dtype=np.int64)
+                for name in ('frame_id', 'sd_frame_id') if name in names]
+    return all(_anchor_ids_strictly_increasing(values) for values in counters)
+
+
 def _verify_anchor_matches(parser, channels_250hz, channel_map, anchor_sd_frame_ids, num_check=200):
     total = len(channels_250hz)
     if total == 0:
@@ -2215,18 +2576,132 @@ def _verify_anchor_matches(parser, channels_250hz, channel_map, anchor_sd_frame_
     return matched, checked, match_rate, mismatch_details
 
 
-def _recover_one_to_one_anchors(parser, channels_250hz, channel_map):
+def _recover_first_ble_epoch_anchors(parser, data_250hz, channels_250hz,
+                                     channel_map, whole_row_result):
+    """Recover only a complete first BLE epoch from a multi-epoch H5 dataset.
+
+    This is deliberately narrower than the ordinary ADC row scan.  It accepts
+    only a strict-counter bin, an explicit H5 counter reset near zero, exact
+    row identity for the entire first epoch, and enough source-span evidence
+    to time the complete physical bin safely.  Later H5 epochs remain
+    unanchored and are reported as audit coverage gaps.
+    """
+    if getattr(parser, 'counter_mode', 'strict') != 'strict':
+        return None
+    names = data_250hz.dtype.names or ()
+    counter_names = [name for name in ('frame_id', 'sd_frame_id') if name in names]
+    if not counter_names or len(data_250hz) < 2:
+        return None
+    nearzero_limit = max(8, DOWNSAMPLE_RATIO)
+    reset_candidates = []
+    counter_arrays = {}
+    for name in counter_names:
+        counters = np.asarray(data_250hz[name], dtype=np.int64)
+        counter_arrays[name] = counters
+        reset_rows = np.flatnonzero(
+            (np.diff(counters) < 0) & (counters[1:] <= nearzero_limit))
+        if len(reset_rows):
+            reset_candidates.append((int(reset_rows[0]), name))
+    if not reset_candidates:
+        return None
+    first_epoch_end = min(row for row, _name in reset_candidates) + 1
+    counter_name = min(reset_candidates, key=lambda item: item[0])[1]
+    counters = counter_arrays[counter_name]
+    if first_epoch_end < 40 or int(counters[first_epoch_end]) > nearzero_limit:
+        return None
+    first_counters = counters[:first_epoch_end]
+    if np.any(np.diff(first_counters) <= 0):
+        return None
+
+    matched_map = whole_row_result.get('matched_row_map', {})
+    first_map = {
+        int(row): int(sd) for row, sd in matched_map.items()
+        if int(row) < first_epoch_end
+    }
+    if len(first_map) < 40 or len(first_map) != first_epoch_end:
+        return None
+
+    ordered = sorted(first_map.items())
+    source_ids = np.asarray([sd for _, sd in ordered], dtype=np.int64)
+    if len(source_ids) < 40 or np.any(np.diff(source_ids) <= 0):
+        return None
+    times = np.asarray(data_250hz['time'][[row for row, _ in ordered]], dtype=np.float64) \
+        if 'time' in names else np.empty(0, dtype=np.float64)
+    if len(times) != len(source_ids) or not np.all(np.isfinite(times)) \
+            or np.any(np.diff(times) <= 0):
+        return None
+    vectors = np.asarray(channels_250hz[[row for row, _ in ordered]])
+    if vectors.ndim != 2 or vectors.shape[1] != 16 \
+            or len(np.unique(vectors, axis=0)) < 40:
+        return None
+
+    source_keys = np.asarray(sorted(parser.frames), dtype=np.int64)
+    if len(source_keys) == 0:
+        return None
+    source_indices = np.searchsorted(source_keys, source_ids)
+    if np.any(source_indices >= len(source_keys)) \
+            or np.any(source_keys[source_indices] != source_ids):
+        return None
+    source_n = len(source_keys)
+    prefix_uncovered = int(source_indices[0])
+    suffix_uncovered = int(source_n - 1 - source_indices[-1])
+    # A paired 2 kHz bin may start/end outside the BLE epoch by up to two
+    # seconds.  This is a partial-epoch safeguard only; ordinary ADC paths
+    # retain their existing 95% validation threshold.
+    edge_limit = 4000
+    source_span = int(source_indices[-1] - source_indices[0] + 1)
+    source_coverage = source_span / max(1, source_n)
+    if source_coverage < 0.80 or prefix_uncovered > edge_limit \
+            or suffix_uncovered > edge_limit:
+        return None
+
+    anchors = np.full(len(channels_250hz), -1, dtype=np.int64)
+    for row, sd_fid in ordered:
+        anchors[row] = sd_fid
+    return {
+        'anchors': anchors,
+        'partial_epoch_recovery': True,
+        'counter_name': counter_name,
+        'first_epoch_rows': int(first_epoch_end),
+        'first_epoch_time_start': float(times[0]),
+        'first_epoch_time_end': float(times[-1]),
+        'whole_h5_rows': int(len(data_250hz)),
+        'uncovered_rows': int(len(data_250hz) - first_epoch_end),
+        'whole_h5_match_rate': float(whole_row_result.get('match_rate', 0.0)),
+        'epoch_match_rate': 1.0,
+        'source_n': int(source_n),
+        'source_span': source_span,
+        'source_coverage': float(source_coverage),
+        'source_prefix_uncovered': prefix_uncovered,
+        'source_suffix_uncovered': suffix_uncovered,
+        'source_edge_limit': int(edge_limit),
+    }
+
+
+def _recover_one_to_one_anchors(parser, channels_250hz, channel_map, data_250hz=None):
     row_result = _scan_bin_for_h5_rows(parser, channels_250hz, channel_map)
     threshold = VALIDATION_CONFIG['adc_match_threshold']
-    if not row_result.get('found') or row_result.get('match_rate', 0.0) < threshold:
-        return None, row_result
-
-    matched_map = row_result.get('matched_row_map', {})
-    anchors = np.full(len(channels_250hz), -1, dtype=np.int64)
-    for row_idx, sd_fid in matched_map.items():
-        anchors[int(row_idx)] = int(sd_fid)
-
-    return anchors, row_result
+    if data_250hz is not None:
+        partial = _recover_first_ble_epoch_anchors(
+            parser, data_250hz, channels_250hz, channel_map, row_result)
+        if partial is not None:
+            row_result = dict(row_result)
+            row_result.update(partial)
+            return partial['anchors'], row_result
+        # A reset/duplicate counter cannot silently fall back to the ordinary
+        # whole-H5 row map: that would import a later epoch as if it belonged
+        # to the paired bin.  The caller will fail closed after this result.
+        if not _h5_counter_ids_strictly_increasing(data_250hz):
+            row_result = dict(row_result)
+            row_result['reason'] = 'H5 counter anchors are not strictly increasing and partial recovery was not admitted'
+            return None, row_result
+    if row_result.get('found') and row_result.get('match_rate', 0.0) >= threshold:
+        matched_map = row_result.get('matched_row_map', {})
+        anchors = np.full(len(channels_250hz), -1, dtype=np.int64)
+        for row_idx, sd_fid in matched_map.items():
+            anchors[int(row_idx)] = int(sd_fid)
+        return anchors, row_result
+    return None, row_result
 
 
 def _round_to_imu_boundary(value):
@@ -2521,7 +2996,9 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
 
     with h5py.File(h5_path, 'r+') as f:
         current_status = f.attrs.get('sync_status', 'unknown')
-        if current_status in ('synced', 'unverified') and device_sync_record_valid(f, device_id, emg_bin_path):
+        if (current_status in ('synced', 'unverified', 'partial')
+                and device_sync_record_valid(f, device_id, emg_bin_path)
+                and _sync_imu_ready_for_repeat(f, device_id, imu_bin_path)):
             if not _synced_file_needs_prompt_coverage_resync(f, device_id):
                 log("警告: 文件已同步，跳过")
                 return {'status': 'skipped', 'reason': 'already_synced'}
@@ -2544,7 +3021,20 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
         channel_map, resolved_name = _resolve_channel_map(f, ds_250hz_name, channel_map_name)
         log(f"通道映射: {resolved_name}")
 
-    parser = EMGBinParser(emg_bin_path, **emg_kwargs).parse()
+    startup_recovery = False
+    try:
+        parser = EMGBinParser(emg_bin_path, **emg_kwargs).parse()
+    except ValueError as exc:
+        # The recovery is deliberately narrow: only a verified one-to-one
+        # recording may opt into the observed one-frame startup counter reset.
+        if not verify or 'reset_or_reorder' not in str(exc):
+            raise
+        parser = EMGBinParser(
+            emg_bin_path, allow_startup_reset=True, **emg_kwargs).parse()
+        if parser.counter_mode != 'startup_reset_segments':
+            raise
+        startup_recovery = True
+        log('[one_to_one] 采用受限 startup-reset 分段解析，保留原始帧号和行序')
     _ni = 2
     try:
         with h5py.File(h5_path, 'r') as _f:
@@ -2564,6 +3054,8 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
     align_model = 'pick'
     align_tier = 'exact'
     align_exact_frac = 1.0
+    ble_epoch_warning = None
+    ble_imu_time_window = None
 
     # ---- ADC 校验：H5 row i 的 250Hz ADC == bin frame sd_frame_id + fid0 ----
     anchor_sd_frame_ids, frame_id_mode = _get_250hz_anchor_sd_frame_ids(data_250hz, bin_offset)
@@ -2599,9 +3091,14 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
         match_rate = matched / checked if checked > 0 else 0.0
         log(f"ADC 校验: {matched}/{checked} matched, rate={match_rate:.3f}")
 
-        if match_rate >= VALIDATION_CONFIG['adc_match_threshold']:
+        if (match_rate >= VALIDATION_CONFIG['adc_match_threshold']
+                and _anchor_ids_strictly_increasing(anchor_sd_frame_ids)
+                and _h5_counter_ids_strictly_increasing(data_250hz)):
             firmware_mode = 'exact'
         else:
+            if match_rate >= VALIDATION_CONFIG['adc_match_threshold']:
+                log('[one_to_one] 初始 ADC 抽样命中率虽达阈值，但全量 anchor 非严格递增；'
+                    '转入偏移/逐行恢复，避免跨 epoch 锚点直接写入')
             # ---- 回退 1：带限相关 + 帧号偏移搜索 ----
             # 覆盖两种情形：(a) 新固件在 BLE 路径先抗混叠低通再抽取，250Hz 样本不再
             # 等于任何单个 SD 帧；(b) bin 与 H5 的帧号基准相差一个未知常量 k。
@@ -2614,7 +3111,9 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
             for line in offset_result['report_lines']:
                 log(f"  {line}")
 
-            if offset_result['passed']:
+            if (offset_result['passed']
+                    and _anchor_ids_strictly_increasing(anchor_sd_frame_ids)
+                    and _h5_counter_ids_strictly_increasing(data_250hz)):
                 bin_base = int(offset_result['bin_base'])
                 match_rate = float(offset_result['best_corr'])
                 checked = int(offset_result['checked'])
@@ -2628,18 +3127,55 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
                     f"模型={align_model}, 命中率={align_exact_frac:.2%}, "
                     f"mean r={match_rate:.4f} -> firmware_mode={firmware_mode}")
             else:
+                if (offset_result.get('passed') and
+                        (not _anchor_ids_strictly_increasing(anchor_sd_frame_ids) or
+                         not _h5_counter_ids_strictly_increasing(data_250hz))):
+                    offset_result = dict(offset_result)
+                    offset_result['passed'] = False
+                    offset_result['reason'] = 'all existing ADC anchors are not strictly increasing'
+                    log('[one_to_one] 偏移搜索相关性虽通过，但全量 anchor 非严格递增；'
+                        '转入逐行 ADC/partial 恢复')
                 # ---- 回退 2：逐行 ADC 扫描（精确匹配，任意偏移的旧固件 bin） ----
-                recovered_anchors, scan_result = _recover_one_to_one_anchors(parser, channels_250hz, channel_map)
+                recovered_anchors, scan_result = _recover_one_to_one_anchors(
+                    parser, channels_250hz, channel_map, data_250hz=data_250hz)
                 if recovered_anchors is not None:
                     anchor_sd_frame_ids = recovered_anchors
                     frame_id_mode = 'adc_row_scan'
                     # 行扫描给出的是 bin 内的绝对帧号，不能再叠加 bin_base
                     bin_base = 0
                     anchor_position = int(scan_result['start_sd_frame_id'] % DOWNSAMPLE_RATIO)
-                    match_rate = float(scan_result.get('match_rate', 0.0))
-                    checked = int(scan_result.get('matched_rows', 0))
+                    match_rate = float(scan_result.get(
+                        'epoch_match_rate', scan_result.get('match_rate', 0.0)))
+                    checked = int(scan_result.get(
+                        'first_epoch_rows', scan_result.get('matched_rows', 0)))
                     matched = checked
                     firmware_mode = 'exact'
+                    if scan_result.get('partial_epoch_recovery'):
+                        ble_epoch_warning = {
+                            key: scan_result[key] for key in (
+                                'first_epoch_rows', 'whole_h5_rows', 'uncovered_rows',
+                                'whole_h5_match_rate', 'epoch_match_rate', 'source_n',
+                                'source_span', 'source_coverage',
+                                'source_prefix_uncovered', 'source_suffix_uncovered',
+                                'source_edge_limit') if key in scan_result
+                        }
+                        ble_epoch_warning['note'] = 'later_ble_epochs_without_paired_bin'
+                        # H5 reset epochs can reuse relative IMU frame IDs.
+                        # Keep the IMU clock anchored to the EMG epoch proven
+                        # to belong to this bin, including one 100 Hz edge
+                        # period for boundary anchors.
+                        first_start = float(scan_result['first_epoch_time_start'])
+                        first_end = float(scan_result['first_epoch_time_end'])
+                        edge = 1.0 / 100.0
+                        ble_imu_time_window = (first_start - edge, first_end + edge)
+                        ble_epoch_warning['imu_time_window_start'] = float(ble_imu_time_window[0])
+                        ble_epoch_warning['imu_time_window_end'] = float(ble_imu_time_window[1])
+                        log(
+                            f"[one_to_one] 仅恢复首 BLE epoch: "
+                            f"{ble_epoch_warning['first_epoch_rows']}/"
+                            f"{ble_epoch_warning['whole_h5_rows']} H5行, "
+                            f"source coverage={ble_epoch_warning['source_coverage']:.3f}; "
+                            f"后续未配对 epoch={ble_epoch_warning['uncovered_rows']} 行")
                     log(
                         f"[one_to_one] H5 sd_frame_id 校验失败，已通过 ADC 行扫描恢复: "
                         f"matched_rows={checked}/{num_frames_250hz}, rate={match_rate:.3f}, "
@@ -2649,6 +3185,17 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
                 else:
                     scan_rate = float(scan_result.get('match_rate', 0.0)) if scan_result else 0.0
                     log(f"[one_to_one] ADC 行扫描未找到可靠锚点: rate={scan_rate:.3f}")
+
+        if startup_recovery and align_tier != 'exact':
+            error_detail = (
+                'startup_reset recovery requires exact ADC row identity; '
+                f'align_tier={align_tier or "none"}')
+            return {
+                'status': 'validation_failed',
+                'reason': error_detail,
+                'match_rate': match_rate, 'checked': checked, 'matched': matched,
+                'mismatch_details': mismatch_details,
+            }
 
         # filtered 模式下 match_rate 是相关系数，不与精确匹配阈值比较
         if firmware_mode is None:
@@ -2693,6 +3240,9 @@ def sync_h5_one_to_one(h5_path, emg_bin_path, imu_bin_path=None, device_id=1,
         firmware_mode=firmware_mode or 'exact',
         align_model=align_model, align_tier=align_tier,
         align_exact_frac=align_exact_frac,
+        startup_recovery=startup_recovery,
+        ble_epoch_warning=ble_epoch_warning,
+        ble_imu_time_window=ble_imu_time_window,
     )
 
 
@@ -2937,13 +3487,24 @@ def _enumerate_2khz_from_bin(emg_parser, channel_map, x_anchor, bin_base,
     # Retain those samples with signed labels rather than clamping or wrapping.
     id_dtype = '<i8' if np.any(x_kept < 0) else '<u4'
 
-    data_2khz = np.empty(len(bin_kept), dtype=np.dtype([
+    fields = [
         ("channels", "<i4", (16,)),
         ("sd_frame_id", id_dtype),
         ("time", "<f8"),
-    ]))
+    ]
+    startup_recovery = getattr(emg_parser, 'counter_mode', 'strict') == 'startup_reset_segments'
+    if startup_recovery:
+        fields.extend([("source_bin_row", "<u8"), ("raw_sd_frame_id", "<u4")])
+    data_2khz = np.empty(len(bin_kept), dtype=np.dtype(fields))
     data_2khz['sd_frame_id'] = x_kept
     data_2khz['time'] = intercept + slope * x_kept.astype(np.float64)
+    if startup_recovery:
+        raw_ids = np.asarray(emg_parser.raw_frame_ids, dtype=np.uint32)
+        source_rows = np.asarray(bin_kept, dtype=np.int64)
+        if np.any(source_rows < 0) or np.any(source_rows >= len(raw_ids)):
+            return None, {'reason': 'startup recovery source rows outside raw bin'}
+        data_2khz['source_bin_row'] = source_rows.astype(np.uint64)
+        data_2khz['raw_sd_frame_id'] = raw_ids[source_rows]
     if anchor_times is not None:
         anchor_ids = np.asarray(x_anchor, dtype=np.int64) + int(bin_base) - int(label_offset)
         anchor_times = np.asarray(anchor_times, dtype=np.float64)
@@ -3034,7 +3595,9 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
                           anchor_position=DOWNSAMPLE_RATIO - 1,
                           bin_base=0, firmware_mode='exact',
                           align_model='pick', align_tier='exact', align_exact_frac=1.0,
-                          label_offset=None, align_offset_attr=None, full_bin=True):
+                          label_offset=None, align_offset_attr=None, full_bin=True,
+                          startup_recovery=False, ble_epoch_warning=None,
+                          ble_imu_time_window=None):
     """构建并写入 2kHz 数据 + IMU 100Hz 数据到 H5（共享逻辑）。
 
     sync_match_rate: 成功路径写入 sync_offset_match_rate_dev{device_id} 供 UI 展示
@@ -3060,6 +3623,11 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
     if label_offset is None:
         label_offset = int(bin_base)
     label_offset = int(label_offset)
+    startup_recovery = bool(startup_recovery or
+                            getattr(emg_parser, 'counter_mode', 'strict') == 'startup_reset_segments')
+    ble_epoch_warning = dict(ble_epoch_warning or {})
+    ble_uncovered_rows = int(ble_epoch_warning.get('uncovered_rows', 0))
+    ble_coverage_note = str(ble_epoch_warning.get('note', ''))
     # 250Hz 的 channels 不再参与 2kHz 构建（输出完全来自 bin），只需要时间戳来定基准
     timestamps_250hz = data_250hz['time']
 
@@ -3144,6 +3712,23 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         ds_2khz.attrs["sync_output_frame_count"] = int(num_frames_2khz)
         ds_2khz.attrs["sync_full_bin_preserved"] = bool(full_bin and num_frames_2khz == len(emg_parser.frames))
         ds_2khz.attrs["sync_ble_anchor_count"] = int(num_frames_250hz)
+        ds_2khz.attrs["sync_ble_uncovered_rows"] = ble_uncovered_rows
+        ds_2khz.attrs["sync_ble_uncovered_count"] = ble_uncovered_rows
+        ds_2khz.attrs["sync_ble_coverage_note"] = ble_coverage_note
+        ds_2khz.attrs["sync_ble_validation_scope"] = (
+            'paired_bin_first_ble_epoch' if ble_epoch_warning else 'whole_h5')
+        if ble_epoch_warning:
+            ds_2khz.attrs["sync_ble_first_epoch_rows"] = int(ble_epoch_warning['first_epoch_rows'])
+            ds_2khz.attrs["sync_ble_whole_h5_rows"] = int(ble_epoch_warning['whole_h5_rows'])
+            ds_2khz.attrs["sync_ble_whole_h5_match_rate"] = float(ble_epoch_warning['whole_h5_match_rate'])
+            ds_2khz.attrs["sync_ble_source_coverage"] = float(ble_epoch_warning['source_coverage'])
+            ds_2khz.attrs["sync_ble_source_prefix_uncovered"] = int(ble_epoch_warning['source_prefix_uncovered'])
+            ds_2khz.attrs["sync_ble_source_suffix_uncovered"] = int(ble_epoch_warning['source_suffix_uncovered'])
+            ds_2khz.attrs["sync_ble_source_edge_limit"] = int(ble_epoch_warning['source_edge_limit'])
+            ds_2khz.attrs["sync_ble_epoch_match_rate"] = float(ble_epoch_warning['epoch_match_rate'])
+            ds_2khz.attrs["sync_ble_imu_time_window"] = json.dumps([
+                float(ble_epoch_warning['imu_time_window_start']),
+                float(ble_epoch_warning['imu_time_window_end'])])
         # bin 驱动写入的审计信息：旧蓝牙网格漏掉多少帧（= "h5 显示丢帧但 bin 没丢帧"），
         # 以及时间基准拟合参数（斜率只用标称 8 帧配对的中位数，恒为 1/2000）
         ds_2khz.attrs["sync_2khz_source"] = "bin_contiguous"
@@ -3167,13 +3752,46 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         _align_attr = int(bin_base if align_offset_attr is None else align_offset_attr)
         ds_2khz.attrs["sync_bin_fid0"] = int(getattr(emg_parser, 'fid0', 0))
         ds_2khz.attrs["sync_bin_align_offset"] = _align_attr
-        ds_2khz.attrs["sync_bin_align_offset_scope"] = 'single_source'
+        ds_2khz.attrs["sync_bin_align_offset_scope"] = (
+            'source_bin_row' if startup_recovery else 'single_source')
         if 'sync_source_segments' in ds_2khz.attrs:
             del ds_2khz.attrs['sync_source_segments']
         ds_2khz.attrs["sync_firmware_type"] = str(firmware_mode)
         ds_2khz.attrs["sync_align_model"] = str(align_model)
         ds_2khz.attrs["sync_align_tier"] = str(align_tier)
         ds_2khz.attrs["sync_align_exact_frac"] = float(align_exact_frac)
+        if startup_recovery:
+            raw_ids = np.asarray(emg_parser.raw_frame_ids, dtype=np.uint32)
+            ds_2khz.attrs['sync_counter_mode'] = 'startup_reset_segments'
+            ds_2khz.attrs['sync_raw_counter_usable'] = False
+            ds_2khz.attrs['sync_source_row_field'] = 'source_bin_row'
+            ds_2khz.attrs['sync_raw_id_field'] = 'raw_sd_frame_id'
+            ds_2khz.attrs['sync_startup_reset_time_note'] = (
+                'isolated first sample time is nominally extrapolated by 1/2000 s from payload order')
+            ds_2khz.attrs['sync_startup_reset_first_raw_id'] = int(raw_ids[0])
+            ds_2khz.attrs['sync_startup_reset_first_row'] = 0
+            ds_2khz.attrs['sync_startup_reset_segment_start_row'] = 1
+            ds_2khz.attrs['sync_source_segments'] = json.dumps([
+                {
+                    'segment': 'isolated_startup_frame',
+                    'source_bin_row_start': 0,
+                    'source_bin_row_end': 0,
+                    'raw_frame_id': int(raw_ids[0]),
+                    'note': ('raw counter is not usable for this isolated leading sample; '
+                             'time uses nominal 1/2000 s payload-order extrapolation'),
+                },
+                {
+                    'segment': 'post_reset_contiguous',
+                    'source_bin_row_start': 1,
+                    'source_bin_row_end': int(len(raw_ids) - 1),
+                    'raw_frame_id_start': int(raw_ids[1]),
+                    'raw_frame_id_end': int(raw_ids[-1]),
+                    'note': 'rows preserved in payload order; timing labels are logical',
+                },
+            ], ensure_ascii=False)
+        else:
+            ds_2khz.attrs['sync_counter_mode'] = 'strict'
+            ds_2khz.attrs['sync_raw_counter_usable'] = True
         ds_2khz.attrs["prompt_coverage_extended"] = bool(extension_info['extra_frames'] > 0)
         if extension_info['extra_frames'] > 0:
             ds_2khz.attrs["prompt_coverage_extra_frames"] = int(extension_info['extra_frames'])
@@ -3183,40 +3801,76 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
             ds_2khz.attrs["prompt_coverage_mode"] = "extend_from_sd_bin"
 
         # IMU 同步（复用原逻辑）
-        imu_result = _sync_imu_100hz(f, emg_parser, imu_parser, data_2khz, device_id)
+        imu_result = _sync_imu_100hz(
+            f, emg_parser, imu_parser, data_2khz, device_id, full_bin=full_bin,
+            ble_time_window=ble_imu_time_window)
 
-        # sync attrs (Issue 4: include match_rate)
-        if set_synced:
-            f.attrs["sync_time"] = datetime.now().isoformat()
-            f.attrs["sync_mode"] = sync_mode
-            if "sync_error" in f.attrs:
-                del f.attrs["sync_error"]
-            f.attrs[f"sync_bin_offset_dev{device_id}"] = int(bin_offset)
-            f.attrs[f"sync_bin_fid0_dev{device_id}"] = int(getattr(emg_parser, 'fid0', 0))
-            f.attrs[f"sync_bin_align_offset_dev{device_id}"] = _align_attr
-            if sync_match_rate is not None:
-                f.attrs[f"sync_offset_match_rate_dev{device_id}"] = float(sync_match_rate)
-            f.attrs["sync_firmware_type"] = str(firmware_mode)
-            f.attrs[f"sync_align_model_dev{device_id}"] = str(align_model)
-            f.attrs[f"sync_align_tier_dev{device_id}"] = str(align_tier)
-            f.attrs[f"sync_align_exact_frac_dev{device_id}"] = float(align_exact_frac)
-            if firmware_mode in ('filtered', 'approx'):
-                # 偏移搜索路径下 match_rate 是带限相关系数，单独记录以免与精确匹配率混淆
-                f.attrs[f"sync_filtered_corr_dev{device_id}"] = float(sync_match_rate or 0.0)
-            f.attrs["sync_frame_id_mode"] = sync_frame_id_mode
-            f.attrs["sync_bin_offset_mode"] = "none" if bin_offset == 0 else "adc_search"
-            f.attrs["sync_time_alignment"] = "anchor_sample"
-            f.attrs["sync_250hz_anchor_position"] = int(anchor_position)
-            f.attrs["sync_2khz_sample_interval"] = 0.0005
-            if extension_info['extra_frames'] > 0:
-                f.attrs["sync_prompt_coverage_repair"] = True
-                f.attrs[f"sync_prompt_coverage_extra_frames_dev{device_id}"] = int(extension_info['extra_frames'])
-            detail = {'mode': sync_mode, 'offset': bin_offset, 'filled': filled_frames, 'missing': missing_frames}
-            if sync_match_rate is not None:
-                detail['match_rate'] = float(sync_match_rate)
-            if extension_info['extra_frames'] > 0:
-                detail['prompt_coverage_extra_frames'] = int(extension_info['extra_frames'])
-            append_sync_history(f, action='sync', status='synced', details=detail)
+        # Device provenance is written even while GUI defers aggregate publication.
+        f.attrs["sync_time"] = datetime.now().isoformat()
+        f.attrs["sync_mode"] = sync_mode
+        if "sync_error" in f.attrs:
+            del f.attrs["sync_error"]
+        f.attrs[f"sync_bin_offset_dev{device_id}"] = int(bin_offset)
+        f.attrs[f"sync_bin_fid0_dev{device_id}"] = int(getattr(emg_parser, 'fid0', 0))
+        f.attrs[f"sync_bin_align_offset_dev{device_id}"] = _align_attr
+        f.attrs[f"sync_bin_align_offset_scope_dev{device_id}"] = (
+            'source_bin_row' if startup_recovery else 'single_source')
+        f.attrs[f"sync_counter_mode_dev{device_id}"] = (
+            'startup_reset_segments' if startup_recovery else 'strict')
+        f.attrs[f"sync_raw_counter_usable_dev{device_id}"] = bool(not startup_recovery)
+        f.attrs[f"sync_ble_uncovered_rows_dev{device_id}"] = ble_uncovered_rows
+        f.attrs[f"sync_ble_uncovered_count_dev{device_id}"] = ble_uncovered_rows
+        f.attrs[f"sync_ble_coverage_note_dev{device_id}"] = ble_coverage_note
+        f.attrs[f"sync_ble_validation_scope_dev{device_id}"] = (
+            'paired_bin_first_ble_epoch' if ble_epoch_warning else 'whole_h5')
+        if ble_epoch_warning:
+            f.attrs[f"sync_ble_first_epoch_rows_dev{device_id}"] = int(ble_epoch_warning['first_epoch_rows'])
+            f.attrs[f"sync_ble_whole_h5_rows_dev{device_id}"] = int(ble_epoch_warning['whole_h5_rows'])
+            f.attrs[f"sync_ble_whole_h5_match_rate_dev{device_id}"] = float(ble_epoch_warning['whole_h5_match_rate'])
+            f.attrs[f"sync_ble_source_coverage_dev{device_id}"] = float(ble_epoch_warning['source_coverage'])
+            f.attrs[f"sync_ble_source_prefix_uncovered_dev{device_id}"] = int(ble_epoch_warning['source_prefix_uncovered'])
+            f.attrs[f"sync_ble_source_suffix_uncovered_dev{device_id}"] = int(ble_epoch_warning['source_suffix_uncovered'])
+            f.attrs[f"sync_ble_source_edge_limit_dev{device_id}"] = int(ble_epoch_warning['source_edge_limit'])
+            f.attrs[f"sync_ble_epoch_match_rate_dev{device_id}"] = float(ble_epoch_warning['epoch_match_rate'])
+            f.attrs[f"sync_ble_imu_time_window_dev{device_id}"] = json.dumps([
+                float(ble_epoch_warning['imu_time_window_start']),
+                float(ble_epoch_warning['imu_time_window_end'])])
+        if startup_recovery:
+            f.attrs[f"sync_startup_reset_first_raw_id_dev{device_id}"] = int(
+                np.asarray(emg_parser.raw_frame_ids, dtype=np.uint32)[0])
+        if sync_match_rate is not None:
+            f.attrs[f"sync_offset_match_rate_dev{device_id}"] = float(sync_match_rate)
+        f.attrs["sync_firmware_type"] = str(firmware_mode)
+        f.attrs[f"sync_align_model_dev{device_id}"] = str(align_model)
+        f.attrs[f"sync_align_tier_dev{device_id}"] = str(align_tier)
+        f.attrs[f"sync_align_exact_frac_dev{device_id}"] = float(align_exact_frac)
+        if firmware_mode in ('filtered', 'approx'):
+            # 偏移搜索路径下 match_rate 是带限相关系数，单独记录以免与精确匹配率混淆
+            f.attrs[f"sync_filtered_corr_dev{device_id}"] = float(sync_match_rate or 0.0)
+        f.attrs["sync_frame_id_mode"] = sync_frame_id_mode
+        f.attrs["sync_bin_offset_mode"] = "none" if bin_offset == 0 else "adc_search"
+        f.attrs["sync_time_alignment"] = "anchor_sample"
+        f.attrs["sync_250hz_anchor_position"] = int(anchor_position)
+        f.attrs["sync_2khz_sample_interval"] = 0.0005
+        if extension_info['extra_frames'] > 0:
+            f.attrs["sync_prompt_coverage_repair"] = True
+            f.attrs[f"sync_prompt_coverage_extra_frames_dev{device_id}"] = int(extension_info['extra_frames'])
+        detail = {'device_id': device_id, 'mode': sync_mode, 'offset': bin_offset,
+                  'filled': filled_frames, 'missing': missing_frames,
+                  'emg_validation_passed': bool(verify_passed),
+                  'imu_verified': bool(imu_result.get('imu_verified', False))}
+        if sync_match_rate is not None:
+            detail['match_rate'] = float(sync_match_rate)
+        if extension_info['extra_frames'] > 0:
+            detail['prompt_coverage_extra_frames'] = int(extension_info['extra_frames'])
+        if ble_epoch_warning:
+            detail['sync_ble_uncovered_rows'] = ble_uncovered_rows
+            detail['sync_ble_coverage_note'] = ble_coverage_note
+            detail['sync_ble_source_coverage'] = float(ble_epoch_warning['source_coverage'])
+            detail['sync_ble_validation_scope'] = 'paired_bin_first_ble_epoch'
+            detail['sync_ble_whole_h5_match_rate'] = float(ble_epoch_warning['whole_h5_match_rate'])
+            detail['sync_ble_epoch_match_rate'] = float(ble_epoch_warning['epoch_match_rate'])
+        append_sync_history(f, action='sync', status='success', details=detail)
 
         update_sync_status(f, device_id, source_path=emg_parser.bin_path,
                            imu_result=imu_result, validation_passed=bool(verify_passed),
@@ -3232,6 +3886,14 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         'status': 'success', 'frames_250hz': num_frames_250hz,
         'frames_2khz': num_frames_2khz, 'filled_frames': filled_frames,
         'missing_frames': missing_frames, 'bin_offset': bin_offset,
+        'sync_ble_uncovered_rows': ble_uncovered_rows,
+        'sync_ble_uncovered_count': ble_uncovered_rows,
+        'sync_ble_coverage_note': ble_coverage_note,
+        'sync_ble_source_coverage': float(ble_epoch_warning.get('source_coverage', 1.0)),
+        'sync_ble_validation_scope': (
+            'paired_bin_first_ble_epoch' if ble_epoch_warning else 'whole_h5'),
+        'sync_ble_whole_h5_match_rate': float(
+            ble_epoch_warning.get('whole_h5_match_rate', 1.0)),
         'prompt_coverage_extra_frames': int(extension_info['extra_frames']),
         'imu_status': imu_result.get('imu_status', 'skipped'),
         'imu_frames': imu_result.get('imu_frames', 0),
@@ -3248,8 +3910,22 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
     }
 
 
-def _iter_imu_ble_anchor_rows(h5_file, device_id):
-    """Yield BLE IMU rows as (imu_index, emg_sd_frame_id, time, acc)."""
+def _iter_imu_ble_anchor_rows(h5_file, device_id, time_window=None):
+    """Yield BLE IMU rows as (imu_index, emg_sd_frame_id, time, acc).
+
+    ``time_window`` is used only by the bounded first-BLE-epoch recovery path.
+    It prevents later reset epochs from reusing the same relative IMU frame
+    IDs as clock anchors for the first paired bin.
+    """
+    if time_window is not None:
+        window_start, window_end = map(float, time_window)
+    else:
+        window_start = window_end = None
+
+    def _in_window(t):
+        return (window_start is None or
+                window_start <= float(t) <= window_end)
+
     all_name = f'imu{device_id}_all_ble'
     if all_name in h5_file:
         ds = h5_file[all_name]
@@ -3258,6 +3934,8 @@ def _iter_imu_ble_anchor_rows(h5_file, device_id):
             has_frame = 'frame_id' in ds.dtype.names
             for row in ds:
                 if not np.isfinite(float(row['time'])):
+                    continue
+                if not _in_window(row['time']):
                     continue
                 if has_sd:
                     emg_sd = int(row['sd_frame_id'])
@@ -3281,6 +3959,8 @@ def _iter_imu_ble_anchor_rows(h5_file, device_id):
         for row in ds:
             if not np.isfinite(float(row['time'])):
                 continue
+            if not _in_window(row['time']):
+                continue
             if has_sd:
                 emg_sd = int(row['sd_frame_id'])
             elif has_frame:
@@ -3292,7 +3972,8 @@ def _iter_imu_ble_anchor_rows(h5_file, device_id):
 
 def _build_imu_frame_axis_from_ble(h5_file, imu_parser, device_id, num_imus,
                                    max_anchor_rows=3000, search_radius=3,
-                                   acc_tolerance=0.035, min_anchors=5):
+                                   acc_tolerance=0.035, min_anchors=5,
+                                   time_window=None):
     """Build a full IMU-bin frame axis using BLE IMU samples as independent time anchors."""
     if not imu_parser.frames:
         return None
@@ -3300,7 +3981,8 @@ def _build_imu_frame_axis_from_ble(h5_file, imu_parser, device_id, num_imus,
     anchors = []
     ambiguous_anchors = 0
     rejected_anchors = 0
-    for row_count, (imu_index, emg_sd, t, ble_acc) in enumerate(_iter_imu_ble_anchor_rows(h5_file, device_id)):
+    for row_count, (imu_index, emg_sd, t, ble_acc) in enumerate(
+            _iter_imu_ble_anchor_rows(h5_file, device_id, time_window=time_window)):
         if row_count >= max_anchor_rows:
             break
         if imu_index < 0 or imu_index >= num_imus:
@@ -3356,7 +4038,8 @@ def _build_imu_frame_axis_from_ble(h5_file, imu_parser, device_id, num_imus,
     }
 
 
-def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
+def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id,
+                    *, full_bin=False, ble_time_window=None):
     """IMU 100Hz 同步 — 支持 2/3 动态数量 IMU"""
     if imu_parser is None:
         return {'imu_status': 'skipped', 'imu_verified': True,
@@ -3364,9 +4047,19 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
     num_imus = imu_parser.num_imus
     labels = ['a', 'b', 'c', 'd'][:num_imus]
 
-    anchor_info = _build_imu_frame_axis_from_ble(h5_file, imu_parser, device_id, num_imus)
+    source_frame_ids = np.asarray(sorted(int(fid) for fid in imu_parser.frames), dtype=np.int64)
+    source_frame_count = int(len(source_frame_ids))
+    if source_frame_count == 0:
+        raise ValueError(f'IMU同步失败：IMU bin 没有可输出的帧（设备{device_id}）')
+
+    anchor_info = _build_imu_frame_axis_from_ble(
+        h5_file, imu_parser, device_id, num_imus,
+        time_window=ble_time_window)
     if anchor_info is not None:
-        imu_frame_ids_unique = anchor_info['frame_ids']
+        # BLE anchors provide the independent clock.  A paired full-bin output
+        # still contains every actual parser frame, including frames outside
+        # the BLE anchor span; missing counter values are not fabricated here.
+        imu_frame_ids_unique = source_frame_ids if full_bin else anchor_info['frame_ids']
         imu_time_by_frame = anchor_info['time_by_frame']
         imu_time_alignment = 'imu_ble_anchor_full_bin'
         log(
@@ -3376,19 +4069,46 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
             f"median_acc_err={anchor_info['median_acc_error']:.4f}"
         )
     else:
-        # Full paired-bin output can legitimately start before H5 counter 0.
-        # Such signed EMG labels are not physical unsigned IMU counter IDs.
+        # Without BLE, use the EMG-derived IMU IDs as time anchors.  This is
+        # enough to interpolate/extrapolate a paired IMU bin at 100 Hz, but an
+        # empty anchor set must fail instead of inventing an epoch at t=0.
         valid_emg_indices = np.flatnonzero(data_2khz['sd_frame_id'] >= 0)
         emg_sd_frame_ids = data_2khz['sd_frame_id'][valid_emg_indices]
         imu_frame_ids_all = emg_sd_frame_ids // EMG_IMU_RATIO
-        imu_frame_ids_unique = np.unique(imu_frame_ids_all)
-        imu_time_by_frame = {}
+        anchor_times_by_frame = {}
         for emg_idx, imu_fid_raw in enumerate(imu_frame_ids_all):
             imu_fid_int = int(imu_fid_raw)
-            if imu_fid_int not in imu_time_by_frame:
-                imu_time_by_frame[imu_fid_int] = float(data_2khz[valid_emg_indices[emg_idx]]['time'])
+            timestamp = float(data_2khz[valid_emg_indices[emg_idx]]['time'])
+            if np.isfinite(timestamp) and imu_fid_int not in anchor_times_by_frame:
+                anchor_times_by_frame[imu_fid_int] = timestamp
+        if not anchor_times_by_frame:
+            raise ValueError(
+                f'IMU同步失败：没有可用的 EMG-derived IMU 时间锚点（设备{device_id}）；'
+                '请提供 BLE IMU 锚点或包含有效时间戳的 EMG 2kHz 数据')
+        anchor_ids = np.asarray(sorted(anchor_times_by_frame), dtype=np.int64)
+        anchor_times = np.asarray([anchor_times_by_frame[int(fid)] for fid in anchor_ids], dtype=np.float64)
+        if len(anchor_ids) > 1 and (np.any(np.diff(anchor_times) <= 0) or not np.all(np.isfinite(anchor_times))):
+            raise ValueError(
+                f'IMU同步失败：EMG-derived IMU 时间锚点不是严格递增（设备{device_id}）')
+        if full_bin:
+            imu_frame_ids_unique = source_frame_ids
+            # Keep the EMG clock at known IDs, then extend both edges at the
+            # nominal 100 Hz interval to cover an IMU bin longer than EMG.
+            imu_time_values = np.interp(source_frame_ids, anchor_ids, anchor_times)
+            before = source_frame_ids < anchor_ids[0]
+            after = source_frame_ids > anchor_ids[-1]
+            imu_time_values[before] = anchor_times[0] + (source_frame_ids[before] - anchor_ids[0]) / 100.0
+            imu_time_values[after] = anchor_times[-1] + (source_frame_ids[after] - anchor_ids[-1]) / 100.0
+            if not np.all(np.diff(imu_time_values) > 0):
+                raise ValueError(
+                    f'IMU同步失败：外推后的 IMU 时间轴不是严格递增（设备{device_id}）')
+            imu_time_by_frame = {int(fid): float(t) for fid, t in zip(source_frame_ids, imu_time_values)}
+        else:
+            imu_frame_ids_unique = np.unique(imu_frame_ids_all)
+            imu_time_by_frame = {int(fid): float(anchor_times_by_frame[int(fid)])
+                                 for fid in imu_frame_ids_unique}
         imu_time_alignment = 'emg_time_fallback'
-        log("  WARN: no reliable BLE IMU anchor; falling back to EMG-derived IMU time axis")
+        log("  WARN: no reliable BLE IMU anchor; using EMG-derived IMU time anchors")
     num_imu_frames = len(imu_frame_ids_unique)
 
     imu_100hz_dtype = np.dtype([
@@ -3400,6 +4120,9 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
     # 为每个 IMU 分配独立的 data array
     # 用 np.zeros 初始化，避免未初始化内存泄露为垃圾数据
     all_data = [np.zeros(num_imu_frames, dtype=imu_100hz_dtype) for _ in range(num_imus)]
+    full_bin_preserved = bool(
+        full_bin and len(imu_frame_ids_unique) == source_frame_count and
+        np.array_equal(np.asarray(imu_frame_ids_unique, dtype=np.int64), source_frame_ids))
     imu_filled = 0
     imu_missing = 0
     missing_frame_ids = []
@@ -3437,7 +4160,10 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
             if frame_present and k < len(imu_data):
                 all_data[k][idx]['valid'] = True
                 all_data[k][idx]['missing'] = False
-        t = imu_time_by_frame.get(imu_fid, float(idx) * 0.01)
+        if imu_fid not in imu_time_by_frame:
+            raise ValueError(
+                f'IMU同步失败：帧 {imu_fid} 没有可用时间锚点（设备{device_id}）')
+        t = float(imu_time_by_frame[imu_fid])
         for k in range(num_imus):
             all_data[k][idx]['time'] = t
 
@@ -3467,6 +4193,9 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
         dataset.attrs["missing_field"] = "missing"
         dataset.attrs["sensor_missing_frames"] = int(per_sensor_missing[imu_index] if imu_index is not None else (per_sensor_missing[0] if per_sensor_missing else 0))
         dataset.attrs["sync_source_mode"] = imu_time_alignment
+        dataset.attrs["sync_source_frame_count"] = source_frame_count
+        dataset.attrs["sync_output_frame_count"] = int(len(data))
+        dataset.attrs["sync_full_bin_preserved"] = full_bin_preserved
         if imu_index is not None:
             dataset.attrs["imu_index"] = imu_index
         dataset.attrs["imu_count"] = num_imus
@@ -3484,6 +4213,10 @@ def _sync_imu_100hz(h5_file, emg_parser, imu_parser, data_2khz, device_id):
     for k, label in enumerate(labels):
         ds_name = f"imu{device_id}{label}_100hz"
         write_or_create_dataset(ds_name, all_data[k], imu_filled, imu_missing, imu_index=k)
+
+    h5_file.attrs[f'imu{device_id}_sync_source_frame_count'] = source_frame_count
+    h5_file.attrs[f'imu{device_id}_sync_output_frame_count'] = int(num_imu_frames)
+    h5_file.attrs[f'imu{device_id}_sync_full_bin_preserved'] = full_bin_preserved
 
     # ── 数据质量校验：标记疑似损坏的传感器 ──
     validation = _validate_imu_sensor_data(all_data, num_imus)

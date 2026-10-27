@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import subprocess
@@ -9,7 +10,15 @@ from unittest.mock import patch
 import h5py
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-from file_access import FileBusyError, h5_transaction, exclusive_file, transactional_h5
+from file_access import (
+    FileBusyError,
+    _io_path,
+    _key,
+    exclusive_file,
+    h5_transaction,
+    logical_h5_path,
+    transactional_h5,
+)
 
 
 class FileTransactionTests(unittest.TestCase):
@@ -114,6 +123,45 @@ except FileBusyError:
                     except ValueError:
                         pass
             self.assertEqual(Path(path).read_bytes(), before)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows extended paths are Windows-only')
+    def test_long_windows_path_commit_rollback_and_alias_reuse(self):
+        root = Path(self.tmp.name) / 'long-path-root'
+        relative = root / ('segment_' * 5)
+        ordinary_parent = str(relative)
+        for index in range(18):
+            ordinary_parent = os.path.join(ordinary_parent, f'level_{index:02d}_xxxxxxxx')
+        ordinary = os.path.join(ordinary_parent, 'original.h5')
+        self.assertGreater(len(ordinary), 260)
+        self.addCleanup(lambda: shutil.rmtree(_io_path(root), ignore_errors=True))
+
+        os.makedirs(_io_path(ordinary_parent))
+        with h5py.File(_io_path(ordinary), 'w') as file:
+            file['old'] = [1]
+        extended = _io_path(ordinary)
+
+        with h5_transaction(ordinary) as staged:
+            self.assertTrue(staged.startswith('\\\\?\\'))
+            with h5_transaction(extended) as again:
+                self.assertEqual(staged, again)
+            with h5_transaction(staged) as third:
+                self.assertEqual(staged, third)
+                self.assertEqual(logical_h5_path(third), _key(ordinary))
+                self.assertNotIn('\\\\?\\', logical_h5_path(third))
+            with h5py.File(staged, 'a') as file:
+                file['new'] = [2]
+        with h5py.File(extended, 'r') as file:
+            self.assertEqual(file['new'][0], 2)
+
+        with open(_io_path(ordinary), 'rb') as handle:
+            before = handle.read()
+        with self.assertRaisesRegex(RuntimeError, 'long rollback'):
+            with h5_transaction(extended) as staged:
+                with h5py.File(staged, 'a') as file:
+                    file['bad'] = [3]
+                raise RuntimeError('long rollback')
+        with open(_io_path(ordinary), 'rb') as handle:
+            self.assertEqual(handle.read(), before)
 
 if __name__ == '__main__':
     unittest.main()

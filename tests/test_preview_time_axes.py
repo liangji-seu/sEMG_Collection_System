@@ -96,6 +96,39 @@ class PreviewTimeAxisTests(unittest.TestCase):
         single = VideoTimeline(1, 30, 10.0, 99.0)
         self.assertEqual(single.duration, 0.0)
 
+    def test_prior_synced_emg_with_unverified_imu_has_consistent_preview_status(self):
+        import tempfile
+        dtype = np.dtype([('channels', np.float32, (16,)), ('time', np.float64)])
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as folder:
+            path = os.path.join(folder, 'previous-output.h5')
+            with h5py.File(path, 'w') as f:
+                rows = np.zeros(10, dtype=dtype)
+                rows['time'] = 1000.0 + np.arange(10) / 2000.0
+                f.create_dataset('emg1_250hz_adc', data=rows)
+                f.create_dataset('emg1_2khz_adc', data=rows)
+                f.create_dataset('imu1a_100hz', data=np.ones(10))
+                f['imu1a_100hz'].attrs['sync_source_mode'] = 'imu_ble_anchor_full_bin'
+                f.attrs['sync_status'] = 'unverified'
+                f.attrs['sync_mode'] = 'one_to_one'
+                f.attrs['sync_device_status_dev1'] = 'synced'
+                f.attrs['sync_device_validation_dev1'] = True
+                f.attrs['sync_device_source_fingerprint_dev1'] = 'source|100|123'
+                f.attrs['sync_device_imu_verified_dev1'] = False
+                f.attrs['imu1_alignment_confidence'] = 'unverified'
+            widget = CalibrateWidget()
+            try:
+                widget.h5_path = path
+                widget.h5_file = h5py.File(path, 'r')
+                widget.load_emg_data()
+                widget._load_status_attrs()
+                self.assertEqual(widget.emg1_loaded_name, 'emg1_2khz_adc')
+                self.assertIn('已同步', widget.lbl_status.text())
+                self.assertNotIn('IMU时间对齐待验证', widget.lbl_status.text())
+                self.assertNotIn('sync not verified', widget.lbl_status.text())
+            finally:
+                widget._release_loaded_file()
+                widget.deleteLater()
+
     def test_calibrate_reads_lazy_mixed_rate_windows(self):
         dtype = np.dtype([('channels', np.float32, (16,)), ('time', np.float64)])
         td = os.path.join(os.path.dirname(__file__), '.preview_time_axes_tmp')

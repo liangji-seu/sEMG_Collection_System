@@ -12,6 +12,15 @@ import hdf5_tool
 
 
 class BinPairResolutionTests(unittest.TestCase):
+    def test_uppercase_extension_is_found_but_preview_is_excluded(self):
+        with tempfile.TemporaryDirectory() as root:
+            expected = Path(root) / 'L062_L_260720_084913_EMG.BIN'
+            expected.touch()
+            (Path(root) / 'preview_L062_L_260720_084913_EMG.BIN').touch()
+            self.assertEqual(hdf5_tool._find_named_file_recursive(
+                root, 'l062_l_260720_084913_emg.bin'), str(expected))
+            self.assertEqual(hdf5_tool._count_bin_files_recursive(root), (1, 0))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='bin-pair-', dir=ROOT)
         self.root = Path(self.temp.name)
@@ -60,6 +69,38 @@ class BinPairResolutionTests(unittest.TestCase):
         self.assertIsNone(emg)
         self.assertIsNone(imu)
         self.assertEqual(info['reason'], 'no_same_subject_side_date_emg_candidate')
+
+    def test_subject_matching_is_case_insensitive(self):
+        h5 = self.root / 'l062_坐姿_session1_20260720_084915.h5'
+        with h5py.File(h5, 'w') as f:
+            f.attrs['sd_bin_dev1'] = 'L062_L_260720_084915'
+        self.touch_pair('L062_L_260720_084913')
+        emg, imu, info = hdf5_tool._resolve_time_matched_bin_pair(
+            str(self.root), str(h5), 1, 'L062_L_260720_084915')
+        self.assertTrue(emg.endswith('L062_L_260720_084913_emg.bin'))
+        self.assertTrue(imu.endswith('L062_L_260720_084913_imu.bin'))
+        self.assertEqual(info['status'], 'time_matched_replacement')
+
+    def test_named_lookup_is_case_insensitive(self):
+        self.touch_pair('L372_L_260903_155549')
+        with h5py.File(self.h5, 'a') as f:
+            f.attrs['sd_bin_dev1'] = 'l372_l_260903_155549'
+        worker = hdf5_tool.SyncWorker.__new__(hdf5_tool.SyncWorker)
+        worker.bin_dir = str(self.root)
+        worker.sync_mode = 'one_to_many'
+        worker.validate_data = True
+        worker.log = type('L', (), {'emit': lambda self, msg: None})()
+        emg, imu = worker._find_bin_files(str(self.h5), 1)
+        self.assertTrue(emg.endswith('L372_L_260903_155549_emg.bin'))
+        self.assertTrue(imu.endswith('L372_L_260903_155549_imu.bin'))
+
+    def test_case_insensitive_duplicate_basenames_are_unresolved(self):
+        a = self.root / 'a'; b = self.root / 'b'
+        a.mkdir(); b.mkdir()
+        (a / 'L372_L_260903_155549_emg.bin').touch()
+        (b / 'l372_l_260903_155549_emg.bin').touch()
+        self.assertIsNone(hdf5_tool._find_named_file_recursive(
+            str(self.root), 'L372_L_260903_155549_emg.bin'))
 
     def test_far_candidate_is_rejected(self):
         self.touch_pair('L372_L_260903_160500')

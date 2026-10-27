@@ -45,6 +45,10 @@ try:
     from video_timeline import VideoTimeline
 except ImportError:  # 作为独立脚本运行时的兼容路径
     from tools.video_timeline import VideoTimeline
+try:
+    from bin_sync_tool import sync_status_summary
+except ImportError:
+    from tools.bin_sync_tool import sync_status_summary
 
 
 # ============== EMG滤波参数（对齐供应商 wband_emg_V3）==============
@@ -916,7 +920,12 @@ class CalibrateWidget(QWidget):
             print(f'[CalibrateTool] 已加载文件: {file_path}')
 
         except Exception as e:
-            self._release_loaded_file()
+            try:
+                self._release_loaded_file()
+            except Exception as cleanup_error:
+                # Preserve the load error shown to the user; resource release
+                # has already attempted to close any opened H5 handle.
+                print(f'[CalibrateTool] 加载失败后的资源清理失败: {cleanup_error}')
             self.lbl_file.setText('未加载文件')
             self.slider.setMaximum(0)
             self.lbl_total.setText('/ 0')
@@ -925,16 +934,22 @@ class CalibrateWidget(QWidget):
 
     def _release_loaded_file(self):
         """Release resources even when loading stops halfway through a file."""
-        self.is_playing = self.is_full_playing = False
-        for timer in (self.playback_timer, self.full_playback_timer, self.update_timer):
-            timer.stop()
-        self.pending_update = False
-        self._close_videos()
-        if self.h5_file is not None:
-            try:
-                self.h5_file.close()
-            finally:
-                self.h5_file = None
+        try:
+            self.is_playing = self.is_full_playing = False
+            for timer in (self.playback_timer, self.full_playback_timer, self.update_timer):
+                timer.stop()
+            self.pending_update = False
+            self._close_videos()
+        finally:
+            if self.h5_file is not None:
+                active_error = sys.exc_info()[0] is not None
+                try:
+                    self.h5_file.close()
+                except BaseException:
+                    if not active_error:
+                        raise
+                finally:
+                    self.h5_file = None
         self.h5_path = None
         for dev in (1, 2):
             for suffix in ('data', 'dataset', 'start_time', 'time_axis', 'loaded_name'):
@@ -971,21 +986,19 @@ class CalibrateWidget(QWidget):
             if isinstance(v, bytes): return v.decode('utf-8').lower() in ('true', '1', 'yes')
             return d
 
-        sync = _s('sync_status')
+        sync_summary = sync_status_summary(f)
+        sync = sync_summary['status']
         cs = _s('collection_status')
         seg = _safe_int(f.attrs.get('segment_index'), 1)
         resumed = 'R' if _safe_bool(f.attrs.get('is_resumed')) else ''
         cm = _s('channel_map_name')
         sfv = f.attrs.get('stream_format_version')
         sm = _s('sync_mode')
-        sync_alignment = _s('sync_time_alignment')
 
         if sync not in ('-', 'unknown'):
-            parts.append(f'sync: {sync}')
+            parts.append('已同步' if sync == 'synced' else f'sync: {sync}')
         if sm not in ('-',):
             parts.append(f'mode: {sm}')
-        if sync_alignment not in ('-',):
-            parts.append(f'align: {sync_alignment}')
         if cs != '-':
             parts.append(f'collection: {cs}')
         if resumed or seg > 1:
@@ -1077,8 +1090,6 @@ class CalibrateWidget(QWidget):
                     # 新版 sync（ADC search / one_to_one）不依赖 frame_id
                     print(f'[CalibrateTool] legacy frame_id {risk} ({dev}: {reason}), '
                           f'ignored: sync_mode={sm} via ADC search')
-                    self.lbl_status.setText(
-                        (self.lbl_status.text() or '') + ' | legacy frame_id ignored; synced by ADC search')
                 elif has_2khz_loaded:
                     # 2kHz + 不可靠同步 → 明显警告
                     self.lbl_status.setText(
@@ -1112,10 +1123,7 @@ class CalibrateWidget(QWidget):
         self.emg2_loaded_name = None
 
         # 判断是否已可靠同步 → 优先 2kHz
-        sync = self.h5_file.attrs.get('sync_status')
-        if isinstance(sync, bytes):
-            sync = sync.decode('utf-8')
-        synced = (sync == 'synced')
+        synced = (sync_status_summary(self.h5_file)['status'] == 'synced')
         has_2khz_emg1 = 'emg1_2khz_adc' in self.h5_file or 'emg1_2khz' in self.h5_file
         has_2khz_emg2 = 'emg2_2khz_adc' in self.h5_file or 'emg2_2khz' in self.h5_file
 
@@ -3214,13 +3222,22 @@ class CalibrateWidget(QWidget):
 
     def closeEvent(self, event):
         """关闭窗口时清理资源"""
-        if self.is_playing:
-            self._stop_playback()
-        if self.is_full_playing:
-            self._stop_full_playback()
-        self._close_videos()
-        if self.h5_file:
-            self.h5_file.close()
+        try:
+            if self.is_playing:
+                self._stop_playback()
+            if self.is_full_playing:
+                self._stop_full_playback()
+            self._close_videos()
+        finally:
+            if self.h5_file:
+                active_error = sys.exc_info()[0] is not None
+                try:
+                    self.h5_file.close()
+                except BaseException:
+                    if not active_error:
+                        raise
+                finally:
+                    self.h5_file = None
         event.accept()
 
 
