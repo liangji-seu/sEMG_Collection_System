@@ -115,6 +115,7 @@ class RealtimeEngine extends EventEmitter {
 
         // Stage状态
         this.currentStageName = null;
+        this.stageStartRequested = false;  // 是否已收到 stage_start（此前到达的包属于标定/准备阶段）
         this.stageFileOpen = false;
         this.stageFileOpening = false;
         this.stageFileOpenPromise = null;
@@ -403,6 +404,7 @@ class RealtimeEngine extends EventEmitter {
         this.collectionBins = null;
         this.collectionBinFilenames = { dev1: null, dev2: null };
         this.collectionStreamId = null;
+        this.stageStartRequested = false;
 
         // 【Phase 2】保存续采模式元数据
         this.isResume = data.isResume || false;
@@ -546,6 +548,7 @@ class RealtimeEngine extends EventEmitter {
         this.collectionExpectedDeviceIds = null;
         this.collectionBins = null;
         this.collectionDataStartTs = 0;
+        this.stageStartRequested = false;
         this.stageFileCreateFailed = false;
         this.storageDataSendError = null;
         this.collectionHealth = null;
@@ -1031,6 +1034,9 @@ class RealtimeEngine extends EventEmitter {
     async onStageStart(stageName, stageIndex, timestamp, needMocap = false) {
         this._throwIfCollectionFault();
         this.currentStageName = stageName;
+        // 从这里开始才要求 H5 必须已打开；collection_start 与 stage_start 之间的
+        // 标定/准备阶段数据本来就不入库，不能当成存储故障。
+        this.stageStartRequested = true;
         // 【统一时钟】优先使用 Python 时钟（来自 onCollectionStart 查询 camera_server），
         // 确保 H5 中 start_time 属性与 EMG/视频数据时间戳同源
         this.stage_start_time = this.collectionDataStartTs || timestamp || Date.now();
@@ -1110,7 +1116,7 @@ class RealtimeEngine extends EventEmitter {
         console.log('[realtimeEngine] 🎥 启动摄像头录制...');
 
         if (!this.camera_connected) {
-            console.error('[realtimeEngine] ❌ camera_server未连接，无法标记录制起始');
+            console.warn('[realtimeEngine] ⚠️ camera_server未连接，本轮不录像（仅采集 EMG/IMU）');
             return;
         }
 
@@ -1145,7 +1151,7 @@ class RealtimeEngine extends EventEmitter {
         }
 
         if (availableSides.length === 0) {
-            console.error('[realtimeEngine] ❌ 没有可用的摄像头（请先在UI中打开摄像头）');
+            console.warn('[realtimeEngine] ⚠️ 没有已打开的摄像头，本轮不录像（仅采集 EMG/IMU）');
             return;
         }
 
@@ -2439,8 +2445,11 @@ class RealtimeEngine extends EventEmitter {
                         imu1_hw_version: imu1HwVersion, imu2_hw_version: imu2HwVersion,
                         imu1_num_imus: imu1NumImus, imu2_num_imus: imu2NumImus,
                     });
-                } else if (this.isCollecting && !this.collectionPaused && !this.isTestMode && !this.stageFileOpen && !this.stageFileOpening && !this.isClosingStageFile && h5OpenGraceExpired &&
+                } else if (this.isCollecting && this.stageStartRequested && !this.collectionPaused && !this.isTestMode &&
+                    !this.stageFileOpen && !this.stageFileOpening && !this.isClosingStageFile && h5OpenGraceExpired &&
                     (rawEmgRows.dev1 > 0 || rawEmgRows.dev2 > 0)) {
+                    // 只有 stage_start 已发出、H5 却迟迟没打开，才是真的存储故障；
+                    // collection_start 与 stage_start 之间的标定/准备数据本来就不入库。
                     this.notifyH5StorageWarning('已收到手环数据，但H5文件未打开，当前轮次数据不会落盘；请紧急中断并重采本轮');
                 } else if (this.isCollecting && this.stageFileOpen && !isFreshCollectionPacket) {
                     this.collectionDroppedStaleBlePackets++;

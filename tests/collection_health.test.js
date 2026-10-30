@@ -122,6 +122,44 @@ test('preview packets count as received while remaining filtered from storage', 
     e._stopCollectionHealthTimer();
 });
 
+test('data before stage_start is filtered but never treated as a storage fault', () => {
+    const e = loadEngine();
+    prepareHealth(e);
+    e.isRunning = true;
+    e.isCollecting = true;
+    e.collectionState = 'starting';
+    e.streamMode = 'collection';
+    e.stageStartRequested = false;   // 标定/准备阶段：还没发 stage_start
+    e.stageFileOpen = false;
+    e.collectionDataStartTs = 0;     // 宽限早已过期
+    e._finalizeCollectionFault = async () => ({});
+    e.handleBleDataPacket({ dev1: { raw: [[1, 2, 3], [4, 5, 6], [7, 8, 9]], uv: [], n: 3 }, active: [1] });
+    assert.equal(e.collectionHealth.sides.dev1.filtered_rows_by_reason.file_not_open, 3);
+    assert.equal(e.collectionFault, null);
+    clearTimeout(e.realtimeDataTimer);
+    e.realtimeDataTimer = null;
+    e._stopCollectionHealthTimer();
+});
+
+test('data after stage_start without an open H5 still raises a storage fault', () => {
+    const e = loadEngine();
+    prepareHealth(e);
+    e.isRunning = true;
+    e.isCollecting = true;
+    e.collectionState = 'starting';
+    e.streamMode = 'collection';
+    e.stageStartRequested = true;    // stage_start 已发出，H5 却没打开
+    e.stageFileOpen = false;
+    e.collectionDataStartTs = 0;
+    e._finalizeCollectionFault = async () => ({});
+    e.handleBleDataPacket({ dev1: { raw: [[1, 2, 3], [4, 5, 6], [7, 8, 9]], uv: [], n: 3 }, active: [1] });
+    assert.ok(e.collectionFault, 'storage fault should be raised');
+    assert.equal(e.collectionFault.code, 'storage_write_failed');
+    clearTimeout(e.realtimeDataTimer);
+    e.realtimeDataTimer = null;
+    e._stopCollectionHealthTimer();
+});
+
 test('recovered data clears the warning state and a later interruption can warn again', () => {
     const e = loadEngine();
     const clock = prepareHealth(e);
