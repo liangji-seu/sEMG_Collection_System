@@ -61,9 +61,11 @@ class DeviceServiceTests(unittest.TestCase):
 
     def test_ble_low_overflow_drops_oldest_data_but_never_control(self):
         control = FakeClient()
-        ble_server.state.msg_queue.put((ble_server.PRIORITY_CONTROL, 0, 'control', {'x': 1}, control))
+        ble_server.state.msg_queue.put(
+            (ble_server.PRIORITY_CONTROL, next(ble_server.state.queue_seq), 'control', {'x': 1}, control))
         for i in range(ble_server.state.queue_low_limit - 1):
-            ble_server.state.msg_queue.put((ble_server.PRIORITY_LOW, i + 1, 'data', {'i': i}, None))
+            ble_server.state.msg_queue.put(
+                (ble_server.PRIORITY_LOW, next(ble_server.state.queue_seq), 'data', {'i': i}, None))
         ble_server.state.main_loop = None
         # 队列满时丢"最旧的数据"，新到样本仍入队；控制消息永远不动。
         self.assertTrue(ble_server.add_to_queue(ble_server.PRIORITY_LOW, 'data', {'i': 'overflow'}))

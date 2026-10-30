@@ -475,6 +475,7 @@ class DeviceState:
             'mac': self.mac,
             'name': self.name,
             'rssi': self.rssi,
+            'mtu': getattr(self.client, 'mtu_size', None) if self.client else None,
             'streaming': self.is_streaming,
             'total': self.total_frames,
             'lost': self.lost_frames,
@@ -1663,7 +1664,9 @@ async def connect_device(ws, device_id: int, mac_or_name: str):
                     dev.rssi = rssi
                     dev.reset_stats()
 
-                    log(f"[Dev{device_id}] 连接成功: {mac}")
+                    log(f"[Dev{device_id}] 连接成功: {mac} "
+                        f"name={dev.name} rssi={rssi} "
+                        f"mtu={getattr(dev.client, 'mtu_size', '?')}")
 
                     # ===================== V1/V2 检测 (方法A: STATUS_CHAR 特征) ======
                     # 必须在配置命令之前检测，以便配置正确的 channel_map 和 num_imus
