@@ -121,6 +121,12 @@ BYTES_PER_IMU = 18              # 单 IMU 数据长度 (Acc6+Gyro6+Reserved6)
 MAX_NUM_IMUS_V1 = 2             # V1 固定 2 个 IMU (ICM-20948)
 MAX_NUM_IMUS_V2 = 3             # V2 最多 3 个 IMU (LSM6DSV32X)
 
+# ================= V5.3+ IMU 实时尾包 =================
+# 5.3.x 固件在 EMG 帧后追加: magic(0xA55A) + seq(u32) + count(u8) + num_imus(u8)
+# + count*num_imus*18。count 可变（0..3），EMG 帧数也随之变化（不再固定 9 帧）。
+IMU_LIVE_HDR_MAGIC = 0xA55A
+IMU_LIVE_HDR_SIZE = 8
+
 # ================= 通道映射 =================
 # 物理通道 → 逻辑显示顺序 (1-indexed, 对齐供应商上位机)
 CHANNELS_MAP_V1 = [14, 15, 16, 3, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
@@ -130,7 +136,7 @@ CHANNELS_MAP_V2 = [15, 16, 14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 STATUS_CHAR_UUID = "9e5c100d-afc2-4e4b-b132-f2c0032f7a0e"
 STATUS_PACKET_SNAPSHOT = 0x01
 STATUS_PACKET_EVENT = 0x02
-STATUS_SNAPSHOT_FORMAT = "<BBBBHBBHBBIIIIIII16s16s"
+STATUS_SNAPSHOT_FORMAT = "<BBBBHBBHBBIIIIIIII16s16s"
 
 # ================= 滤波器配置 =================
 # 【重要】参考供应商滤波参数，优化实时显示效果
@@ -381,10 +387,16 @@ class DeviceState:
     packet_counter_base: Optional[int] = None
     # 固件包计数器复位（重启/回绕）后累加的续接偏移，保证 frame_id 全程单调
     packet_counter_offset: int = 0
+    # V5.3+ 每包 EMG 帧数可变（6/9...），帧号只能用"游标"续写，不能再用 包号×固定帧数。
+    ble_frame_cursor: int = 0
+    last_ble_fpp: int = 9
+    last_packet_seq: int = -1
+    imu_sample_rate_hz: float = 100.0
     # 采样计数时间轴：(样本序号 n_ref, 该样本对应的墙钟 t_ref)。
     # 帧时间戳 = t_ref + (n - n_ref)/rate，只允许往后推，见 _counter_timeline()
     sample_clock_ref: Optional[tuple] = None
     last_emit_time: Optional[float] = None
+    last_imu_time: float = 0.0
     last_data_time: float = 0.0  # 【新增】最后收到数据的时间戳
     stream_started_monotonic: Optional[float] = None
     last_notification_monotonic: Optional[float] = None
@@ -419,8 +431,12 @@ class DeviceState:
         self.last_packet_counter = -1
         self.packet_counter_base = None
         self.packet_counter_offset = 0
+        self.ble_frame_cursor = 0
+        self.last_ble_fpp = 9
+        self.last_packet_seq = -1
         self.sample_clock_ref = None
         self.last_emit_time = None
+        self.last_imu_time = 0.0
         self.raw_buffer.clear()
         self.data_buffer.clear()
         self.raw_dropped_packets = 0
@@ -624,58 +640,137 @@ def parse_imu_v2(data: bytearray, emg_len: int, num_imus: int) -> list:
     return imus
 
 
-def parse_packet(data: bytearray, dev: DeviceState) -> Optional[dict]:
-    params = get_packet_params(dev.config)
+def _detect_v53_imu_layout(data: bytearray, dev: DeviceState) -> Optional[dict]:
+    """识别 5.3.x 的「EMG + IMU 实时尾包」布局。
 
-    emg_len = params['emg_len']
+    布局: 4B 包号 + N 帧 EMG + [magic(0xA55A) + imu_seq(u32) + count(u8)
+    + num_imus(u8) + count*num_imus*18]。count 可变，EMG 帧数随之变化。
+    """
     payload_len = len(data) - 4
+    if dev.hw_version != 'V2' or not dev.config.get('imu_enabled'):
+        return None
+    if payload_len <= IMU_LIVE_HDR_SIZE + 16 * 2:
+        return None
+    for bps in (3, 2):
+        stride = 16 * bps
+        for num_imus in range(1, MAX_NUM_IMUS_V2 + 1):
+            for count in range(0, 9):
+                tail = IMU_LIVE_HDR_SIZE + count * num_imus * BYTES_PER_IMU
+                emg_bytes = payload_len - tail
+                if emg_bytes <= 0 or emg_bytes % stride:
+                    continue
+                magic_off = 4 + emg_bytes
+                if magic_off + IMU_LIVE_HDR_SIZE > len(data):
+                    continue
+                magic, imu_seq, imu_count, imu_num = struct.unpack_from('<HIBB', data, magic_off)
+                if magic != IMU_LIVE_HDR_MAGIC or imu_count != count or imu_num != num_imus:
+                    continue
+                return {
+                    'layout': 'v53', 'bps': bps, 'frames': emg_bytes // stride,
+                    'emg_len': emg_bytes, 'imu_samples': count, 'imu_chips': num_imus,
+                    'imu_seq': imu_seq,
+                }
+    return None
 
-    # ===== 包长校验 (V1 固定 / V2 动态) =====
-    if dev.hw_version == "V2":
-        if payload_len < emg_len:
-            log(f"[Dev{dev.device_id}] 包过短: {len(data)}, 期望至少 {4 + emg_len}")
-            return None
-        imu_byte_count = payload_len - emg_len
-        if imu_byte_count % BYTES_PER_IMU != 0:
-            log(f"[Dev{dev.device_id}] IMU 数据异常: {imu_byte_count} bytes (非 18 的倍数)")
-            return None
-        num_imus = imu_byte_count // BYTES_PER_IMU
-        if num_imus > MAX_NUM_IMUS_V2:
-            log(f"[Dev{dev.device_id}] IMU 数量超限: {num_imus} > {MAX_NUM_IMUS_V2}")
-            return None
-        if num_imus != dev.num_imus:
-            dev.num_imus = num_imus
-            log(f"[Dev{dev.device_id}] IMU 数量已更新: {num_imus}")
-    else:
+
+def _detect_variable_emg_layout(data: bytearray, dev: DeviceState) -> Optional[dict]:
+    """无 IMU 尾包时按长度反推每包 EMG 帧数（5.3.x 也允许 IMU 关闭）。"""
+    payload_len = len(data) - 4
+    if dev.hw_version != 'V2' or payload_len <= 0:
+        return None
+    for bps in (3, 2):
+        stride = 16 * bps
+        if payload_len % stride == 0:
+            frames = payload_len // stride
+            if 1 <= frames <= 64:
+                return {'layout': 'variable_emg', 'bps': bps, 'frames': frames,
+                        'emg_len': payload_len, 'imu_samples': 0, 'imu_chips': 0,
+                        'imu_seq': None}
+    return None
+
+
+def _detect_legacy_layout(data: bytearray, dev: DeviceState) -> Optional[dict]:
+    """5.2 及以前的固定布局：9 帧 EMG + 0..3 个 IMU 快照（每块 18B）。"""
+    params = get_packet_params(dev.config)
+    payload_len = len(data) - 4
+    if dev.hw_version == 'V1':
         if len(data) != params['total_len']:
             log(f"[Dev{dev.device_id}] 包长错误: {len(data)} != {params['total_len']}")
             return None
-        num_imus = MAX_NUM_IMUS_V1  # V1 固定 2 个 IMU
+        return {'layout': 'legacy', 'bps': params['bps'], 'frames': params['fpkt'],
+                'emg_len': params['emg_len'], 'imu_samples': 1, 'imu_chips': MAX_NUM_IMUS_V1,
+                'imu_seq': None}
+    emg_len = params['emg_len']
+    if payload_len < emg_len:
+        log(f"[Dev{dev.device_id}] 包过短: {len(data)}, 期望至少 {4 + emg_len}")
+        return None
+    imu_byte_count = payload_len - emg_len
+    if imu_byte_count % BYTES_PER_IMU != 0:
+        log(f"[Dev{dev.device_id}] IMU 数据异常: {imu_byte_count} bytes (非 18 的倍数)")
+        return None
+    num_imus = imu_byte_count // BYTES_PER_IMU
+    if num_imus > MAX_NUM_IMUS_V2:
+        log(f"[Dev{dev.device_id}] IMU 数量超限: {num_imus} > {MAX_NUM_IMUS_V2}")
+        return None
+    return {'layout': 'legacy', 'bps': params['bps'], 'frames': params['fpkt'],
+            'emg_len': emg_len, 'imu_samples': 1 if num_imus else 0,
+            'imu_chips': num_imus, 'imu_seq': None}
+
+
+def _detect_packet_layout(data: bytearray, dev: DeviceState) -> Optional[dict]:
+    return (_detect_v53_imu_layout(data, dev)
+            or _detect_variable_emg_layout(data, dev)
+            or _detect_legacy_layout(data, dev))
+
+
+def _next_frame_cursor(dev: DeviceState, packet_seq: int, frames: int) -> int:
+    """按包序号续写帧号：5.3 每包帧数可变，不能再用 包号×固定帧数。"""
+    if dev.last_packet_seq < 0:
+        start_frame = 0
+    elif packet_seq == dev.last_packet_seq + 1:
+        start_frame = dev.ble_frame_cursor
+    elif packet_seq > dev.last_packet_seq + 1:
+        gap_packets = packet_seq - dev.last_packet_seq - 1
+        lost_frames_delta = gap_packets * dev.last_ble_fpp
+        dev.lost_frames += lost_frames_delta
+        log(f"[Dev{dev.device_id}] BLE 丢包检测: packet_counter "
+            f"{dev.last_packet_seq}→{packet_seq}, 丢失 {gap_packets} 包 "
+            f"(~{lost_frames_delta} 帧)")
+        start_frame = dev.ble_frame_cursor + lost_frames_delta
+    else:
+        # 固件包计数器复位（重启/回绕）：帧号继续往后走，绝不让 H5 中途倒退。
+        log(f"[Dev{dev.device_id}] 包计数器复位 {dev.last_packet_seq}→{packet_seq}，帧号续接")
+        start_frame = dev.ble_frame_cursor
+    dev.last_packet_seq = packet_seq
+    dev.ble_frame_cursor = start_frame + frames
+    dev.last_ble_fpp = frames
+    dev.last_packet_counter = packet_seq
+    return start_frame
+
+
+def parse_packet(data: bytearray, dev: DeviceState) -> Optional[dict]:
+    layout = _detect_packet_layout(data, dev)
+    if layout is None:
+        return None
 
     try:
         config = dev.config
-        lsb_uv = calculate_lsb_uv(config)
-        bps = params['bps']
-        fpkt = params['fpkt']
+        bps = layout['bps']
+        fpkt = layout['frames']
+        emg_len = layout['emg_len']
+        imu_samples = layout['imu_samples']
+        imu_chips = layout['imu_chips']
 
-        # 包头 4 字节是 ESP32 固件的 ble_frame_counter（包计数器），不是帧号
-        # 每个 BLE 包包含 fpkt 个 250Hz EMG 帧，真实帧号 = 包号 × fpkt + 帧内偏移
+        # 24-bit / 16-bit 各自的 LSB（按实际检测到的采样字节数，而不是配置）
+        lsb_uv = BASE_LSB_24BIT / (config['gain'] * HARDWARE_FRONTEND_GAIN)
+        if bps == 2:
+            lsb_uv = lsb_uv * (2 ** config['shift'])
+
         packet_counter = struct.unpack('<I', data[0:4])[0]
-        if dev.packet_counter_base is None:
-            dev.packet_counter_base = packet_counter
-            dev.packet_counter_offset = 0
-            log(f"[Dev{dev.device_id}] stream packet counter base: {dev.packet_counter_base}")
-        elif packet_counter < dev.last_packet_counter:
-            # 固件包计数器复位（重启/回绕）。绝不能像以前那样把 base 挪过去、
-            # 让帧号从 0 重新开始：那会让写进 H5 的 frame_id / sd_frame_id 在会话
-            # 中途倒退，后处理会把它当成时间回退去修（实测 38080→0 造出 19s 折叠）。
-            # 这里只累加一个续接偏移，帧号继续往后走。
-            jump = dev.last_packet_counter - packet_counter + 1
-            dev.packet_counter_offset += jump
-            log(f"[Dev{dev.device_id}] 包计数器复位 {dev.last_packet_counter}→{packet_counter}，"
-                f"帧号续接 +{jump}（累计偏移 {dev.packet_counter_offset}）")
-        relative_packet_counter = packet_counter - dev.packet_counter_base + dev.packet_counter_offset
-        start_frame = relative_packet_counter * fpkt
+        if dev.last_packet_seq < 0:
+            log(f"[Dev{dev.device_id}] stream packet counter base: {packet_counter} "
+                f"layout={layout['layout']} fpp={fpkt} bps={bps} imu_samples={imu_samples}")
+        start_frame = _next_frame_cursor(dev, packet_counter, fpkt)
 
         # ===== EMG 解析 (物理顺序) =====
         emg_raw = []
@@ -707,13 +802,37 @@ def parse_packet(data: bytearray, dev: DeviceState) -> Optional[dict]:
             emg_raw_mapped.append(mapped_raw)
             emg_uv_mapped.append(mapped_uv)
 
-        # ===== IMU 解析 (按版本分叉) =====
+        # ===== IMU 解析（V5.3 尾包可含多帧 IMU 样本）=====
         imu = None
-        if config['imu_enabled'] and num_imus > 0:
+        imu_all = []
+        if config['imu_enabled'] and imu_samples > 0 and imu_chips > 0:
             if dev.hw_version == "V2":
-                imu = parse_imu_v2(data, emg_len, num_imus)
+                base = 4 + emg_len + (IMU_LIVE_HDR_SIZE if layout['layout'] == 'v53' else 0)
+                for sample_idx in range(imu_samples):
+                    sample = []
+                    for chip_idx in range(imu_chips):
+                        off = base + (sample_idx * imu_chips + chip_idx) * BYTES_PER_IMU
+                        chunk = data[off: off + BYTES_PER_IMU]
+                        if len(chunk) < BYTES_PER_IMU:
+                            sample = []
+                            break
+                        ag = struct.unpack('<6h', chunk[:12])
+                        sample.append([[x * SCALE_ACCEL for x in ag[0:3]],
+                                       [x * SCALE_GYRO for x in ag[3:6]]])
+                    if len(sample) != imu_chips:
+                        continue
+                    imu = sample
+                    for chip_idx, chip in enumerate(sample):
+                        imu_all.append({'index': chip_idx, 'acc': chip[0],
+                                        'gyr': chip[1], 'mag': None})
+                if imu_chips != dev.num_imus:
+                    dev.num_imus = imu_chips
+                    log(f"[Dev{dev.device_id}] IMU 数量已更新: {imu_chips}")
             else:
                 imu = parse_imu_v1(data, emg_len)
+                for chip_idx, chip in enumerate(imu or []):
+                    imu_all.append({'index': chip_idx, 'acc': chip[0], 'gyr': chip[1],
+                                    'mag': (chip[2] if len(chip) > 2 else None)})
 
         dev.total_frames += fpkt
         dev.last_valid_emg_monotonic = time.monotonic()
@@ -722,17 +841,6 @@ def parse_packet(data: bytearray, dev: DeviceState) -> Optional[dict]:
             log(f"[Dev{dev.device_id}] EMG_CAPTURE_HEALTH recovered frames={dev.total_frames}")
             dev.emg_health_missing_logged = False
 
-        # ===== 丢包检测：跟踪 packet_counter 连续性 =====
-        if dev.last_packet_counter >= 0:
-            expected_packet = dev.last_packet_counter + 1
-            if packet_counter > expected_packet:
-                lost_packets = packet_counter - expected_packet
-                lost_frames_delta = lost_packets * fpkt
-                dev.lost_frames += lost_frames_delta
-                log(f"[Dev{dev.device_id}] BLE 丢包检测: packet_counter {expected_packet}→{packet_counter}, "
-                    f"丢失 {lost_packets} 包 ({lost_frames_delta} 帧)")
-
-        dev.last_packet_counter = packet_counter
         dev.last_frame_index = start_frame + fpkt - 1
 
         # ===== 生成每帧的BLE帧号 =====
@@ -755,11 +863,16 @@ def parse_packet(data: bytearray, dev: DeviceState) -> Optional[dict]:
             'f': start_frame,
             'packet_counter': packet_counter,  # 原始包号（诊断用）
             'n': fpkt,
+            'fpp': fpkt,
             'frame_ids': frame_ids,
             'raw': emg_raw_mapped,
             'uv': emg_uv_filtered,
-            'imu': imu,
-            'num_imus': num_imus,
+            'imu': imu,                       # 本包最后一帧 IMU（供实时显示）
+            'imu_all': imu_all,               # 本包全部 IMU 样本（按样本展平）
+            'imu_samples': imu_samples if imu_all else 0,
+            'imu_seq': layout.get('imu_seq'),
+            'num_imus': imu_chips or dev.num_imus,
+            'layout': layout['layout'],
             'hw_version': dev.hw_version,
             's': [dev.total_frames, dev.lost_frames],
         }
@@ -831,8 +944,26 @@ def create_status_handler(dev: DeviceState):
                 dev.battery_percent = s[8]  # 解析电池百分比
                 dev.storage_state = s[9]
                 dev.sd_free_kb = s[10]
-                dev.firmware_version = s[17].split(b'\x00')[0].decode('ascii', errors='ignore')
-                dev.hardware_version = s[18].split(b'\x00')[0].decode('ascii', errors='ignore')
+                dev.firmware_version = s[18].split(b'\x00')[0].decode('ascii', errors='ignore')
+                dev.hardware_version = s[19].split(b'\x00')[0].decode('ascii', errors='ignore')
+
+                # V5.3: 状态快照尾部携带 ble_tx_rate(u16) + imu_sample_rate(u16)
+                # + ble_emg_frames_per_packet(u8) + reserved(u8) + imu_drop(u32)。
+                version = s[1]
+                offset = expected_size
+                if version >= 2 and len(data) >= offset + 2:
+                    ble_tx_rate = struct.unpack_from('<H', data, offset)[0]
+                    offset += 2
+                    if version >= 3 and len(data) >= offset + 8:
+                        imu_rate, fpp_hint, _reserved, _imu_drop = struct.unpack_from(
+                            '<HBBI', data, offset)
+                        if 1 <= imu_rate <= 1000:
+                            dev.imu_sample_rate_hz = float(imu_rate)
+                        if not getattr(dev, '_v53_status_logged', False):
+                            dev._v53_status_logged = True
+                            log(f"[Dev{dev.device_id}] 固件 {dev.firmware_version or '?'} "
+                                f"BLE速率={ble_tx_rate}Hz IMU={imu_rate}Hz "
+                                f"标称每包EMG帧数={fpp_hint}")
 
             elif packet_type == STATUS_PACKET_EVENT:
                 # 事件记录（后续可扩展透传给前端用于诊断）
@@ -909,10 +1040,25 @@ def finalize_parsed_packet(dev: DeviceState, parsed: dict, ts: float):
     emg_t = _counter_timeline(dev, parsed.get('f', 0), fpkt, ts)
     parsed['emg_t'] = emg_t
 
-    if parsed.get('imu'):
-        # IMU 行按包写入（每包每颗 IMU 一行），取本包最后一帧的时刻，
-        # 与 EMG 同一条单调时间轴，避免 IMU 侧再出现墙钟回退
-        parsed['imu_t'] = [emg_t[-1]] * len(parsed['imu'])
+    if parsed.get('imu_all'):
+        # V5.3 一包可带 0..3 帧 IMU 样本；每帧内按 IMU 采样率回推时刻，
+        # 再按"每样本 num_imus 行"展平成与 imu_all 等长的列表。
+        samples = int(parsed.get('imu_samples') or 1)
+        total_rows = len(parsed['imu_all'])
+        chips = max(1, total_rows // samples)
+        rate = float(getattr(dev, 'imu_sample_rate_hz', 100.0) or 100.0)
+        if not (0.0 < rate <= 1000.0):
+            rate = 100.0
+        step = 1.0 / rate
+        times = [emg_t[-1] - (samples - 1 - idx) * step for idx in range(samples)]
+        last_time = float(getattr(dev, 'last_imu_time', 0.0) or 0.0)
+        monotonic_times = []
+        for t in times:
+            t = max(t, last_time + 1e-4)
+            monotonic_times.append(t)
+            last_time = t
+        dev.last_imu_time = last_time
+        parsed['imu_t'] = [monotonic_times[idx] for idx in range(samples) for _ in range(chips)]
 
     if len(dev.data_buffer) >= dev.data_buffer.maxlen:
         _report_transport_drop(f'Dev{dev.device_id} 解析数据缓冲溢出')

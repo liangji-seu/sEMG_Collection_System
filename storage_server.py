@@ -1392,8 +1392,13 @@ class HDF5StorageServer:
             ds = self.f[ds_name]
             ble_frame_id = frame_id if frame_id is not None else 0
             sd_frame_id = ble_frame_id * 8
-            timestamp = timestamps[0] if timestamps else 0.0
             num_imus = len(imu_list)
+            # V5.3 一包可含多帧 IMU 样本：时间戳按行给就用逐行时间，
+            # 否则沿用旧行为（整包一个时间）。
+            if timestamps and len(timestamps) == num_imus:
+                row_times = [float(value) for value in timestamps]
+            else:
+                row_times = [float(timestamps[0]) if timestamps else 0.0] * num_imus
 
             data_ble = np.empty(num_imus, dtype=IMU_ALL_BLE_DTYPE)
             for i, imu in enumerate(imu_list):
@@ -1414,7 +1419,7 @@ class HDF5StorageServer:
                 data_ble[i]["mag"] = mag
                 data_ble[i]["frame_id"] = ble_frame_id
                 data_ble[i]["sd_frame_id"] = sd_frame_id
-                data_ble[i]["time"] = timestamp
+                data_ble[i]["time"] = row_times[i]
 
             current_len = ds.shape[0]
             ds.resize(current_len + num_imus, axis=0)

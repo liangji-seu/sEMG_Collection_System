@@ -79,6 +79,20 @@ class CaptureStorageHealthTests(unittest.TestCase):
             self.assertEqual(saved.attrs["physical_device_ids_source"],
                              "collection_switch_expected")
 
+    def test_imu_all_uses_per_row_timestamps_for_multi_sample_packets(self):
+        # V5.3 一包可能带多帧 IMU 样本：每行必须落自己的时间戳，不能整包共用一个时间。
+        self._create("imu-multi")
+        chips = [{"index": i % 2, "acc": [1.0, 2.0, 3.0], "gyr": [4.0, 5.0, 6.0], "mag": None}
+                 for i in range(6)]
+        times = [1000.0, 1000.0, 1000.01, 1000.01, 1000.02, 1000.02]
+        written = self.server._append_imu_all("imu1_all", chips, times, frame_id=10,
+                                              hw_version="V2")
+        self.assertEqual(written, 6)
+        dataset = self.server.f["imu1_all_ble"]
+        self.assertEqual(list(dataset["time"]), times)
+        self.assertEqual(list(dataset["imu_index"]), [0, 1, 0, 1, 0, 1])
+        self.assertEqual(list(dataset["frame_id"]), [10] * 6)
+
     def test_row_counter_mismatch_refuses_to_report_success(self):
         self._create("mismatch")
         self._append_side(1)

@@ -2285,7 +2285,8 @@ class RealtimeEngine extends EventEmitter {
         for (let i = 0; i < dev.imu.length; i++) {
             const chip = dev.imu[i];
             imus.push({
-                index: i,
+                // V5.3 的 imu_all 是多帧展平列表，行号必须用固件给的芯片下标
+                index: Number.isInteger(chip?.index) ? chip.index : i,
                 acc: chip[0] || [0, 0, 0],
                 gyr: chip[1] || [0, 0, 0],
                 mag: hwVersion === "V1" ? (chip[2] || [0, 0, 0]) : null,  // V2 no mag
@@ -2351,7 +2352,9 @@ class RealtimeEngine extends EventEmitter {
                     imu1Norm = this.normalizeImuData(dev1);
                     imu1HwVersion = imu1Norm.hwVersion;
                     imu1NumImus = imu1Norm.numImus;
-                    imu1All = imu1Norm.imus;
+                    // V5.3: 一包可带多帧 IMU 样本，写盘用 imu_all（展平），显示用最后一帧
+                    imu1All = Array.isArray(dev1.imu_all) && dev1.imu_all.length > 0
+                        ? dev1.imu_all : imu1Norm.imus;
 
                     if (imu1HwVersion === "V1") {
                         if (dev1.imu?.[0]) imu1aData = this.imuChipToLegacy(dev1.imu[0], imu1HwVersion);
@@ -2374,7 +2377,8 @@ class RealtimeEngine extends EventEmitter {
                     imu2Norm = this.normalizeImuData(dev2);
                     imu2HwVersion = imu2Norm.hwVersion;
                     imu2NumImus = imu2Norm.numImus;
-                    imu2All = imu2Norm.imus;
+                    imu2All = Array.isArray(dev2.imu_all) && dev2.imu_all.length > 0
+                        ? dev2.imu_all : imu2Norm.imus;
 
                     if (imu2HwVersion === "V1") {
                         if (dev2.imu?.[0]) imu2aData = this.imuChipToLegacy(dev2.imu[0], imu2HwVersion);

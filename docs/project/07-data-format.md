@@ -8,6 +8,13 @@
 
 IMU同步输出包含 `valid` / `missing`，保留物理传感器数量。大缺帧清单存于 `sync_quality/devN/imu_missing_frame_ids`，由 `missing_frame_ids_path` 属性引用，避免属性尺寸上限。多bin使用逐段来源与偏移记录，不将单一偏移伪装为全文件规则。
 
+## 2026-10-30 BLE 包格式（固件 5.3.0）
+
+5.3.0 起 BLE 通知改为"可变 EMG 帧数 + IMU 实时尾包"：
+`4B包号 + N帧×16ch×bps + magic(0xA55A)+imu_seq+count+num_imus + count×num_imus×18B`。
+`N` 与 `count` 每包可变（现场 6/9 帧、0..3 个 IMU 样本），帧号必须按游标续写；
+详细格式、兼容策略与真机验证见 [BLE 5.3 包格式适配](20-ble-packet-v53.md)。
+
 ## 1. H5 文件结构
 
 ### 1.1 数据集概览
