@@ -6,6 +6,8 @@
 2. 缺设备时的错误信息包含手别与设备号；
 3. 发送队列溢出时丢"最旧的数据"，而不是把刚采到的新数据整批丢掉。
 """
+import asyncio
+import time
 import unittest
 from queue import PriorityQueue
 from unittest.mock import patch
@@ -38,6 +40,23 @@ class ControlWriteModeTests(unittest.IsolatedAsyncioTestCase):
         dev.client = self._FakeClient()
         await ble_server.send_control_command(dev, bytes([ble_server.CMD_MAP['CONFIG']]))
         self.assertEqual(dev.client.modes, [True])
+
+    async def test_hung_write_cannot_block_the_caller(self):
+        # WinRT 写调用可能挂 30 秒；调用方必须在 ~2 秒内返回，不能被拖死。
+        class _HangClient:
+            is_connected = True
+
+            async def write_gatt_char(self, *_args, **_kwargs):
+                await asyncio.Event().wait()
+
+        dev = ble_server.DeviceState(1)
+        dev.hw_version = "V2"
+        dev.client = _HangClient()
+        started = time.monotonic()
+        with patch("ble_server.log"):
+            await ble_server.send_control_command(
+                dev, bytes([ble_server.CMD_MAP['STOP']]), expect_response=False)
+        self.assertLess(time.monotonic() - started, 3.0)
 
 
 class SwitchAllOrNothingTests(unittest.IsolatedAsyncioTestCase):

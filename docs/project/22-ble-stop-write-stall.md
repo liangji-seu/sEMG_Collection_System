@@ -52,3 +52,25 @@ collection_stop_and_wait: success
 修复前同一路径会卡 30 秒以上并让前端报超时；现在 5 秒内完成。
 
 回归：Node 112 项、Python 187 项全部通过（新增 STOP 写入模式用例）。
+
+## 追加（19:33 / 20:09 两次现场卡顿）
+
+现场连续两次在"一轮结束 → 切回 preview/返回"时卡 30 秒，期间左手停止发数据、
+右手继续，看起来就是"左手断了"：
+
+- `19:33:11 stop_any_stream` → `19:33:41` 才停完 Dev1：卡在 `client.stop_notify()`；
+- `20:08:57 switch_collection_to_preview` Phase 1 → `20:09:27` 才打印"Dev1 已发送 STOP"：
+  即使已经改成 without-response，WinRT 的 GATT 写调用本身仍可能被拥塞卡 30 秒。
+
+对应修复：
+
+1. **不再 await `stop_notify()`**：旧回调由 `notification_epoch` 保护，下一次
+   `start_notify` 会覆盖回调，残留通知会被忽略；取消订阅对采流不是必需的。
+2. `send_control_command` 统一改成"有界等待"：`asyncio.ensure_future(write)` +
+   `wait_for(shield(task), min(timeout, 2s))`，超时后让写操作在后台继续并立即返回；
+   `SET_FILENAME` 超时仍会补一次 without-response。这样任何一次 WinRT 写挂起都不会
+   再堵住 asyncio 控制链路。
+
+验证：新增 `hung_write_cannot_block_the_caller` 用例（永不完成的写调用，调用方
+2 秒内返回）；真机全流程回归待手环上电后补跑。
+

@@ -1511,32 +1511,47 @@ async def send_control_command(dev: DeviceState, payload: bytes, timeout: float 
     """V1/V2 统一的控制命令写入封装
 
     V2 设备默认使用 Write with Response（与 main_windows 原始逻辑一致）；
-    STOP/START 这类"发完就走"的命令用 expect_response=False，避免设备忙于
-    关闭 SD 文件时 ATT 响应迟迟不回，把事件循环卡住（实测 STOP 卡 30s，
-    前端 12s 超时 → 切流失败但后台仍在切，状态错位）。
+    STOP/START 这类"发完就走"的命令用 expect_response=False。
 
-    V1 设备始终使用 Write without Response。
+    关键：WinRT 的 GATT 写调用即使 without-response 也可能被设备忙/链路拥塞卡住
+    （实测 STOP 写卡 30s，把切流和收尾整条 asyncio 链路堵死）。因此这里统一用
+    `shield + wait_for` 做"有界等待"：最多等 2 秒，超时后让写操作在后台继续，
+    不再阻塞调用方；同一 characteristic 上的后续写由协议栈排队，顺序不会乱。
     """
     if dev.client is None or not dev.is_connected():
         raise RuntimeError(f"Dev{dev.device_id} not connected")
 
-    if dev.hw_version != "V2" or not expect_response:
-        await dev.client.write_gatt_char(CONTROL_CHAR_UUID, payload, response=False)
-        return
+    use_response = dev.hw_version == "V2" and expect_response
+    write_task = asyncio.ensure_future(
+        dev.client.write_gatt_char(CONTROL_CHAR_UUID, payload, response=use_response))
+
+    def _consume(task):
+        try:
+            task.exception()
+        except BaseException:
+            pass
+
+    write_task.add_done_callback(_consume)
 
     try:
-        await asyncio.wait_for(
-            dev.client.write_gatt_char(CONTROL_CHAR_UUID, payload, response=True),
-            timeout=timeout,
-        )
+        await asyncio.wait_for(asyncio.shield(write_task), timeout=min(timeout, 2.0))
+        return
     except asyncio.TimeoutError:
-        # 设备响应慢但命令可能已生效，对 SET_FILENAME 做一次 without-response 兜底
+        if not use_response:
+            log(f"[Dev{dev.device_id}] 控制命令写入超时，已转后台继续（不阻塞切流）")
+            return
+        # 设备响应慢但命令可能已生效，对 SET_FILENAME 再做一次 without-response 兜底
         if payload and payload[0] == CMD_MAP['SET_FILENAME']:
             log(f"[Dev{dev.device_id}] SET_FILENAME response timeout; retry write without response")
             await asyncio.sleep(0.1)
-            await dev.client.write_gatt_char(CONTROL_CHAR_UUID, payload, response=False)
-        else:
-            raise
+            try:
+                await asyncio.wait_for(
+                    dev.client.write_gatt_char(CONTROL_CHAR_UUID, payload, response=False),
+                    timeout=1.0)
+            except Exception:
+                pass
+            return
+        raise
 
 
 async def refresh_device_for_connect(mac: str, fallback_device=None):
@@ -1921,10 +1936,10 @@ async def stop_stream(ws, device_id: int, silent=False):
         if dev.client and dev.is_connected():
             await send_control_command(dev, bytes([CMD_MAP['STOP']]), expect_response=False)
             log(f"[Dev{device_id}] 已发送 STOP")
-            
-            await dev.client.stop_notify(EMG_DATA_CHAR_UUID)
-            log(f"[Dev{device_id}] 已取消订阅")
-        
+            # 不再 await stop_notify：WinRT 的 CCCD 写入会等设备响应，设备忙关 bin 时
+            # 实测阻塞 30s，把切流/停止流程整个卡死。旧回调由 notification_epoch 保护，
+            # 下次 start_notify 会覆盖回调，收到的旧通知会被直接丢弃。
+
         dev.is_streaming = False
         clear_stream_buffers(dev)
 
@@ -2146,11 +2161,8 @@ async def _do_stop_stream_for_device(dev):
                 stop_result['error'] = '设备已断开，无法发送 STOP 命令'
                 log(f"[Dev{dev.device_id}] 设备已断开，无法发送 STOP 命令")
 
-            if dev.client:
-                try:
-                    await dev.client.stop_notify(EMG_DATA_CHAR_UUID)
-                except Exception:
-                    pass
+            # 不 await stop_notify（WinRT CCCD 写入可能阻塞 30s）；旧回调由 epoch 保护，
+            # 下次 start_notify 覆盖回调，残留的旧通知会被直接丢弃。
     finally:
         dev.is_streaming = False
         clear_stream_buffers(dev)

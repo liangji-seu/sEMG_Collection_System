@@ -121,7 +121,8 @@ class BleStopResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(disconnected.is_streaming)
         self.assertEqual(len(disconnected.raw_buffer), 0)
         self.assertEqual(len(disconnected.data_buffer), 0)
-        disconnected.client.stop_notify.assert_awaited_once()
+        # stop_notify 不再 await（WinRT CCCD 写入可能阻塞 30s）
+        disconnected.client.stop_notify.assert_not_awaited()
 
         write_failed = self._dev(connected=True)
         with patch("ble_server.send_control_command", new_callable=AsyncMock,
@@ -133,7 +134,7 @@ class BleStopResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(write_failed.is_streaming)
         self.assertEqual(len(write_failed.raw_buffer), 0)
         self.assertEqual(len(write_failed.data_buffer), 0)
-        write_failed.client.stop_notify.assert_awaited_once()
+        write_failed.client.stop_notify.assert_not_awaited()
 
     async def test_successful_stop_is_reported_per_device_without_changing_top_level_success(self):
         dev = self._dev(connected=True)
