@@ -2329,16 +2329,38 @@ async def start_preview_stream(ws, device_id=None):
             }
             for did in [1, 2]
         }
+        streaming_modes = [
+            info['stream_mode'] for info in device_status.values() if info['streaming']
+        ]
+        already_preview = bool(streaming_modes) and all(
+            mode == 'preview' for mode in streaming_modes)
+        collection_running = any(mode == 'collection' for mode in streaming_modes)
         log(f"[preview] 没有需要启动 preview 的设备: {device_status}")
         if ws:
             has_connected = any(info['connected'] for info in device_status.values())
-            await send_to_control(ws, 'start_preview_stream', {
-                'success': False,
-                'started': [],
-                'stream_mode': 'preview',
-                'device_status': device_status,
-                'error': '没有已连接设备' if not has_connected else '设备已全部在采集中',
-            })
+            if already_preview:
+                # 幂等：设备本来就在 preview，重复进入采集页不算失败
+                await send_to_control(ws, 'start_preview_stream', {
+                    'success': True,
+                    'started': [],
+                    'already_streaming': True,
+                    'stream_mode': 'preview',
+                    'device_status': device_status,
+                })
+            else:
+                if not has_connected:
+                    error = '没有已连接设备'
+                elif collection_running:
+                    error = '设备正在采集流中，请先停止采集'
+                else:
+                    error = '设备已全部在采集中'
+                await send_to_control(ws, 'start_preview_stream', {
+                    'success': False,
+                    'started': [],
+                    'stream_mode': 'preview',
+                    'device_status': device_status,
+                    'error': error,
+                })
         return
 
     started_ids = []

@@ -428,6 +428,20 @@ async function decodeData(buffer) {
             updateConnectButton(deviceId, true);
         }
         
+        // preview 流：只用于波形显示，启动是幂等的，失败不弹红框
+        else if (action === 'start_preview_stream') {
+            if (msg.success) {
+                (msg.started || []).forEach(id => {
+                    if (BleState.devices[id]) BleState.devices[id].streaming = true;
+                });
+                updateAllUI();
+            } else {
+                console.warn('[BLE] preview stream 未启动:', msg.error || '未知原因');
+                // 预览流失败用黄色提示，不再用红色"启动失败"（设备已在预览属正常情况）
+                showToast('预览流未启动: ' + (msg.error || '未知原因'), 'warning');
+            }
+        }
+        
         // 开始采集
         else if (action.startsWith('start')) {
             const deviceId = action === 'start_all' ? 0 : parseInt(action.slice(-1));

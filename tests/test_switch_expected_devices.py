@@ -218,5 +218,47 @@ class QueueDropOldestTests(unittest.TestCase):
         self.assertEqual(self._drain_markers(), ["h1", "h2"])
 
 
+class PreviewStartIdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    """重复进入采集页会再次 start_preview_stream；设备本来就在 preview 时不应报错。"""
+
+    class _Client:
+        is_connected = True
+
+    def _dev(self, device_id, streaming, mode, connected=True):
+        dev = ble_server.DeviceState(device_id)
+        dev.client = self._Client() if connected else None
+        dev.mac = "AA:BB:CC:DD:EE:0%d" % device_id
+        dev.is_streaming = streaming
+        dev.stream_mode = mode
+        return dev
+
+    async def _start(self, dev1, dev2):
+        sent = []
+
+        async def fake_send(_ws, action, payload):
+            sent.append((action, payload))
+
+        with patch.object(ble_server.state, 'get_device',
+                          side_effect=lambda did: dev1 if did == 1 else dev2), \
+                patch('ble_server.send_to_control', new=fake_send):
+            await ble_server.start_preview_stream(object())
+        return sent[-1][1]
+
+    async def test_devices_already_in_preview_is_success(self):
+        payload = await self._start(
+            self._dev(1, True, 'preview'),
+            self._dev(2, False, 'idle', connected=False))
+        self.assertTrue(payload['success'])
+        self.assertTrue(payload['already_streaming'])
+        self.assertEqual(payload['started'], [])
+
+    async def test_collection_streaming_reports_actionable_error(self):
+        payload = await self._start(
+            self._dev(1, True, 'collection'),
+            self._dev(2, False, 'idle', connected=False))
+        self.assertFalse(payload['success'])
+        self.assertIn('采集流', payload['error'])
+
+
 if __name__ == "__main__":
     unittest.main()
