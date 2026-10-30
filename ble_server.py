@@ -353,6 +353,7 @@ RAW_DRAIN_LIMIT_PER_TICK = 100
 
 # ================= 数据超时检测 =================
 DATA_TIMEOUT = 3.0  # 3秒无数据则认为设备停止发送
+EMG_HEALTH_TIMEOUT = 5.0
 
 # ================= 优先级 =================
 PRIORITY_CONTROL = 0   # 控制命令（最高优先级）
@@ -385,6 +386,11 @@ class DeviceState:
     sample_clock_ref: Optional[tuple] = None
     last_emit_time: Optional[float] = None
     last_data_time: float = 0.0  # 【新增】最后收到数据的时间戳
+    stream_started_monotonic: Optional[float] = None
+    last_notification_monotonic: Optional[float] = None
+    last_valid_emg_monotonic: Optional[float] = None
+    emg_health_missing_logged: bool = False
+    capture_fault_active: bool = False
     sd_filename: Optional[str] = None  # 【新增】当前采集的SD卡bin文件名前缀
     stream_mode: str = "idle"  # "idle" | "preview" | "collection" — 当前流模式
 
@@ -418,6 +424,12 @@ class DeviceState:
         self.raw_buffer.clear()
         self.data_buffer.clear()
         self.raw_dropped_packets = 0
+        self.last_data_time = 0.0
+        self.stream_started_monotonic = None
+        self.last_notification_monotonic = None
+        self.last_valid_emg_monotonic = None
+        self.emg_health_missing_logged = False
+        self.capture_fault_active = False
         self.notification_epoch += 1
         self.sd_filename = None  # 【新增】重置SD卡文件名
         self.stream_mode = "idle"  # 【新增】重置流模式
@@ -704,6 +716,11 @@ def parse_packet(data: bytearray, dev: DeviceState) -> Optional[dict]:
                 imu = parse_imu_v1(data, emg_len)
 
         dev.total_frames += fpkt
+        dev.last_valid_emg_monotonic = time.monotonic()
+        dev.capture_fault_active = False
+        if getattr(dev, 'emg_health_missing_logged', False):
+            log(f"[Dev{dev.device_id}] EMG_CAPTURE_HEALTH recovered frames={dev.total_frames}")
+            dev.emg_health_missing_logged = False
 
         # ===== 丢包检测：跟踪 packet_counter 连续性 =====
         if dev.last_packet_counter >= 0:
@@ -917,6 +934,11 @@ def clear_stream_buffers(dev: DeviceState):
     dev.raw_buffer.clear()
     dev.data_buffer.clear()
     dev.last_data_time = 0.0
+    dev.stream_started_monotonic = None
+    dev.last_notification_monotonic = None
+    dev.last_valid_emg_monotonic = None
+    dev.emg_health_missing_logged = False
+    dev.capture_fault_active = False
     dev.notification_epoch += 1
     reset_callback_timing(dev.device_id)
 
@@ -933,6 +955,7 @@ def create_notification_handler(dev: DeviceState):
             if handler_epoch != dev.notification_epoch:
                 return
             ts = _precise_time()  # 高精度时间戳，避免 time.time() 15ms 精度导致回退
+            dev.last_notification_monotonic = time.monotonic()
             device_key = dev.device_id
 
             if device_key in _last_callback_time:
@@ -950,6 +973,62 @@ def create_notification_handler(dev: DeviceState):
         except Exception as e:
             log(f"[Dev{dev.device_id}] 回调错误: {e}")
     return handler
+
+
+def log_capture_device_health(dev: DeviceState, now=None):
+    """Emit a low-rate JSON snapshot and one warning per no-EMG/recovery transition."""
+    now = time.monotonic() if now is None else now
+    started = getattr(dev, 'stream_started_monotonic', None)
+    last_emg = getattr(dev, 'last_valid_emg_monotonic', None)
+    last_notification = getattr(dev, 'last_notification_monotonic', None)
+    emg_age = max(0.0, now - last_emg) if last_emg is not None else None
+    notification_age = max(0.0, now - last_notification) if last_notification is not None else None
+    health = {
+        'device_id': int(dev.device_id),
+        'connected': bool(dev.is_connected()),
+        'streaming': bool(dev.is_streaming),
+        'mode': str(getattr(dev, 'stream_mode', 'idle')),
+        'name': getattr(dev, 'name', None),
+        'sd_prefix': getattr(dev, 'sd_filename', None),
+        'total_frames': int(getattr(dev, 'total_frames', 0)),
+        'lost_frames': int(getattr(dev, 'lost_frames', 0)),
+        'raw_dropped': int(getattr(dev, 'raw_dropped_packets', 0)),
+        'last_valid_emg_age_s': emg_age,
+        'last_valid_notification_age_s': notification_age,
+    }
+    if dev.is_streaming and started is not None and now - (last_emg if last_emg is not None else started) >= EMG_HEALTH_TIMEOUT:
+        if not getattr(dev, 'emg_health_missing_logged', False):
+            log(f"[Dev{dev.device_id}] EMG_CAPTURE_HEALTH no_valid_emg {json.dumps(health, ensure_ascii=False, sort_keys=True)}")
+            dev.emg_health_missing_logged = True
+    log(f"[Dev{dev.device_id}] EMG_CAPTURE_HEALTH {json.dumps(health, ensure_ascii=False, sort_keys=True)}")
+    if dev.is_streaming and getattr(dev, 'stream_mode', 'idle') == 'collection':
+        if not health['connected']:
+            emit_collection_capture_fault(dev, 'ble_disconnected', '蓝牙设备已断开')
+        elif started is not None and now - (last_emg if last_emg is not None else started) >= EMG_HEALTH_TIMEOUT:
+            emit_collection_capture_fault(dev, 'ble_no_emg', f'采集期间已超过 {EMG_HEALTH_TIMEOUT:g} 秒未收到有效 EMG 数据')
+        else:
+            # A live connection with recent valid EMG ends the current fault episode.
+            if health['connected'] and last_emg is not None:
+                dev.capture_fault_active = False
+    return health
+
+
+def emit_collection_capture_fault(dev: DeviceState, code: str, message: str):
+    """Queue one high-priority data-client fault for the current BLE outage episode."""
+    if getattr(dev, 'capture_fault_active', False):
+        return False
+    packet = {
+        'type': 'capture_fault',
+        'source': 'ble',
+        'code': code,
+        'device_id': int(dev.device_id),
+        'sd_prefix': getattr(dev, 'sd_filename', None),
+        'message': message,
+    }
+    queued = add_to_queue(PRIORITY_HIGH, 'data', packet)
+    if queued:
+        dev.capture_fault_active = True
+    return queued
 
 
 def data_sender_thread():
@@ -1048,6 +1127,9 @@ def data_sender_thread():
             # 每5秒打印一次发送统计
             now = time.time()
             if now - last_log_time >= 5.0:
+                health_now = time.monotonic()
+                log_capture_device_health(state.dev1, health_now)
+                log_capture_device_health(state.dev2, health_now)
                 if send_count > 0 or active:
                     timeout_info = ""
                     if dev1_timeout or dev2_timeout:
@@ -1493,8 +1575,11 @@ async def disconnect_device(ws, device_id: int, silent=False):
     dev = state.get_device(device_id)
     action = f'disconnect{device_id}'
     mac = dev.mac
+    was_collection_streaming = dev.is_streaming and dev.stream_mode == 'collection'
 
     try:
+        if was_collection_streaming:
+            emit_collection_capture_fault(dev, 'ble_disconnected', '采集期间蓝牙设备被断开')
         if dev.is_streaming:
             await stop_stream(ws, device_id, silent=True)
             dev.stream_mode = "idle"
@@ -1618,6 +1703,7 @@ async def start_stream(ws, device_id: int):
         log(f"[Dev{device_id}] 已发送 START 命令")
 
         dev.is_streaming = True
+        dev.stream_started_monotonic = time.monotonic()
 
         await send_to_control(ws, action, {
             'success': True,
@@ -1837,6 +1923,7 @@ async def _do_start_stream_for_device(dev, filename_str):
         # clear_stream_buffers 被调用数百次，epoch 远超 handler_epoch，所有 BLE
         # 通知被静默丢弃 → 前端 0 信号。
         dev.is_streaming = True
+        dev.stream_started_monotonic = time.monotonic()
         handler = create_notification_handler(dev)
         reset_callback_timing(dev.device_id)
         await dev.client.start_notify(EMG_DATA_CHAR_UUID, handler)
@@ -1864,20 +1951,35 @@ async def _do_start_stream_for_device(dev, filename_str):
 
 async def _do_stop_stream_for_device(dev):
     """对单个设备执行: STOP → unsubscribe 的底层逻辑。"""
+    stop_result = {
+        'device_id': dev.device_id,
+        'local_stopped': False,
+        'stop_command_sent': False,
+    }
     try:
-        if dev.is_streaming and dev.client and dev.is_connected():
-            await send_control_command(dev, bytes([CMD_MAP['STOP']]))
-            log(f"[Dev{dev.device_id}] STOP 命令已发送")
-            try:
-                await dev.client.stop_notify(EMG_DATA_CHAR_UUID)
-            except Exception:
-                pass
+        if dev.is_streaming:
+            if dev.client and dev.is_connected():
+                try:
+                    await send_control_command(dev, bytes([CMD_MAP['STOP']]))
+                    stop_result['stop_command_sent'] = True
+                    log(f"[Dev{dev.device_id}] STOP 命令已发送")
+                except Exception as e:
+                    stop_result['error'] = f"STOP 命令发送失败: {e}"
+                    log(f"[Dev{dev.device_id}] 停止 stream 失败: {e}")
+            else:
+                stop_result['error'] = '设备已断开，无法发送 STOP 命令'
+                log(f"[Dev{dev.device_id}] 设备已断开，无法发送 STOP 命令")
+
+            if dev.client:
+                try:
+                    await dev.client.stop_notify(EMG_DATA_CHAR_UUID)
+                except Exception:
+                    pass
+    finally:
         dev.is_streaming = False
         clear_stream_buffers(dev)
-    except Exception as e:
-        log(f"[Dev{dev.device_id}] 停止 stream 失败: {e}")
-        dev.is_streaming = False
-        clear_stream_buffers(dev)
+        stop_result['local_stopped'] = True
+    return stop_result
 
 
 async def start_preview_stream(ws, device_id=None):
@@ -1986,9 +2088,10 @@ async def stop_collection_stream(ws, device_id=None, silent=False):
 
     stopped_ids = []
     sd_filenames = {}
+    stop_results = {}
     for dev in devices_to_stop:
         sd_filenames[f'dev{dev.device_id}'] = dev.sd_filename
-        await _do_stop_stream_for_device(dev)
+        stop_results[f'dev{dev.device_id}'] = await _do_stop_stream_for_device(dev)
         dev.stream_mode = "idle"
         stopped_ids.append(dev.device_id)
         log(f"[collection] Dev{dev.device_id} collection stream 已停止: {dev.sd_filename}")
@@ -2002,6 +2105,7 @@ async def stop_collection_stream(ws, device_id=None, silent=False):
             'success': True,
             'stopped': stopped_ids,
             'sd_filenames': sd_filenames,
+            'stop_results': stop_results,
             'stream_mode': 'collection',
         })
 

@@ -31,11 +31,17 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
 from PyQt5.QtGui import QFont, QColor, QPalette, QPixmap, QImage
+# Load file_access under its canonical top-level module name before either
+# offline entrypoint is imported, so transaction thread-local state is shared.
+_tools_dir = os.path.dirname(os.path.abspath(__file__))
+if _tools_dir not in sys.path:
+    sys.path.insert(0, _tools_dir)
 try:
     from file_access import h5_transaction, FileBusyError, exclusive_file
 except ImportError:
     h5_transaction = None
     FileBusyError = RuntimeError
+    exclusive_file = None
 
 # cv2 用于视频帧读取（精确对齐标定功能）
 try:
@@ -112,41 +118,8 @@ def _is_h5_stale_write_error(exc):
 
 
 def repair_h5_stale_write_flag(h5_path):
-    """Clear a stale HDF5 v3 write-access flag after the file is known idle.
-
-    Preconditions: the caller has independently confirmed that no recorder or
-    other process currently has this file open for writing. This function edits
-    the raw superblock and creates a backup, so it remains an explicit
-    maintenance operation rather than an automatic open fallback.
-
-    Returns (ok, message). A backup is created before modifying the file.
-    """
-    with open(h5_path, 'rb') as f:
-        header = bytearray(f.read(48))
-    if len(header) < 48 or bytes(header[:8]) != HDF5_SIGNATURE:
-        return False, '不是可识别的 HDF5 superblock'
-    if header[8] != 3:
-        return False, f'仅支持自动修复 superblock v3，当前版本={header[8]}'
-    if header[11] == 0:
-        return True, 'HDF5 write flag 已经是 0'
-
-    backup_path = h5_path + '.bak_before_h5clear_flag'
-    if not os.path.exists(backup_path):
-        import shutil
-        shutil.copy2(h5_path, backup_path)
-
-    header[11] = 0
-    checksum = _jenkins_lookup3_hashlittle(bytes(header[:44]))
-    header[44:48] = checksum.to_bytes(4, 'little')
-    with open(h5_path, 'r+b') as f:
-        f.write(header)
-
-    try:
-        with h5py.File(h5_path, 'r') as _f:
-            _ = list(_f.keys())
-    except Exception as e:
-        return False, f'已清除 stale flag，但 H5 元数据仍无法打开: {e}'
-    return True, f'已清除 stale write flag，备份: {os.path.basename(backup_path)}'
+    """Legacy entry point; route through the guarded open/recovery flow."""
+    return ensure_h5_openable(h5_path)
 
 
 def ensure_h5_openable(h5_path):
@@ -156,9 +129,25 @@ def ensure_h5_openable(h5_path):
     except Exception as e:
         if not _is_h5_stale_write_error(e):
             return False, str(e)
-        return False, ('HDF5 文件可能仍在采集或被其他程序占用，也可能是上次异常退出遗留了写入标记。'
-                       '请先停止采集并关闭占用程序后重试；若仍报错，请保留原文件，'
-                       '确认没有写入进程后再备份检查写入标记。')
+        if exclusive_file is None:
+            return False, '无法安全恢复：离线文件锁依赖未加载，源文件未修改。'
+        try:
+            from h5_recovery import recover_stale_write_flag
+            with exclusive_file(h5_path):
+                ok, message = recover_stale_write_flag(
+                    h5_path, _jenkins_lookup3_hashlittle)
+            if not ok:
+                return False, message
+            try:
+                with h5py.File(h5_path, 'r') as _f:
+                    _f.visititems(lambda _name, _obj: None)
+            except Exception as reopen_error:
+                return False, (f'{message}；清除后重开验证失败: {reopen_error}。'
+                               '完整备份已保留，请勿覆盖源文件。')
+            return True, message
+        except Exception as recovery_error:
+            return False, ('无法安全恢复 HDF5 stale write flag；文件可能仍在使用或格式不受支持，'
+                           f'源文件未确认可用。{recovery_error}')
 
 
 def _sync_output_is_valid(h5_path, device_id, result, require_imu=False):
@@ -223,6 +212,7 @@ try:
         sys.path.insert(0, _tools_dir)
     from bin_sync_tool import (EMGBinParser, IMUBinParser, sync_h5_with_bin,
                                sync_h5_one_to_one, sync_h5_one_to_many_adc_search,
+                               sync_h5_from_peer_time_reference,
                                sync_h5_one_to_one_multibin_rescue,
                                find_bin_offset_by_adc,
                                diagnose_frame_ids, clear_sync_outputs,
@@ -232,6 +222,31 @@ try:
 except ImportError:
     HAS_SYNC_TOOL = False
     print("[警告] 无法导入bin_sync_tool，同步功能不可用")
+
+
+def _ble_dataset_is_empty(h5_path, device_id):
+    try:
+        with h5py.File(h5_path, 'r') as f:
+            dataset = f.get(f'emg{int(device_id)}_250hz_adc')
+            return dataset is not None and dataset.shape[0] == 0
+    except Exception:
+        return False
+
+
+def _peer_reference_for_target(target_device_id, completed_results, specs, h5_path):
+    spec_by_device = {int(device_id): (emg_bin, imu_bin)
+                      for device_id, emg_bin, imu_bin, *_rest in specs}
+    for reference_device_id, result, _require_imu in completed_results:
+        if (int(reference_device_id) == int(target_device_id) or
+                result.get('status') not in ('success', 'skipped') or
+                int(reference_device_id) not in spec_by_device or
+                _ble_dataset_is_empty(h5_path, reference_device_id)):
+            continue
+        if result.get('status') == 'skipped' and result.get('reason') not in (
+                'already_synced', 'already_validated'):
+            continue
+        return int(reference_device_id), spec_by_device[int(reference_device_id)][0]
+    return None, None
 
 CalibrateWidget = None
 HAS_CALIBRATE_TOOL = None
@@ -778,9 +793,15 @@ class SyncWorker(QThread):
             if not ok:
                 self.log.emit(f"  ✗ H5文件无法打开: {message}")
                 continue
+            if message != 'ok':
+                self.log.emit(f"  ✓ {message}")
+            # Resolve a non-empty BLE clock source first so an empty hand can
+            # only borrow time from a successfully synchronized opposite hand.
+            ordered_device_ids = sorted(
+                device_ids, key=lambda d: _ble_dataset_is_empty(h5_file, d))
             specs = []
             missing = []
-            for device_id in device_ids:
+            for device_id in ordered_device_ids:
                 emg_bin, imu_bin = self._find_bin_files(h5_file, device_id)
                 require_imu = f'imu{device_id}' in self.devices
                 if not emg_bin:
@@ -797,8 +818,25 @@ class SyncWorker(QThread):
                     device_results = []
                     for device_id, emg_bin, imu_bin, require_imu in specs:
                         try:
-                            result = self._sync_device_transactional(
-                                work_path, device_id, emg_bin, imu_bin)
+                            peer_device, peer_bin = _peer_reference_for_target(
+                                device_id, device_results, specs, work_path)
+                            if _ble_dataset_is_empty(work_path, device_id):
+                                if peer_device:
+                                    result = sync_h5_from_peer_time_reference(
+                                        work_path, emg_bin, peer_device, peer_bin,
+                                        device_id, imu_bin_path=imu_bin,
+                                        full_bin=self.sync_mode != 'one_to_many')
+                                    if result.get('status') == 'success':
+                                        self.log.emit(
+                                            f"    D{device_id}: 使用 D{peer_device} BLE 时间锚，"
+                                            f"BIN 启动差 {result.get('peer_start_delta_seconds', 0):+.0f}s"
+                                            "（头时间精度 1s）")
+                                else:
+                                    result = {'status': 'validation_failed',
+                                              'reason': 'empty target BLE has no successful verified opposite-hand reference'}
+                            else:
+                                result = self._sync_device_transactional(
+                                    work_path, device_id, emg_bin, imu_bin)
                         except Exception as exc:
                             result = {'status': 'error', 'reason': str(exc)}
                         device_results.append((device_id, result, require_imu))
@@ -813,7 +851,9 @@ class SyncWorker(QThread):
                         for device_id, result, _require_imu in device_results:
                             source = next(spec[1] for spec in specs if spec[0] == device_id)
                             update_sync_status(f, device_id, source_path=source,
-                                imu_result=result, validation_passed=bool(self.validate_data))
+                                imu_result=result,
+                                validation_passed=bool(self.validate_data or
+                                                       result.get('peer_time_fallback')))
                         f.attrs['sync_last_operation_results'] = json.dumps(
                             details, ensure_ascii=False, default=str)
                 success_count += 1
@@ -3205,6 +3245,13 @@ class SyncCalibrationTab(QWidget):
         """加载 H5 文件及关联视频"""
         self.close_file()
 
+        ok, message = ensure_h5_openable(file_path)
+        if not ok:
+            QMessageBox.warning(self, "错误", f"无法打开文件: {message}")
+            return
+        if message != 'ok':
+            QMessageBox.information(self, "HDF5修复", message)
+
         self.h5_path = file_path
         self.h5_file = h5py.File(file_path, 'r')
         try:
@@ -3829,6 +3876,12 @@ class CalibrateTab(QWidget):
 
     def load_file(self, file_path):
         """加载H5文件并可视化"""
+        ok, message = ensure_h5_openable(file_path)
+        if not ok:
+            QMessageBox.warning(self, "错误", f"无法打开文件: {message}")
+            return
+        if message != 'ok':
+            QMessageBox.information(self, "HDF5修复", message)
         if self.ensure_widget():
             self.calibrate_widget.load_h5_file(file_path)
 
@@ -5646,9 +5699,19 @@ class OneToManySyncWorker(QThread):
         for idx, h5_path in enumerate(self.h5_paths):
             fname = os.path.basename(h5_path)
             self.file_started.emit(idx, total, fname)
+            ok, message = ensure_h5_openable(h5_path)
+            if not ok:
+                self.log.emit(f'  ✗ H5文件无法安全打开: {message}')
+                results.append({'file': fname, 'status': 'failed', 'reason': message})
+                self.file_finished.emit(idx, total, fname, 'failed', message)
+                continue
+            if message != 'ok':
+                self.log.emit(f'  ✓ {message}')
+            ordered_device_ids = sorted(
+                device_ids, key=lambda d: _ble_dataset_is_empty(h5_path, d))
             specs = []
             missing = []
-            for device_id in device_ids:
+            for device_id in ordered_device_ids:
                 emg_bin, imu_bin = self._find_bin(h5_path, device_id)
                 if not emg_bin:
                     missing.append(f'D{device_id} EMG bin')
@@ -5666,11 +5729,27 @@ class OneToManySyncWorker(QThread):
                     device_results = []
                     for device_id, emg_bin, imu_bin in specs:
                         try:
-                            result = sync_h5_one_to_many_adc_search(
-                                work_path, emg_bin, imu_bin,
-                                device_id=device_id, verify=True, set_synced=False,
-                                num_anchors=self.num_anchors,
-                                match_threshold=self.match_threshold)
+                            peer_device, peer_bin = _peer_reference_for_target(
+                                device_id, device_results, specs, work_path)
+                            if _ble_dataset_is_empty(work_path, device_id):
+                                if peer_device:
+                                    result = sync_h5_from_peer_time_reference(
+                                        work_path, emg_bin, peer_device, peer_bin,
+                                        device_id, imu_bin_path=imu_bin, full_bin=False)
+                                    if result.get('status') == 'success':
+                                        self.log.emit(
+                                            f'    D{device_id}: 使用 D{peer_device} BLE 时间锚，'
+                                            f"BIN 启动差 {result.get('peer_start_delta_seconds', 0):+.0f}s"
+                                            '（头时间精度 1s）')
+                                else:
+                                    result = {'status': 'validation_failed',
+                                              'reason': 'empty target BLE has no successful verified opposite-hand reference'}
+                            else:
+                                result = sync_h5_one_to_many_adc_search(
+                                    work_path, emg_bin, imu_bin,
+                                    device_id=device_id, verify=True, set_synced=False,
+                                    num_anchors=self.num_anchors,
+                                    match_threshold=self.match_threshold)
                         except Exception as exc:
                             result = {'status': 'error', 'reason': str(exc)}
                         device_results.append((device_id, result, self.imu))

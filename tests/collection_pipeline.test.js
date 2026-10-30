@@ -236,6 +236,7 @@ test('a PUSH failure makes close fail and keeps the file open', async () => {
         storageDataSequence: engine.storageDataSequence,
         storageDataLastSentSequence: engine.storageDataLastSentSequence,
         storageDataSendError: engine.storageDataSendError,
+        storagePushFallbackActive: engine.storagePushFallbackActive,
         sendStorageCommand: engine.sendStorageCommand
     };
     let closeCount = 0;
@@ -252,6 +253,7 @@ test('a PUSH failure makes close fail and keeps the file open', async () => {
     engine.storageDataSendError = null;
     engine.sendStorageCommand = async cmd => {
         if (cmd === 'close') closeCount += 1;
+        if (cmd === 'append') return { status: 'error', msg: 'REP unavailable' };
         return { status: 'success' };
     };
 
@@ -325,24 +327,25 @@ test('REQ timeout rebuilds the socket and rejects queued commands together', asy
     assert.equal(localEngine.storageRequestQueue.length, 0);
 });
 
-test('PUSH pending limit rejects data and makes close fail without sending', async () => {
+test('PUSH pending limit reports collection backpressure without sending', async () => {
     const localEngine = loadEngineWithoutNativeSockets();
     let sendCount = 0;
     localEngine.streamMode = 'collection';
     localEngine.stageFileOpen = true;
     localEngine.storage_push_connected = true;
     localEngine.storagePushPendingCount = 1000;
+    localEngine.isCollecting = true;
+    localEngine.collectionState = 'collecting';
+    localEngine.collectionBinFilenames = { dev1: 'left-bin', dev2: null };
     localEngine.storage_push_socket = { send: async () => { sendCount += 1; } };
     localEngine.notifyH5StorageWarning = () => {};
-    localEngine.sendStorageCommand = async () => {
-        throw new Error('close must be blocked');
-    };
+    let fault = null;
+    localEngine.requestCollectionFault = packet => { fault = packet; return true; };
 
     await localEngine.saveDataToStorage({ emg1: [[[1]]] });
-    const closeResult = await localEngine.closeStageFile();
     assert.equal(sendCount, 0);
-    assert.match(localEngine.storageDataSendError.message, /队列已满/);
-    assert.equal(closeResult.status, 'error');
+    assert.equal(localEngine.storageDataSendError, null);
+    assert.equal(fault.code, 'storage_backpressure');
 });
 
 test('stop waits for opening close, tries incomplete finalization, and releases sockets on close failure', async () => {
@@ -499,23 +502,24 @@ test('unreachable create reconciliation never releases uncertain ownership', asy
     await assert.rejects(e.onCollectionStart({}), /上一Stage/);
 });
 
-test('failed PUSH can finalize incomplete and admit a clean next session', async () => {
+test('failed PUSH and REP fallback automatically save incomplete before admitting a clean next session', async () => {
     const e = loadEngineWithoutNativeSockets(); const commands = [];
     e.stageFileOpen = true; e.storageFileToken = 'old'; e.streamMode = 'collection';
     e.storage_push_connected = true;
     e.storage_push_socket.send = async () => { throw new Error('connection lost'); };
-    e.sendStorageCommand = async (cmd, params) => { commands.push({ cmd, params }); return { status: 'success' }; };
+    e.sendStorageCommand = async (cmd, params) => { commands.push({ cmd, params }); return cmd === 'append' ? { status: 'error', msg: 'REP unavailable' } : { status: 'success' }; };
     await e.saveDataToStorage({ emg1: [[1]] });
-    assert.equal((await e.onCollectionStop(true)).status, 'error');
-    assert.equal((await e.finalizeIncomplete()).status, 'success');
-    assert.equal(commands[0].cmd, 'finalize_incomplete');
-    assert.equal(commands[0].params._storage_file_token, 'old');
-    assert.equal(commands[0].params._storage_data_seq, 0);
+    assert.equal((await e.collectionFaultFinalizePromise).status, 'success');
+    assert.equal(e.collectionState, 'interrupted');
+    const finalize = commands.find(command => command.cmd === 'finalize_incomplete');
+    assert.ok(finalize);
+    assert.equal(finalize.params._storage_file_token, 'old');
+    assert.equal(finalize.params._storage_data_seq, 0);
     await e.onCollectionStart({ isTestMode: true });
     assert.equal(e.storageDataSendError, null); assert.equal(e.isCollecting, true);
 });
 
-test('retrying stop preserves video association and stable operation ID', async () => {
+test('normal video stop failure enters automatic fault save and retries the same operation ID', async () => {
     const e = loadEngineWithoutNativeSockets(); e.stageFileOpen = true;
     e.videoRecordingStarted = true; e.videoFileNames = { left: 'a.avi' };
     e.videoStopOperationId = 'stop-a'; const ids = []; let attempts = 0; let closes = 0;
@@ -526,22 +530,27 @@ test('retrying stop preserves video association and stable operation ID', async 
     };
     e.sendStorageCommand = async () => { closes++; return { status: 'success' }; };
     assert.equal((await e.onCollectionStop(true)).status, 'error');
-    assert.equal(e.videoFileNames.left, 'a.avi'); assert.equal(closes, 0);
-    assert.equal((await e.onCollectionStop(true)).status, 'success');
+    assert.ok(e.collectionFault);
+    await e.collectionFaultFinalizePromise;
     assert.deepEqual(ids, ['stop-a_left', 'stop-a_left']); assert.equal(closes, 1);
+    assert.equal(e.collectionFault.save_result.video.status, 'success');
 });
 
-test('slow preview clients are byte bounded and transport fault is fatal for collection', async () => {
+test('slow preview clients are byte bounded and transport fault freezes collection', async () => {
     const e = loadEngineWithoutNativeSockets(); let sent = 0; let terminated = 0;
     const slow = { readyState: 1, bufferedAmount: 1024 * 1024, send() { sent++; }, terminate() { terminated++; } };
     e.clients.add(slow);
     for (let i = 0; i < 25; i++) e.broadcastToClients({ type: 'realtime_data', data: [] });
     assert.equal(sent, 0); assert.equal(terminated, 1); assert.equal(e.previewDroppedPackets, 20);
     e.isCollecting = true;
+    e.collectionState = 'collecting';
+    e.collectionBinFilenames = { dev1: 'left-bin', dev2: null };
+    e._finalizeCollectionFault = async () => ({ status: 'success' });
     e.onTransportFault({ source: 'ble', error: 'overflow', dropped: 1 });
-    assert.equal(e.isCollecting, false); assert.equal(e.collectionState, 'save_failed');
-    assert.match(e.storageDataSendError.message, /overflow/);
-    assert.equal((await e.onCollectionStop(true)).status, 'error');
+    assert.equal(e.isCollecting, false); assert.equal(e.collectionState, 'fault_stopping');
+    assert.equal(e.storageDataSendError, null);
+    assert.match(e.collectionFault.message, /overflow/);
+    await e.collectionFaultFinalizePromise;
 });
 
 function loadCollectionPrototype(document = { readyState: 'loading', addEventListener() {}, getElementById() { return null; } }) {

@@ -1,0 +1,124 @@
+{
+  "tool": "E:\\1_Master\\2_学业\\my_project\\1_华为横向\\0_外采任务开发\\sEMG_Collection_System\\tmp\\field-validation-20261011\\create_counter_clock_comparison.py",
+  "output_root": "E:\\1_Master\\2_学业\\my_project\\1_华为横向\\0_外采任务开发\\sEMG_Collection_System\\tmp\\field-validation-20261011\\counter-clock-comparison",
+  "cases": [
+    {
+      "case_id": "145539",
+      "source_h5": "E:\\1_Master\\2_学业\\my_project\\1_华为横向\\0_外采任务开发\\sEMG_Collection_System\\tmp\\field-validation-20261011\\final-b\\copies\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0719\\电脑数据\\L057\\L057-C1C2C4\\离散手势采集\\静态采集\\坐姿\\正常状态\\L057\\l057_坐姿_(正向)_坐姿_小臂自然抬起-四向_session1_20260719_145539.h5",
+      "comparison_h5": "E:\\1_Master\\2_学业\\my_project\\1_华为横向\\0_外采任务开发\\sEMG_Collection_System\\tmp\\field-validation-20261011\\counter-clock-comparison\\145539\\l057_坐姿_(正向)_坐姿_小臂自然抬起-四向_session1_20260719_145539.h5",
+      "clock_only": true,
+      "timing_assumption": "constant_2000hz_no_unrecorded_sampling_pause",
+      "datasets": {
+        "emg1_2khz_adc": {
+          "rows": 344656,
+          "reference_anchor_id": 1080,
+          "reference_anchor_time_seconds": 1784444139.298721,
+          "reference_bin_frame_id": 1031,
+          "first_anchor_output_row": 1031,
+          "first_time_seconds": 1784444138.783221,
+          "last_time_seconds": 1784444311.110721,
+          "time_span_seconds": 172.32750010490417,
+          "id_span": 344655,
+          "id_gap_count": 0,
+          "time_step_min_seconds": 0.0004999637603759766,
+          "time_step_max_seconds": 0.0005002021789550781,
+          "first_anchor_exact": true,
+          "ble_residual_seconds": {
+            "min": 0.0,
+            "max": 1.2467634677886963,
+            "end": 0.7177886962890625,
+            "peak_to_peak": 1.2467634677886963
+          },
+          "residual_warning": "WARNING: BLE residual peak-to-peak exceeds 20 ms"
+        },
+        "emg2_2khz_adc": {
+          "rows": 344842,
+          "reference_anchor_id": 0,
+          "reference_anchor_time_seconds": 1784444139.289707,
+          "reference_bin_frame_id": 20933,
+          "first_anchor_output_row": 7,
+          "first_time_seconds": 1784444139.286207,
+          "last_time_seconds": 1784444311.706707,
+          "time_span_seconds": 172.42050004005432,
+          "id_span": 344841,
+          "id_gap_count": 0,
+          "time_step_min_seconds": 0.0004999637603759766,
+          "time_step_max_seconds": 0.0005002021789550781,
+          "first_anchor_exact": true,
+          "ble_residual_seconds": {
+            "min": 0.0,
+            "max": 0.05455732345581055,
+            "end": 0.05455732345581055,
+            "peak_to_peak": 0.05455732345581055
+          },
+          "residual_warning": "WARNING: BLE residual peak-to-peak exceeds 20 ms"
+        }
+      },
+      "protected_dataset_fields_unchanged": true,
+      "protected_root_attributes_unchanged": true,
+      "protected_dataset_count": 26,
+      "changed_fields": [
+        "emg1_2khz_adc.time",
+        "emg2_2khz_adc.time",
+        "emg1_2khz_adc.attrs.comparison_*",
+        "emg2_2khz_adc.attrs.comparison_*",
+        "emgN_2khz_adc.attrs.sync_time_source/slope/intercept/span",
+        "root.attrs.clock_comparison_only"
+      ]
+    },
+    {
+      "case_id": "145353",
+      "source_h5": "E:\\1_Master\\2_学业\\my_project\\1_华为横向\\0_外采任务开发\\sEMG_Collection_System\\tmp\\field-validation-20261011\\final-b\\copies\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0719\\电脑数据\\L057\\L057-C1C2C4\\离散手势采集\\静态采集\\坐姿\\正常状态\\L057\\l057_坐姿_(正向)_坐姿_小臂自然抬起-四向_session1_20260719_145353.h5",
+      "comparison_h5": "E:\\1_Master\\2_学业\\my_project\\1_华为横向\\0_外采任务开发\\sEMG_Collection_System\\tmp\\field-validation-20261011\\counter-clock-comparison\\145353\\l057_坐姿_(正向)_坐姿_小臂自然抬起-四向_session1_20260719_145353.h5",
+      "clock_only": true,
+      "timing_assumption": "constant_2000hz_no_unrecorded_sampling_pause",
+      "datasets": {
+        "emg1_2khz_adc": {
+          "rows": 7983,
+          "reference_anchor_id": 17291,
+          "reference_anchor_time_seconds": 1784444033.2314692,
+          "reference_bin_frame_id": 17291,
+          "first_anchor_output_row": 1087,
+          "first_time_seconds": 1784444032.6879692,
+          "last_time_seconds": 1784444036.6789691,
+          "time_span_seconds": 3.990999937057495,
+          "id_span": 7982,
+          "id_gap_count": 0,
+          "time_step_min_seconds": 0.0004999637603759766,
+          "time_step_max_seconds": 0.0005002021789550781,
+          "first_anchor_exact": true,
+          "ble_residual_seconds": null,
+          "residual_warning": null
+        },
+        "emg2_2khz_adc": {
+          "rows": 8971,
+          "reference_anchor_id": 223774,
+          "reference_anchor_time_seconds": 1784444033.2184918,
+          "reference_bin_frame_id": 223774,
+          "first_anchor_output_row": 7,
+          "first_time_seconds": 1784444033.2149918,
+          "last_time_seconds": 1784444037.6999917,
+          "time_span_seconds": 4.484999895095825,
+          "id_span": 8970,
+          "id_gap_count": 0,
+          "time_step_min_seconds": 0.0004999637603759766,
+          "time_step_max_seconds": 0.0005002021789550781,
+          "first_anchor_exact": true,
+          "ble_residual_seconds": null,
+          "residual_warning": null
+        }
+      },
+      "protected_dataset_fields_unchanged": true,
+      "protected_root_attributes_unchanged": true,
+      "protected_dataset_count": 22,
+      "changed_fields": [
+        "emg1_2khz_adc.time",
+        "emg2_2khz_adc.time",
+        "emg1_2khz_adc.attrs.comparison_*",
+        "emg2_2khz_adc.attrs.comparison_*",
+        "emgN_2khz_adc.attrs.sync_time_source/slope/intercept/span",
+        "root.attrs.clock_comparison_only"
+      ]
+    }
+  ]
+}

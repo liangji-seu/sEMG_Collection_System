@@ -74,6 +74,17 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
             this._isAllSessionsMode = false;    // 是否为全部轮次采集模式
             this._restBetweenSessions = 30;     // 轮次间休息时间（秒）
             this._restCountdownTimer = null;    // 休息倒计时定时器
+            this._autoStartTimer = null;
+            this._autoStartGeneration = 0;
+            this._guideTimeouts = new Set();
+            this._guideTimeoutGeneration = 0;
+            this._collectionFaultId = null;
+            this._collectionFaultPhases = new Set();
+            this._collectionFault = null;
+            this._collectionFaultRetryCount = 0;
+            this._collectionSessionGeneration = 0;
+            this._previewResumeTimer = null;
+            this._previewResumeGeneration = 0;
 
             // ===== 精确对齐同步状态 =====
             this._sessionSyncDone = false;      // 当前session是否已完成同步prompt
@@ -1102,6 +1113,11 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
          */
         async startTask(isTestMode = false) {
             if (this._isRunning || ['starting', 'stopping', 'save_failed'].includes(this._saveState)) return;
+            const sessionGeneration = ++this._collectionSessionGeneration;
+            if (this._saveState === 'idle') {
+                this._collectionFaultId = null;
+                this._collectionFault = null;
+            }
             this._saveState = 'starting';
 
             // 【新增】保存测试模式状态
@@ -1142,8 +1158,10 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                 console.log('[Collection] 停止摄像头预览流，释放摄像头...');
                 try {
                     await window.cameraControl.stopStreaming('both');
+                    if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     console.log('[Collection] ✅ 摄像头预览流已停止');
                 } catch (error) {
+                    if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     console.warn('[Collection] 停止摄像头预览流失败:', error);
                 }
             }
@@ -1161,17 +1179,20 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                     const sessionId = this._getEffectiveSessionId();
                     console.log('[Collection] ★ Step 1: 设置 session_id:', sessionId);
                     await window.BleControl.setSessionIdAndWait(sessionId);
+                    if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     console.log('[Collection] ★ set_session_id 完成');
 
                     // Step 2: preview → collection 切流
                     console.log('[Collection] ★ Step 2: preview → collection 切换...');
                     switchResponse = await window.BleControl.sendAndWait('switch_preview_to_collection');
+                    if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     console.log('[Collection] ★ switch_preview_to_collection 完成:', switchResponse);
 
                     if (switchResponse.collection_bins) {
                         console.log('[Collection] Collection bins:', switchResponse.collection_bins);
                     }
                 } catch (err) {
+                    if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     console.error('[Collection] ★ 切换采集流失败:', err);
                     this.showToast('切换采集流失败: ' + err.message, 'error');
                     this._setAllButtonsDisabled(false);
@@ -1290,18 +1311,24 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
 
             try {
                 await this.sendToRealtimeEngineAndWait('collection_start', startPayload);
-                if (this._saveState !== 'starting') return;
+                if (!this._isCurrentCollectionSession(sessionGeneration) || this._saveState !== 'starting') return;
                 if (this.currentTaskId === 'discrete_gesture') {
-                    await this.startDiscreteGestureCollection();
+                    await this.startDiscreteGestureCollection(sessionGeneration);
                 } else {
+                    if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     this.startContinualGestureCollection();
                 }
-                if (this._saveState === 'starting') this._saveState = 'collecting';
+                if (this._isCurrentCollectionSession(sessionGeneration) && this._saveState === 'starting') this._saveState = 'collecting';
             } catch (error) {
+                if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                 this.sendToRealtimeEngine('abnormal_interrupt_freeze', {});
                 this._retrySave = () => this.stopTask();
                 this._setSaveState('save_failed', error.message);
             }
+        }
+
+        _isCurrentCollectionSession(generation) {
+            return generation === this._collectionSessionGeneration && !this._collectionFaultId;
         }
 
         /**
@@ -1357,10 +1384,10 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
             });
 
             // 2秒后隐藏弹窗并开始采集
-            setTimeout(() => {
+            this._scheduleAutoStart(() => {
                 this.hideSessionOverlay();
                 this.startTask(false);
-            }, 2000);
+            });
         }
 
         /**
@@ -1406,7 +1433,9 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                 this._restCountdownTimer = null;
             }
 
+            const restGeneration = this._guideTimeoutGeneration;
             this._restCountdownTimer = setInterval(() => {
+                if (restGeneration !== this._guideTimeoutGeneration || this._collectionFaultId) return;
                 remainingSeconds--;
 
                 // 更新全屏弹窗的倒计时
@@ -1444,10 +1473,10 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                     });
 
                     // 2秒后隐藏弹窗并开始采集
-                    setTimeout(() => {
+                    this._scheduleAutoStart(() => {
                         this.hideSessionOverlay();
                         this.startTask(false);
-                    }, 2000);
+                    });
                 }
             }, 1000);
         }
@@ -1468,8 +1497,46 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                 clearInterval(this._restCountdownTimer);
                 this._restCountdownTimer = null;
             }
+            this._cancelPendingAutoStart();
+            this._cancelGuideTimeouts();
             // 隐藏全屏弹窗
             this.hideSessionOverlay();
+        }
+
+        _scheduleAutoStart(callback) {
+            this._cancelPendingAutoStart();
+            const generation = this._autoStartGeneration;
+            this._autoStartTimer = setTimeout(() => {
+                if (generation !== this._autoStartGeneration) return;
+                this._autoStartTimer = null;
+                callback();
+            }, 2000);
+        }
+
+        _cancelPendingAutoStart() {
+            this._autoStartGeneration++;
+            if (this._autoStartTimer !== null && this._autoStartTimer !== undefined) {
+                clearTimeout(this._autoStartTimer);
+                this._autoStartTimer = null;
+            }
+        }
+
+        _scheduleGuideTimeout(callback, delay) {
+            const generation = this._guideTimeoutGeneration;
+            let timer = null;
+            timer = setTimeout(() => {
+                this._guideTimeouts.delete(timer);
+                if (generation !== this._guideTimeoutGeneration || this._collectionFaultId) return;
+                callback();
+            }, delay);
+            this._guideTimeouts.add(timer);
+            return timer;
+        }
+
+        _cancelGuideTimeouts() {
+            this._guideTimeoutGeneration++;
+            for (const timer of this._guideTimeouts) clearTimeout(timer);
+            this._guideTimeouts.clear();
         }
 
         async stopTask(opts = {}) {
@@ -2016,7 +2083,7 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                 showCountdown: false
             });
 
-            setTimeout(() => {
+            this._scheduleGuideTimeout(() => {
                 this.currentPhase = 'prepare';
                 this.updateGestureList();
                 this.showContinualPreparation(() => {
@@ -2093,7 +2160,8 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
 
         // ==================== 离散手势采集流程 ====================
 
-        async startDiscreteGestureCollection() {
+        async startDiscreteGestureCollection(sessionGeneration = this._collectionSessionGeneration) {
+            if (!this._isCurrentCollectionSession(sessionGeneration)) return;
             console.log('[Collection] 开始离散手势采集');
             console.log('[Collection] 乱序模式:', this._shuffleMode ? '是' : '否');
 
@@ -2107,6 +2175,7 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                 timestamp: Date.now() / 1000,  // 【修改】转换为秒，与ble_server时间戳一致
                 needMocap: needMocap  // 【新增】传递动捕需求标志
             });
+            if (!this._isCurrentCollectionSession(sessionGeneration)) return;
             console.log(`[Collection] Stage "${currentStage?.name}" needMocap: ${needMocap}`);
 
             // 【精准对齐同步】每个session的第一个stage有独立的同步阶段
@@ -2567,7 +2636,7 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
 
             // 如果间隔时间很短（<=1秒），直接继续不显示倒计时
             if (intervalTime <= 1) {
-                setTimeout(() => {
+                this._scheduleGuideTimeout(() => {
                     callback();
                 }, intervalTime * 1000);
                 return;
@@ -2684,7 +2753,8 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
         }
 
         async onAllGesturesComplete() {
-            if (this._saveState === 'stopping') return;
+            if (this._saveState === 'stopping' || this._collectionFaultId) return;
+            const sessionGeneration = this._collectionSessionGeneration;
             console.log('[Collection] ===== 当前Stage所有手势采集完成 =====');
 
             this.currentPhase = 'complete';
@@ -2705,9 +2775,11 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
             try {
                 await this.sendToRealtimeEngineAndWait('collection_stop_and_wait', { completed: true });
             } catch (error) {
+                if (sessionGeneration !== this._collectionSessionGeneration || this._collectionFaultId) return;
                 this._setSaveState('save_failed', error.message);
                 return;
             }
+            if (sessionGeneration !== this._collectionSessionGeneration || this._collectionFaultId) return;
             this._retrySave = null;
             this._setSaveState('idle');
 
@@ -2846,7 +2918,8 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
         /**
          * 【关键修复】启动连续手势动画 - 传递执行参数给动画模块
          */
-        async startContinualAnimation() {
+        async startContinualAnimation(sessionGeneration = this._collectionSessionGeneration) {
+            if (!this._isCurrentCollectionSession(sessionGeneration)) return;
             console.log('[Collection] ====== 启动连续手势动画 ======');
             console.log('[Collection] 任务类型:', this.currentTaskId);
             console.log('[Collection] ★★★ trialsPerStage:', this.currentExecutionParams.trialsPerStage);
@@ -2901,12 +2974,13 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                     needMocap: true  // 【新增】连续手势必须记录动捕数据
                 });
                 } catch (error) {
+                    if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     this._retrySave = () => this.stopTask();
                     this._setSaveState('save_failed', error.message);
                     this.sendToRealtimeEngine('abnormal_interrupt_freeze', {});
                     return;
                 }
-                if (this._saveState === 'stopping' || this._saveState === 'save_failed') return;
+                if (!this._isCurrentCollectionSession(sessionGeneration) || this._saveState === 'stopping' || this._saveState === 'save_failed') return;
                 console.log(`[Collection] 连续手势 Stage "${currentStage?.name}" needMocap: true (强制)`);
 
                 this.setupContinualProgressUpdater(animationModule);
@@ -2969,7 +3043,8 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
         }
 
         async onContinualStageComplete() {
-            if (this._saveState === 'stopping') return;
+            if (this._saveState === 'stopping' || this._collectionFaultId) return;
+            const sessionGeneration = this._collectionSessionGeneration;
             console.log('[Collection] 连续手势Stage完成');
 
             // 【新增】隐藏手势示范 GIF
@@ -2985,9 +3060,11 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
             try {
                 await this.sendToRealtimeEngineAndWait('collection_stop_and_wait', { completed: true });
             } catch (error) {
+                if (sessionGeneration !== this._collectionSessionGeneration || this._collectionFaultId) return;
                 this._setSaveState('save_failed', error.message);
                 return;
             }
+            if (sessionGeneration !== this._collectionSessionGeneration || this._collectionFaultId) return;
             this._retrySave = null;
             this._setSaveState('idle');
 
@@ -3190,8 +3267,7 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                         let packet;
                         try { packet = JSON.parse(event.data); } catch (_) { return; }
                         if (packet.type === 'collection_fault') {
-                            this._retrySave = () => this.stopTask({ retrying: true });
-                            this._setSaveState('save_failed', packet.error);
+                            this._handleCollectionFault(packet);
                         }
                     };
                     socket.addEventListener('message', this._collectionFaultListener);
@@ -3199,6 +3275,179 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                 return socket;
             }
             return null;
+        }
+
+        _handleCollectionFault(packet) {
+            const faultId = String(packet.fault_id || 'unknown-fault');
+            const phase = packet.phase;
+            if (phase !== 'stopping' && phase !== 'stopped') return;
+
+            const phaseKey = `${faultId}:${phase}`;
+            if (this._collectionFaultPhases.has(phaseKey)) return;
+            if (phase === 'stopping' && this._collectionFaultPhases.has(`${faultId}:stopped`)) return;
+            if (this._saveState === 'stopping' && this._collectionFaultId && this._collectionFaultId !== faultId) return;
+            this._collectionFaultPhases.add(phaseKey);
+            console.error('[Collection] collection fault notification:', packet);
+
+            if (this._collectionFaultId !== faultId) {
+                this._collectionFaultId = faultId;
+                this._collectionFaultRetryCount = 0;
+            }
+            this._collectionFault = { ...(this._collectionFault || {}), ...packet, fault_id: faultId };
+
+            if (phase === 'stopping') {
+                this._freezeForCollectionFault(packet);
+                return;
+            }
+
+            if (!this._collectionFaultPhases.has(`${faultId}:stopping`)) {
+                this._freezeForCollectionFault(packet);
+            }
+            this._finishCollectionFault(this._collectionFault);
+        }
+
+        _freezeForCollectionFault(packet = {}) {
+            this._collectionSessionGeneration++;
+            this._isRunning = false;
+            this._isPaused = false;
+            this.isCalibrating = false;
+            this.calibrationPhase = null;
+            this._disableSpaceKey();
+            this._cancelPendingAutoStart();
+            this._cancelGuideTimeouts();
+            if (this._previewResumeTimer !== null) {
+                this._previewResumeGeneration++;
+                clearTimeout(this._previewResumeTimer);
+                this._previewResumeTimer = null;
+            }
+            this._isAllSessionsMode = false;
+            if (this._restCountdownTimer) {
+                clearInterval(this._restCountdownTimer);
+                this._restCountdownTimer = null;
+            }
+            this.hideSessionOverlay();
+            if (window.calibrationGuideAnimation) window.calibrationGuideAnimation.hide?.();
+            this.hideGestureGif();
+            window.animationController?.stop?.();
+            this._setSaveState('stopping');
+            const reason = packet.error || packet.message || packet.code || '采集异常';
+            this.updateStatus(`${reason}；正在尽量保存已有数据，请等待`);
+        }
+
+        _finishCollectionFault(fault) {
+            const h5Result = fault.save_result?.h5;
+            const h5Saved = h5Result?.status === 'success';
+            const h5Closed = h5Result?.file_closed === true;
+            const h5NotCreated = h5Result?.status === 'not_created' && h5Result?.no_file === true;
+            this._isRunning = false;
+            this._isPaused = false;
+            this._isAllSessionsMode = false;
+
+            if (h5Saved || h5Closed || h5NotCreated) {
+                this._retrySave = null;
+                this._setSaveState('idle');
+                this.updateControlButtons(false);
+                this.updateStatus(h5Saved
+                    ? '异常采集已停止；保存情况见故障结果弹窗'
+                    : h5NotCreated
+                        ? '本轮未创建H5，采集数据未保存；可手动开始新采集，详情见弹窗'
+                        : 'H5文件已关闭但保存校验不完整；可手动开始新采集，详情见弹窗');
+            } else {
+                this._retrySave = () => this._retryCollectionFault();
+                this._setSaveState('save_failed', fault.error || fault.message || 'H5保存结果未确认');
+            }
+            this._showCollectionFaultResult(fault);
+        }
+
+        async _retryCollectionFault() {
+            const faultId = this._collectionFaultId;
+            if (!faultId || this._saveState === 'stopping') return;
+            this._retrySave = () => this._retryCollectionFault();
+            this._setSaveState('stopping');
+            try {
+                const result = await this.sendToRealtimeEngineAndWait('retry_collection_fault', { fault_id: faultId });
+                const saveResult = result?.save_result || (result && (result.h5 || result.video || result.ble) ? result : null);
+                const updatedFault = {
+                    ...this._collectionFault,
+                    ...(result && typeof result === 'object' ? result : {}),
+                    fault_id: faultId,
+                    phase: 'stopped',
+                    save_result: saveResult || null
+                };
+                this._collectionFault = updatedFault;
+                this._collectionFaultRetryCount++;
+                const retryH5 = updatedFault.save_result?.h5;
+                const h5Saved = retryH5?.status === 'success';
+                const h5Closed = retryH5?.file_closed === true;
+                const h5NotCreated = retryH5?.status === 'not_created' && retryH5?.no_file === true;
+                if (h5Saved || h5Closed || h5NotCreated) {
+                    this._retrySave = null;
+                    this._setSaveState('idle');
+                    this.updateControlButtons(false);
+                    this.updateStatus(h5Saved
+                        ? '故障保存重试已完成；不会自动继续采集'
+                        : h5NotCreated
+                            ? '本轮未创建H5，采集数据未保存；可手动开始新采集'
+                            : 'H5文件已关闭但保存校验不完整；可手动开始新采集');
+                } else {
+                    this._retrySave = () => this._retryCollectionFault();
+                    this._setSaveState('save_failed', updatedFault.error || updatedFault.message || 'H5保存结果未确认');
+                }
+                this._showCollectionFaultResult(updatedFault, `retry:${faultId}:${this._collectionFaultRetryCount}`);
+            } catch (error) {
+                const updatedFault = { ...this._collectionFault, phase: 'stopped', error: error.message, save_result: null };
+                this._collectionFault = updatedFault;
+                this._collectionFaultRetryCount++;
+                this._retrySave = () => this._retryCollectionFault();
+                this._setSaveState('save_failed', error.message);
+                this._showCollectionFaultResult(updatedFault, `retry:${faultId}:${this._collectionFaultRetryCount}`);
+            }
+        }
+
+        _showCollectionFaultResult(fault, retryKey = null) {
+            const faultId = String(fault.fault_id || 'unknown-fault');
+            if (!this._collectionFaultModalKeys) this._collectionFaultModalKeys = new Set();
+            const eventKey = `${faultId}:stopped`;
+            const modalKey = retryKey || eventKey;
+            if (this._collectionFaultModalKeys.has(modalKey)) return;
+            this._collectionFaultModalKeys.add(modalKey);
+
+            const statusLine = (name, result) => {
+                if (!result || !result.status) return `${name}：结果不确定，未收到保存确认`;
+                if (result.status === 'success') return `${name}：成功${result.file_path ? `（${result.file_path}）` : ''}${result.msg ? `；${result.msg}` : ''}`;
+                if (name === 'H5' && result.status === 'not_created' && result.no_file === true) {
+                    return `H5：本轮未创建H5，未保存采集数据${result.msg ? `；${result.msg}` : ''}`;
+                }
+                if (name === 'H5' && result.status === 'error' && result.file_closed === true) {
+                    const rows = result.readback?.emg_rows;
+                    const rowSummary = rows && typeof rows === 'object'
+                        ? `；读回EMG行数：${Object.entries(rows).map(([side, count]) => `${side} ${count}`).join('，')}`
+                        : '';
+                    const readback = result.readback?.ok === true ? `；已读回部分数据${rowSummary}` : '；可读性尚未确认';
+                    return `H5：文件已关闭，但最终保存校验不完整${readback}${result.msg ? `；${result.msg}` : ''}`;
+                }
+                if (result.status === 'error') return `${name}：失败${result.msg ? `；${result.msg}` : ''}`;
+                return `${name}：结果不确定（${result.status}）${result.msg ? `；${result.msg}` : ''}`;
+            };
+            const h5 = fault.save_result?.h5;
+            const video = fault.save_result?.video;
+            const ble = fault.save_result?.ble;
+            const incomplete = h5?.status !== 'success' || video?.status !== 'success';
+            const lines = [
+                '采集已因故障停止。',
+                `原因：${fault.error || fault.message || fault.code || fault.source || '未知'}`,
+                `阶段：${fault.phase || 'stopped'}`,
+                `故障来源/代码：${[fault.source, fault.code].filter(Boolean).join(' / ') || '未提供'}`,
+                `文件：${fault.file_path || h5?.file_path || video?.file_path || '未提供'}`,
+                statusLine('H5', h5),
+                statusLine('视频', video),
+                statusLine('设备链路', ble)
+            ];
+            if (incomplete) lines.push('H5或视频保存未全部确认成功，不能视为完整保存。');
+            if (retryKey) lines.push('这是一次新的保存重试结果；采集不会自动继续。');
+            alert(lines.join('\n'));
+            // Retry results have their own dialog key, while same-id stopped events stay deduplicated.
+            this._collectionFaultModalKeys.add(eventKey);
         }
 
         // ==================== UI更新 ====================
@@ -3289,7 +3538,10 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
             console.log(`[Collection] 切回 preview stream (reason: ${reason})`);
             this._showRingStreamTransition('preview');
             // 延迟给 close H5 和 stop collection 一些时间
-            setTimeout(() => {
+            const generation = ++this._previewResumeGeneration;
+            this._previewResumeTimer = setTimeout(() => {
+                if (generation !== this._previewResumeGeneration || this._collectionFaultId) return;
+                this._previewResumeTimer = null;
                 if (!this._switchInProgress && window.BleControl && window.BleControl.isConnected) {
                     window.BleControl.switchCollectionToPreview();
                 }

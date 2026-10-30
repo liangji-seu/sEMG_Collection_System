@@ -151,9 +151,12 @@
 
                 if (packet.type === 'h5_storage_warning') {
                     const message = packet.message || 'H5写入异常，请中断并重采本轮';
-                    console.error('[Waveform] H5存储告警:', packet);
+                    const nonBlocking = packet.nonBlocking === true || packet.level === 'warning';
+                    (nonBlocking ? console.warn : console.error)('[Waveform] H5存储告警:', packet);
                     if (window.collectionController && typeof window.collectionController.showToast === 'function') {
-                        window.collectionController.showToast(message, 'error');
+                        window.collectionController.showToast(message, nonBlocking ? 'warning' : 'error');
+                    } else if (nonBlocking) {
+                        console.warn('[Waveform] 非阻断采集提示:', message);
                     } else {
                         alert(message);
                     }

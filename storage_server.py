@@ -38,8 +38,8 @@ import h5py
 import zmq
 import json
 import os
+import shutil
 import sys
-import io
 import argparse
 import time
 from datetime import datetime
@@ -47,8 +47,13 @@ import numpy as np
 from threading import Lock
 
 # ================= 基础配置 =================
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
+except (AttributeError, ValueError, OSError):
+    pass
 
 # ===================== 数据类型定义 =====================
 
@@ -176,6 +181,7 @@ class HDF5StorageServer:
         self.last_received_sequence = 0
         self.file_token = None
         self.finalized_files = {}
+        self._pending_close_validation = None
         self.create_failed = False
         self.data_barrier_timeout_ms = 5000
         
@@ -226,11 +232,140 @@ class HDF5StorageServer:
             "prompts": 0
         }
         self.data_write_error = None
+        self._first_emg_write_logged = set()
+        self._last_capture_progress_log = 0.0
+        self._last_data_error_snapshot_log = None
 
     def _record_data_write_error(self, error):
         if getattr(self, "data_write_error", None) is None:
             self.data_write_error = str(error)
-        debug_log(f"❌ 数据写入错误（文件将拒绝close）: {error}")
+        try:
+            debug_log(f"❌ 数据写入错误（文件将拒绝close）: {error}")
+        except Exception:
+            pass
+        try:
+            now = time.monotonic()
+            last = getattr(self, "_last_data_error_snapshot_log", None)
+            if last is not None and now - last < 10.0:
+                return
+            self._last_data_error_snapshot_log = now
+        except Exception:
+            return
+        try:
+            health_json = self._capture_health_json()
+        except Exception:
+            health_json = json.dumps({"diagnostic_error": "health snapshot unavailable"}, ensure_ascii=False)
+        try:
+            debug_log(f"CAPTURE_HEALTH_WRITE_ERROR {health_json}")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _attr_text(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value) if value is not None else None
+
+    def _capture_health(self, save_validation="pending"):
+        f = getattr(self, "f", None)
+        stats = getattr(self, "stats", {}) or {}
+        diagnostic_errors = []
+        def rows(name):
+            if f is None:
+                return 0
+            try:
+                if not f.id.valid:
+                    raise ValueError("closed HDF5 handle")
+                return int(f[name].shape[0]) if name in f else 0
+            except Exception as error:
+                diagnostic_errors.append(f"rows:{name}:{error}")
+                return None
+        try:
+            if f is not None and not f.id.valid:
+                raise ValueError("closed HDF5 handle")
+            attrs = f.attrs if f is not None else {}
+        except Exception as error:
+            attrs = {}
+            diagnostic_errors.append(f"attrs:{error}")
+        def attr_value(name):
+            try:
+                return attrs.get(name)
+            except Exception as error:
+                diagnostic_errors.append(f"attr:{name}:{error}")
+                return None
+        emg_rows = {"dev1": rows("emg1_250hz_adc"), "dev2": rows("emg2_250hz_adc")}
+        imu_dataset_names = ("imu1_all_ble", "imu2_all_ble", "imu1a_ble", "imu1b_ble", "imu2a_ble", "imu2b_ble")
+        imu_rows = {name: rows(name) for name in imu_dataset_names}
+        prompts_rows = rows("prompts/names")
+        warnings = []
+        if emg_rows["dev1"] == 0:
+            warnings.append("emg_dev1_empty")
+        if emg_rows["dev2"] == 0:
+            warnings.append("emg_dev2_empty")
+        if any(value is None for value in emg_rows.values()):
+            content_status = "unknown"
+            warnings.append("emg_dataset_rows_unavailable")
+        else:
+            content_status = "empty" if len(warnings) == 2 else "partial" if warnings else "complete"
+        disk_free_bytes = None
+        try:
+            disk_path = os.path.dirname(getattr(self, "file_path", "") or "") or getattr(self, "storage_dir", ".")
+            disk_free_bytes = int(shutil.disk_usage(disk_path).free)
+        except Exception:
+            pass
+        return {
+            "file_path": getattr(self, "file_path", None),
+            "file_token": getattr(self, "file_token", None),
+            "session_id": getattr(self, "current_recording_session_id", None),
+            "sequences": {"received": int(getattr(self, "last_received_sequence", 0)),
+                          "written": int(getattr(self, "last_data_sequence", 0))},
+            "emg_rows": emg_rows,
+            "emg_write_counts": {"dev1": int(stats.get("emg1_frames", 0)),
+                                 "dev2": int(stats.get("emg2_frames", 0))},
+            "imu_rows": imu_rows,
+            "imu_write_counts": {"imu1a": int(stats.get("imu1a_frames", 0)),
+                                 "imu1b": int(stats.get("imu1b_frames", 0)),
+                                 "imu2a": int(stats.get("imu2a_frames", 0)),
+                                 "imu2b": int(stats.get("imu2b_frames", 0)),
+                                 "imu1_all": int(stats.get("imu1_all_frames", 0)),
+                                 "imu2_all": int(stats.get("imu2_all_frames", 0))},
+            "prompts_rows": prompts_rows,
+            "disk_free_bytes": disk_free_bytes,
+            "devices": {"dev1": {"name": self._attr_text(attr_value("ble_device_dev1")),
+                                  "sd_bin": self._attr_text(attr_value("sd_bin_dev1"))},
+                         "dev2": {"name": self._attr_text(attr_value("ble_device_dev2")),
+                                  "sd_bin": self._attr_text(attr_value("sd_bin_dev2"))}},
+            "write_error": getattr(self, "data_write_error", None),
+            "save_validation": save_validation,
+            "content_status": content_status,
+            "capture_warnings": warnings,
+            **({"diagnostic_error": diagnostic_errors} if diagnostic_errors else {}),
+        }
+
+    def _capture_health_json(self, save_validation="pending"):
+        try:
+            return json.dumps(self._capture_health(save_validation), ensure_ascii=False, sort_keys=True)
+        except Exception as error:
+            return json.dumps({"save_validation": save_validation, "content_status": "unknown",
+                               "diagnostic_error": str(error)}, ensure_ascii=False, sort_keys=True)
+
+    def _store_capture_health(self, health):
+        self.f.attrs["capture_data_health_json"] = json.dumps(health, ensure_ascii=False, sort_keys=True)
+        self.f.attrs["capture_warnings_json"] = json.dumps(health["capture_warnings"], ensure_ascii=False)
+
+    def _maybe_log_capture_progress(self):
+        try:
+            now = time.monotonic()
+            last = getattr(self, "_last_capture_progress_log", 0.0)
+            if now - last >= 10.0:
+                health = self._capture_health("in_progress")
+                debug_log(f"CAPTURE_HEALTH_PROGRESS {json.dumps(health, ensure_ascii=False, sort_keys=True)}")
+                self._last_capture_progress_log = now
+        except Exception as error:
+            try:
+                debug_log(f"CAPTURE_HEALTH_PROGRESS diagnostic_error={error}")
+            except Exception:
+                pass
     
     def _sanitize_name(self, name):
         """清理文件/目录名中的非法字符"""
@@ -366,6 +501,7 @@ class HDF5StorageServer:
             return {"status": "error", "msg": "上一个文件仍处于打开状态，拒绝覆盖创建新文件"}
         if token is not None and token in getattr(self, "finalized_files", {}):
             return {"status": "error", "msg": "该文件标识已收尾，不能重新创建", "finalized": True}
+        self._pending_close_validation = None
         self.file_token = token
         self.create_failed = True
         try:
@@ -824,17 +960,23 @@ class HDF5StorageServer:
             # A successfully created file starts a fresh write-error and
             # sequence boundary; a failed append remains fatal for this file.
             self.data_write_error = None
+            self._last_data_error_snapshot_log = None
             self.last_data_sequence = 0
             self.last_received_sequence = 0
+            self._first_emg_write_logged = set()
+            self._last_capture_progress_log = time.monotonic()
             self.create_failed = False
             if token is not None:
                 self.f.attrs["storage_file_token"] = token
+            health = self._capture_health("pending")
+            self._store_capture_health(health)
             
             # 显示相对路径
             rel_path = os.path.relpath(self.file_path, self.storage_dir)
             debug_log(f"✅ 文件创建成功: {rel_path}")
             debug_log(f"   任务: {task_id}, 用户: {user_id}, Stage: {stage_name}")
             debug_log(f"   分类: {category1}/{category2}/{category4}")
+            debug_log(f"CAPTURE_HEALTH_CREATE {json.dumps(health, ensure_ascii=False, sort_keys=True)}")
 
             # Phase 5: 补填父 segment 的 resumed_by 链路
             self._maybe_update_parent_segment_link(self.file_path, params)
@@ -843,7 +985,9 @@ class HDF5StorageServer:
                 "status": "success",
                 "msg": f"创建Stage文件成功",
                 "file_path": self.file_path,
-                "stage_name": stage_name
+                "stage_name": stage_name,
+                "capture_warnings": health["capture_warnings"],
+                "data_health": health,
             }
             
         except Exception as e:
@@ -928,6 +1072,15 @@ class HDF5StorageServer:
                         data.get("prompt_time", 0)
                     )
 
+                first_logged = getattr(self, "_first_emg_write_logged", None)
+                if first_logged is None:
+                    first_logged = self._first_emg_write_logged = set()
+                for side, ds_name in (("dev1", "emg1_250hz_adc"), ("dev2", "emg2_250hz_adc")):
+                    if ds_name in self.f and self.f[ds_name].shape[0] and side not in first_logged:
+                        first_logged.add(side)
+                        debug_log(f"CAPTURE_HEALTH_FIRST_EMG_WRITE side={side} rows={int(self.f[ds_name].shape[0])} "
+                                  f"file={self.file_path} token={getattr(self, 'file_token', None)}")
+
             return {"status": "success", "msg": "数据已追加"}
 
         except Exception as e:
@@ -940,8 +1093,14 @@ class HDF5StorageServer:
         return params.get("_storage_file_token") == getattr(self, "file_token", None)
 
     def get_file_status(self):
-        return {
-            "status": "success", "open": self.f is not None,
+        is_open = False
+        if self.f is not None:
+            try:
+                is_open = bool(self.f.id.valid)
+            except Exception:
+                is_open = False
+        status = {
+            "status": "success", "open": is_open,
             "file_token": getattr(self, "file_token", None),
             "file_path": getattr(self, "file_path", None),
             "create_failed": getattr(self, "create_failed", False),
@@ -949,6 +1108,9 @@ class HDF5StorageServer:
             "written_sequence": self.last_data_sequence,
             "write_error": self.data_write_error,
         }
+        if is_open:
+            status["data_health"] = self._capture_health("in_progress")
+        return status
 
     def _process_data_request(self, request):
         if request.get("cmd") != "append":
@@ -978,6 +1140,7 @@ class HDF5StorageServer:
             return False
         if sequence is not None:
             self.last_data_sequence = max(self.last_data_sequence, sequence)
+        self._maybe_log_capture_progress()
         return True
 
     def _drain_data_until(self, target_sequence, allow_errors=False):
@@ -1021,6 +1184,39 @@ class HDF5StorageServer:
         if not self._drain_data_until(params.get("_storage_data_seq", 0), allow_errors=incomplete):
             return {"status": "error", "msg": "数据栅栏未完成，文件保持打开"}
         return self.close_file(params, incomplete=incomplete)
+
+    def _retry_pending_close_validation(self, params, incomplete):
+        pending = getattr(self, "_pending_close_validation", None)
+        token = params.get("_storage_file_token")
+        if not pending or token != pending.get("file_token"):
+            return None
+        if not self._matches_file(params):
+            return {"status": "error", "msg": "stale storage file token"}
+        health = pending["health"]
+        path = pending["file_path"]
+        try:
+            with h5py.File(path, "r") as saved_file:
+                rows = {"dev1": int(saved_file["emg1_250hz_adc"].shape[0]),
+                        "dev2": int(saved_file["emg2_250hz_adc"].shape[0])}
+            if rows != health["emg_rows"]:
+                raise IOError(f"readback row mismatch: expected={health['emg_rows']}, got={rows}")
+            health["save_validation"] = "valid"
+            health["readback"] = {"ok": True, "emg_rows": rows}
+            health.pop("save_error", None)
+            result = {"status": "success", "msg": "文件已保存并关闭", "file_path": path,
+                      "stats": pending["stats"], "collection_status": pending["collection_status"],
+                      "capture_warnings": health["capture_warnings"], "data_health": health}
+            debug_log(f"CAPTURE_HEALTH_CLOSE_RETRY {json.dumps(health, ensure_ascii=False, sort_keys=True)}")
+            getattr(self, "finalized_files", {}).setdefault(token, result)
+            self._pending_close_validation = None
+            return result
+        except Exception as error:
+            health["save_validation"] = "failed"
+            health["save_error"] = str(error)
+            health["readback"] = {"ok": False, "error": str(error), "emg_rows_before_close": health["emg_rows"]}
+            debug_log(f"❌ H5只读回验重试失败 file={path} token={token} rows={health['emg_rows']}: {error}")
+            return {"status": "error", "msg": f"文件已关闭但只读回验失败: {error}", "file_path": path,
+                    "stats": pending["stats"], "capture_warnings": health["capture_warnings"], "data_health": health}
 
     def _validate_emg_batch(self, emg_data, timestamps, frame_ids):
         channels = np.asarray(emg_data)
@@ -1311,12 +1507,45 @@ class HDF5StorageServer:
             params = {}
         if not self._matches_file(params):
             return {"status": "error", "msg": "stale storage file token"}
+        pending_result = self._retry_pending_close_validation(params, incomplete)
+        if pending_result is not None:
+            return pending_result
         if self.f is not None and getattr(self, "data_write_error", None) and not incomplete:
+            health = self._capture_health("failed")
+            debug_log(f"CAPTURE_HEALTH_CLOSE_REFUSED {json.dumps(health, ensure_ascii=False, sort_keys=True)}")
             return {
-                "status": "error",
-                "msg": f"文件存在数据写入错误，拒绝标记完成: {self.data_write_error}"
+                "status": "error", "msg": f"文件存在数据写入错误，拒绝标记完成: {self.data_write_error}",
+                "file_path": getattr(self, "file_path", None),
+                "capture_warnings": health["capture_warnings"], "data_health": health,
             }
         try:
+            health = self._capture_health("pending")
+            row_count_mismatches = []
+            for side, dataset_name, counter_name in (
+                ("dev1", "emg1_250hz_adc", "emg1_frames"),
+                ("dev2", "emg2_250hz_adc", "emg2_frames"),
+            ):
+                actual = health["emg_rows"][side]
+                expected = int(self.stats.get(counter_name, 0))
+                if actual is None or actual != expected:
+                    error = f"{side} EMG dataset/count mismatch: rows={actual}, writes={expected}"
+                    self._record_data_write_error(error)
+                    row_count_mismatches.append({"side": side, "dataset": dataset_name,
+                                                 "actual_rows": actual, "write_count": expected})
+                    if not incomplete:
+                        health = self._capture_health("failed")
+                        health["row_count_mismatches"] = row_count_mismatches
+                        if self.f is not None:
+                            self._store_capture_health(health)
+                            self.f.attrs["capture_save_error"] = error
+                        debug_log(f"CAPTURE_HEALTH_CLOSE_REFUSED {json.dumps(health, ensure_ascii=False, sort_keys=True)}")
+                        return {"status": "error", "msg": error, "file_path": self.file_path,
+                                "capture_warnings": health["capture_warnings"], "data_health": health}
+            if row_count_mismatches:
+                health = self._capture_health("pending")
+                health["row_count_mismatches"] = row_count_mismatches
+                health["capture_warnings"].append("emg_dataset_write_count_mismatch")
+            self._store_capture_health(health)
             self.flush()
 
             if self.f:
@@ -1433,11 +1662,42 @@ class HDF5StorageServer:
                 self._write_segment_metadata(params)
 
                 self.f.attrs["collection_status"] = str(collection_status)
+                self.f.attrs["capture_validation"] = "pending"
                 self.f.flush()
                 self.f.close()
                 self.f = None
             
             self.is_collecting = False
+
+            expected_rows = health["emg_rows"]
+            readback_rows = {}
+            try:
+                with h5py.File(self.file_path, "r") as saved_file:
+                    readback_rows = {
+                        "dev1": int(saved_file["emg1_250hz_adc"].shape[0]),
+                        "dev2": int(saved_file["emg2_250hz_adc"].shape[0]),
+                    }
+                if readback_rows != expected_rows:
+                    raise IOError(f"readback row mismatch: expected={expected_rows}, got={readback_rows}")
+                health["save_validation"] = "valid"
+                health["readback"] = {"ok": True, "emg_rows": readback_rows}
+            except Exception as error:
+                health["save_validation"] = "failed"
+                health["save_error"] = str(error)
+                health["readback"] = {"ok": False, "error": str(error), "emg_rows_before_close": expected_rows}
+                collection_status = "incomplete" if incomplete else params.get("collection_status", "completed")
+                self._pending_close_validation = {
+                    "file_path": self.file_path, "file_token": getattr(self, "file_token", None),
+                    "health": health, "stats": self.stats.copy(), "collection_status": collection_status,
+                }
+                debug_log(f"❌ H5只读回验失败 file={self.file_path} token={getattr(self, 'file_token', None)} "
+                          f"received_seq={getattr(self, 'last_received_sequence', 0)} "
+                          f"written_seq={getattr(self, 'last_data_sequence', 0)} counters={health['emg_write_counts']} "
+                          f"rows={expected_rows}: {error}")
+                result = {"status": "error", "msg": f"文件已关闭但只读回验失败: {error}",
+                          "file_path": self.file_path, "stats": self.stats.copy(),
+                          "capture_warnings": health["capture_warnings"], "data_health": health}
+                return result
 
             rel_path = os.path.relpath(self.file_path, self.storage_dir) if self.file_path else "N/A"
             debug_log(f"✅ 文件已关闭: {rel_path}")
@@ -1452,14 +1712,66 @@ class HDF5StorageServer:
             result = {
                 "status": "success", "msg": "文件已保存并关闭",
                 "file_path": self.file_path, "stats": self.stats.copy(),
-                "collection_status": "incomplete" if incomplete else params.get("collection_status", "completed")
+                "collection_status": "incomplete" if incomplete else params.get("collection_status", "completed"),
+                "capture_warnings": health["capture_warnings"], "data_health": health,
             }
+            debug_log(f"CAPTURE_HEALTH_CLOSE {json.dumps(health, ensure_ascii=False, sort_keys=True)}")
             token = getattr(self, "file_token", None)
             if token is not None:
-                self.finalized_files[token] = result
+                getattr(self, "finalized_files", {}).setdefault(token, result)
             return result
             
         except Exception as e:
+            if incomplete and self.f is not None:
+                original_error = str(e)
+                fallback_errors = {}
+                file_handle = self.f
+                try:
+                    file_handle.attrs["collection_status"] = "incomplete"
+                    file_handle.attrs["finalize_error"] = original_error
+                except Exception as attr_error:
+                    fallback_errors["metadata"] = str(attr_error)
+                try:
+                    file_handle.flush()
+                except Exception as flush_error:
+                    fallback_errors["flush"] = str(flush_error)
+
+                file_closed = False
+                try:
+                    file_handle.close()
+                    file_closed = True
+                    self.f = None
+                    self.is_collecting = False
+                except Exception as close_error:
+                    fallback_errors["close"] = str(close_error)
+
+                readback = {"ok": False, "emg_rows": None}
+                if file_closed:
+                    try:
+                        with h5py.File(self.file_path, "r") as saved_file:
+                            readback["emg_rows"] = {
+                                "dev1": int(saved_file["emg1_250hz_adc"].shape[0]),
+                                "dev2": int(saved_file["emg2_250hz_adc"].shape[0]),
+                            }
+                        readback["ok"] = True
+                    except Exception as read_error:
+                        readback["error"] = str(read_error)
+                        fallback_errors["readback"] = str(read_error)
+
+                debug_log(
+                    f"❌ 不完整文件尽力收尾失败 file={getattr(self, 'file_path', None)} "
+                    f"token={getattr(self, 'file_token', None)} original_error={original_error} "
+                    f"file_closed={file_closed} fallback_errors={fallback_errors} readback={readback}"
+                )
+                return {
+                    "status": "error",
+                    "msg": f"不完整采集收尾未能完整完成: {original_error}",
+                    "error": original_error,
+                    "file_path": getattr(self, "file_path", None),
+                    "file_closed": file_closed,
+                    "readback": readback,
+                    "fallback_errors": fallback_errors,
+                }
             if self.f is not None:
                 try:
                     self.f.attrs["collection_status"] = "save_failed"
@@ -1467,7 +1779,10 @@ class HDF5StorageServer:
                     self.f.flush()
                 except Exception:
                     pass
-            debug_log(f"❌ 关闭文件失败: {e}")
+            debug_log(f"❌ 关闭文件失败 file={getattr(self, 'file_path', None)} token={getattr(self, 'file_token', None)} "
+                      f"received_seq={getattr(self, 'last_received_sequence', 0)} "
+                      f"written_seq={getattr(self, 'last_data_sequence', 0)} "
+                      f"counters={getattr(self, 'stats', {})}: {e}")
             return {"status": "error", "msg": f"关闭文件失败：{str(e)}"}
     
     def _write_segment_metadata(self, params):
@@ -1677,7 +1992,10 @@ class HDF5StorageServer:
                 success = self._process_data_request({"cmd": "append", "params": params})
                 return {"status": "success" if success else "error",
                         "msg": self.data_write_error or "data appended"}
-            return self.append_data(params)
+            response = self.append_data(params)
+            if response.get("status") == "success":
+                self._maybe_log_capture_progress()
+            return response
         if cmd == "stats":
             return {"status": "success", "data": self.get_stats()}
         if cmd == "flush":

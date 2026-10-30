@@ -1,0 +1,28 @@
+﻿path,kind,classification,confirmed_missing_samples,footer_count_off_by_one_uncertain,nonforward_count,remainder
+D:\Master\华为横向数据\第一批\L164_L_260804_102752_emg.bin,emg,declared_count_mismatch,1267,False,0,0
+D:\Master\华为横向数据\第一批\L164_L_260804_102752_imu.bin,imu,source_structure_error,,False,11156,16
+D:\Master\华为横向数据\第三批\离散L057 L062 L065\离散L057 L062 L065\0719\手环数据\L057\L057_L_260718_220333_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第三批\离散L057 L062 L065\离散L057 L062 L065\0719\手环数据\L057\L057_R_260718_214646_emg.bin,emg,declared_count_mismatch,1270,False,0,0
+D:\Master\华为横向数据\第三批\离散L057 L062 L065\离散L057 L062 L065\0719\手环数据\L057\L057_R_260718_214646_imu.bin,imu,source_structure_error,,False,4839,48
+D:\Master\华为横向数据\第三批\离散L057 L062 L065\离散L057 L062 L065\0720\手环数据\L062\L062_R_260720_100237_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第三批\离散L057 L062 L065\离散L057 L062 L065\0720\手环数据\L062\L065_R_260720_174926_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L367_L_260903_194153_emg.bin,emg,confirmed_missing_samples,194,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L367_L_260903_194451_emg.bin,emg,confirmed_missing_samples,259,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_L_260904_083612_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_L_260904_090518_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_R_260904_082932_emg.bin,emg,confirmed_missing_samples,42,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_R_260904_083613_emg.bin,emg,confirmed_missing_samples,426,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_R_260904_085802_emg.bin,emg,confirmed_missing_samples,1192,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_R_260904_090519_emg.bin,emg,confirmed_missing_samples,399,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_R_260904_091138_emg.bin,emg,confirmed_missing_samples,261,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_R_260904_091750_emg.bin,emg,confirmed_missing_samples,381,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_R_260904_103605_emg.bin,emg,confirmed_missing_samples,908,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L380\L380_R_260904_104606_emg.bin,emg,confirmed_missing_samples,535,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L385\L385_R_260904_133340_emg.bin,emg,declared_count_mismatch,1265,False,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L385\L385_R_260904_133340_imu.bin,imu,source_structure_error,,False,48557,22
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L385\L385_R_260904_142342_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L388\L388_L_260904_183256_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L388\L388_L_260904_192048_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L388\L388_L_260904_193756_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L388\L388_L_260904_194307_imu.bin,imu,declared_count_mismatch,,True,0,0
+D:\Master\华为横向数据\第二批\离散L380 L385 L388\离散L380 L385 L388\0904\手环数据\L388\L388_R_260904_193700_imu.bin,imu,declared_count_mismatch,,True,0,0

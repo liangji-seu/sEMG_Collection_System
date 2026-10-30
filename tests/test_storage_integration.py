@@ -48,6 +48,44 @@ async function rpc(cmd, params = {}) {
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>{req.close();push.close();});
 '''
 
+NODE_DUPLICATE_FALLBACK = r'''
+const zmq = require('zeromq');
+const port = Number(process.argv[1]);
+const req = new zmq.Request({receiveTimeout: 10000, sendTimeout: 5000, linger: 0});
+const push = new zmq.Push({sendTimeout: 5000, linger: 0});
+req.connect(`tcp://127.0.0.1:${port}`);
+push.connect(`tcp://127.0.0.1:${port+1}`);
+async function rpc(cmd, params = {}) {
+  await req.send(JSON.stringify({cmd, params}));
+  const [reply] = await req.receive();
+  return JSON.parse(reply.toString());
+}
+function appendParams(seq) {
+  return {_storage_file_token:'same-file-token', _storage_seq:seq,
+    data:{emg1:Array.from({length:16},(_,c)=>[c*1000+seq]),emg1_t:[1000+seq/250],emg1_frame_ids:[seq]}};
+}
+(async () => {
+  const created = await rpc('create', {_storage_file_token:'same-file-token', user_id:'test', stage_name:'duplicate-wire'});
+  if(created.status !== 'success') throw new Error(JSON.stringify(created));
+
+  // Ambiguous PUSH receipt: REP replays the identical seq/token/data either
+  // before or after the PULL loop consumes the PUSH message.
+  const first = appendParams(1);
+  await push.send(JSON.stringify({cmd:'append', params:first}));
+  const ambiguousRetry = await rpc('append', appendParams(1));
+
+  // Delayed PUSH arrival after the REP copy was accepted, followed by an
+  // already-written duplicate REP retry and the next sequence over PUSH.
+  const delayedRetry = await rpc('append', appendParams(2));
+  await push.send(JSON.stringify({cmd:'append', params:appendParams(2)}));
+  const alreadyWrittenRetry = await rpc('append', appendParams(2));
+  await push.send(JSON.stringify({cmd:'append', params:appendParams(3)}));
+  const nextSequence = await rpc('append', appendParams(4));
+  const close = await rpc('close', {_storage_file_token:'same-file-token', _storage_data_seq:4});
+  console.log(JSON.stringify({created, ambiguousRetry, delayedRetry, alreadyWrittenRetry, nextSequence, close}));
+})().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>{req.close();push.close();});
+'''
+
 
 class StorageWireTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'Node runtime unavailable')
@@ -74,7 +112,9 @@ class StorageWireTests(unittest.TestCase):
                     deadline = time.monotonic() + 10
                     while True:
                         if service.poll() is not None:
-                            self.fail('Storage exited before readiness')
+                            log.flush()
+                            detail = (Path(directory) / 'service.log').read_text(errors='replace')
+                            self.fail(f'Storage exited before readiness: {detail}')
                         try:
                             with socket.create_connection(('127.0.0.1', port), timeout=.2):
                                 break
@@ -96,6 +136,65 @@ class StorageWireTests(unittest.TestCase):
                     with h5py.File(response['second']['file_path'], 'r') as file:
                         self.assertEqual(file['prompts/names'].asstr()[:].tolist(), ['fresh'])
                         self.assertEqual(file.attrs['storage_written_sequence'], 1)
+                finally:
+                    service.terminate()
+                    try:
+                        service.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        service.kill()
+                        service.wait(timeout=5)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node runtime unavailable')
+    def test_node_push_rep_duplicate_fallback_is_idempotent_and_preserves_next_sequence(self):
+        # The storage child uses the active Conda interpreter, with numerical
+        # libraries limited to one thread for a predictable integration run.
+        for _ in range(30):
+            with socket.socket() as first, socket.socket() as second:
+                first.bind(('127.0.0.1', 0))
+                port = first.getsockname()[1]
+                if port == 65535:
+                    continue
+                try:
+                    second.bind(('127.0.0.1', port+1))
+                    break
+                except OSError:
+                    continue
+        else:
+            self.fail('No free consecutive loopback ports')
+
+        child_env = os.environ.copy()
+        child_env.update({'OPENBLAS_NUM_THREADS': '1', 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'})
+        with tempfile.TemporaryDirectory(dir=ROOT / 'tests', prefix='wire-dup-') as directory:
+            with open(Path(directory) / 'service.log', 'wb') as log:
+                service = subprocess.Popen([str(Path(sys.executable)), '-u', str(ROOT / 'storage_server.py'),
+                    '--port', str(port), '--storage_dir', directory], stdout=log, stderr=log,
+                    cwd=ROOT, env=child_env)
+                try:
+                    deadline = time.monotonic() + 10
+                    while True:
+                        if service.poll() is not None:
+                            log.flush()
+                            detail = (Path(directory) / 'service.log').read_text(errors='replace')
+                            self.fail(f'Storage exited before readiness: {detail}')
+                        try:
+                            with socket.create_connection(('127.0.0.1', port), timeout=.2):
+                                break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                self.fail('Storage readiness timeout')
+                            time.sleep(.02)
+                    result = subprocess.run(['node', '-e', NODE_DUPLICATE_FALLBACK, str(port)],
+                                            capture_output=True, timeout=30, cwd=ROOT)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+                    response = json.loads(result.stdout)
+                    for key in ('ambiguousRetry', 'delayedRetry', 'alreadyWrittenRetry', 'nextSequence', 'close'):
+                        self.assertEqual(response[key]['status'], 'success', (key, response[key]))
+                    with h5py.File(response['created']['file_path'], 'r') as file:
+                        rows = file['emg1_250hz_adc'][:]
+                        self.assertEqual(len(rows), 4)
+                        np.testing.assert_array_equal(rows['frame_id'], np.arange(1, 5))
+                        np.testing.assert_array_equal(rows['channels'][:, 5], np.arange(1, 5) + 5000)
+                        self.assertEqual(file.attrs['storage_written_sequence'], 4)
                 finally:
                     service.terminate()
                     try:

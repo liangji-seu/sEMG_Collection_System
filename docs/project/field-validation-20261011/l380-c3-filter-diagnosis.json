@@ -1,0 +1,471 @@
+{
+  "case": {
+    "case_key": "第二批/离散L380 L385 L388/离散L380 L385 L388/0904/电脑数据/L380/L380-C3/离散手势采集/静态采集/坐姿/正常状态/L380/L380_坐姿_(正向)_站姿_手臂自然下垂-3-4_session3_20260904_084235.h5",
+    "source_h5": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\电脑数据\\L380\\L380-C3\\离散手势采集\\静态采集\\坐姿\\正常状态\\L380\\L380_坐姿_(正向)_站姿_手臂自然下垂-3-4_session3_20260904_084235.h5",
+    "pairs": {
+      "dev1_emg": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_L_260904_084234_emg.bin",
+      "dev1_imu": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_L_260904_084234_imu.bin",
+      "dev2_emg": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_084235_emg.bin",
+      "dev2_imu": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_084235_imu.bin"
+    }
+  },
+  "source": {
+    "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\电脑数据\\L380\\L380-C3\\离散手势采集\\静态采集\\坐姿\\正常状态\\L380\\L380_坐姿_(正向)_站姿_手臂自然下垂-3-4_session3_20260904_084235.h5",
+    "open": "ok",
+    "datasets": {
+      "emg1_250hz_adc": {
+        "shape": [
+          36
+        ],
+        "dtype": "[('channels', '<i4', (16,)), ('frame_id', '<u4'), ('sd_frame_id', '<u4'), ('time', '<f8')]",
+        "chunks": [
+          1000
+        ],
+        "compression": "gzip",
+        "compression_opts": 4,
+        "filters": [
+          {
+            "id": 1,
+            "name": "deflate",
+            "available": true
+          }
+        ],
+        "whole_read": "OSError: Can't synchronously read data (filter returned failure during read)",
+        "fields": {
+          "channels": {
+            "chunks_tested": 1,
+            "ok_chunks": 0,
+            "bad_chunks": [
+              {
+                "start": 0,
+                "end": 36,
+                "error": "OSError: Can't synchronously read data (filter returned failure during read)"
+              }
+            ]
+          },
+          "frame_id": {
+            "chunks_tested": 1,
+            "ok_chunks": 0,
+            "bad_chunks": [
+              {
+                "start": 0,
+                "end": 36,
+                "error": "OSError: Can't synchronously read data (filter returned failure during read)"
+              }
+            ]
+          },
+          "sd_frame_id": {
+            "chunks_tested": 1,
+            "ok_chunks": 0,
+            "bad_chunks": [
+              {
+                "start": 0,
+                "end": 36,
+                "error": "OSError: Can't synchronously read data (filter returned failure during read)"
+              }
+            ]
+          },
+          "time": {
+            "chunks_tested": 1,
+            "ok_chunks": 0,
+            "bad_chunks": [
+              {
+                "start": 0,
+                "end": 36,
+                "error": "OSError: Can't synchronously read data (filter returned failure during read)"
+              }
+            ]
+          }
+        }
+      },
+      "emg2_250hz_adc": {
+        "shape": [
+          36
+        ],
+        "dtype": "[('channels', '<i4', (16,)), ('frame_id', '<u4'), ('sd_frame_id', '<u4'), ('time', '<f8')]",
+        "chunks": [
+          1000
+        ],
+        "compression": "gzip",
+        "compression_opts": 4,
+        "filters": [
+          {
+            "id": 1,
+            "name": "deflate",
+            "available": true
+          }
+        ],
+        "whole_read": "OSError: Can't synchronously read data (filter returned failure during read)",
+        "fields": {
+          "channels": {
+            "chunks_tested": 1,
+            "ok_chunks": 0,
+            "bad_chunks": [
+              {
+                "start": 0,
+                "end": 36,
+                "error": "OSError: Can't synchronously read data (filter returned failure during read)"
+              }
+            ]
+          },
+          "frame_id": {
+            "chunks_tested": 1,
+            "ok_chunks": 0,
+            "bad_chunks": [
+              {
+                "start": 0,
+                "end": 36,
+                "error": "OSError: Can't synchronously read data (filter returned failure during read)"
+              }
+            ]
+          },
+          "sd_frame_id": {
+            "chunks_tested": 1,
+            "ok_chunks": 0,
+            "bad_chunks": [
+              {
+                "start": 0,
+                "end": 36,
+                "error": "OSError: Can't synchronously read data (filter returned failure during read)"
+              }
+            ]
+          },
+          "time": {
+            "chunks_tested": 1,
+            "ok_chunks": 0,
+            "bad_chunks": [
+              {
+                "start": 0,
+                "end": 36,
+                "error": "OSError: Can't synchronously read data (filter returned failure during read)"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "metadata": {
+      "root_attrs": {
+        "bin_pair_source": "collection_stream",
+        "collection_session_id": "rec_20260904_082925_6",
+        "is_multi_session": true,
+        "recording_session_id": "rec_20260904_082925_6",
+        "sd_bin_dev1": "L380_L_260904_084234",
+        "sd_bin_dev2": "L380_R_260904_084235",
+        "session_count": 6,
+        "session_index": 2,
+        "session_number": 3,
+        "start_time": 1788482555.887,
+        "timestamp_to_start_delay_ms": 200,
+        "video_left": "L380_L_260904_084234.avi",
+        "video_right": "L380_R_260904_084235.avi",
+        "video_start_timestamp": 1788482555.890209
+      },
+      "objects": {
+        "prompts": {
+          "attrs": {},
+          "entries": {
+            "names": {
+              "shape": [
+                0
+              ],
+              "dtype": "object",
+              "chunks": [
+                1000
+              ],
+              "compression": null,
+              "compression_opts": null,
+              "filters": [],
+              "whole_read": "ok",
+              "fields": {}
+            },
+            "times": {
+              "shape": [
+                0
+              ],
+              "dtype": "float64",
+              "chunks": [
+                1000
+              ],
+              "compression": null,
+              "compression_opts": null,
+              "filters": [],
+              "whole_read": "ok",
+              "fields": {}
+            }
+          }
+        }
+      }
+    }
+  },
+  "comparison_h5": {
+    "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\电脑数据\\L380\\L380-C3\\离散手势采集\\静态采集\\坐姿\\正常状态\\L380\\L380_坐姿_(正向)_站姿_手臂自然下垂-3-4_session1_20260904_082932.h5",
+    "open": "ok",
+    "datasets": {
+      "emg1_250hz_adc": {
+        "shape": [
+          93240
+        ],
+        "dtype": "[('channels', '<i4', (16,)), ('frame_id', '<u4'), ('sd_frame_id', '<u4'), ('time', '<f8')]",
+        "chunks": [
+          1000
+        ],
+        "compression": "gzip",
+        "compression_opts": 4,
+        "filters": [
+          {
+            "id": 1,
+            "name": "deflate",
+            "available": true
+          }
+        ],
+        "whole_read": "ok",
+        "fields": {
+          "channels": {
+            "chunks_tested": 94,
+            "ok_chunks": 94,
+            "bad_chunks": []
+          },
+          "frame_id": {
+            "chunks_tested": 94,
+            "ok_chunks": 94,
+            "bad_chunks": []
+          },
+          "sd_frame_id": {
+            "chunks_tested": 94,
+            "ok_chunks": 94,
+            "bad_chunks": []
+          },
+          "time": {
+            "chunks_tested": 94,
+            "ok_chunks": 94,
+            "bad_chunks": []
+          }
+        }
+      },
+      "emg2_250hz_adc": {
+        "shape": [
+          93249
+        ],
+        "dtype": "[('channels', '<i4', (16,)), ('frame_id', '<u4'), ('sd_frame_id', '<u4'), ('time', '<f8')]",
+        "chunks": [
+          1000
+        ],
+        "compression": "gzip",
+        "compression_opts": 4,
+        "filters": [
+          {
+            "id": 1,
+            "name": "deflate",
+            "available": true
+          }
+        ],
+        "whole_read": "ok",
+        "fields": {
+          "channels": {
+            "chunks_tested": 94,
+            "ok_chunks": 94,
+            "bad_chunks": []
+          },
+          "frame_id": {
+            "chunks_tested": 94,
+            "ok_chunks": 94,
+            "bad_chunks": []
+          },
+          "sd_frame_id": {
+            "chunks_tested": 94,
+            "ok_chunks": 94,
+            "bad_chunks": []
+          },
+          "time": {
+            "chunks_tested": 94,
+            "ok_chunks": 94,
+            "bad_chunks": []
+          }
+        }
+      }
+    },
+    "metadata": {
+      "root_attrs": {
+        "bin_pair_source": "collection_stream",
+        "collection_bin_finalized": "true",
+        "emg1_time_max": 1788482145.931745,
+        "emg1_time_min": 1788481772.9429684,
+        "emg2_time_max": 1788482145.938741,
+        "emg2_time_min": 1788481772.9429684,
+        "end_time": 1788482156.931,
+        "last_sync_attempt_time": "2026-09-04T12:28:53.618194",
+        "last_sync_error_time": "2026-09-04T12:28:53.618194",
+        "sd_bin_dev1": "L380_L_260904_082931",
+        "sd_bin_dev2": "L380_R_260904_082932",
+        "segment_bin_summary": "{\"devices\": {\"dev1\": {\"frame_id_min\": 207, \"frame_id_max\": 93464, \"frame_count\": 93240, \"time_min\": 1788481772.9429684, \"time_max\": 1788482145.931745, \"sd_bin\": \"L380_L_260904_082931\", \"ble_device\": \"WristBand_CFDE\"}, \"dev2\": {\"frame_id_min\": 9, \"frame_id_max\": 93266, \"frame_count\": 93249, \"time_min\": 1788481772.9429684, \"time_max\": 1788482145.938741, \"sd_bin\": \"L380_R_260904_082932\", \"ble_device\": \"WristBand_C786\"}}, \"device_count\": 2}",
+        "segment_has_dev1_bin": true,
+        "segment_has_dev2_bin": true,
+        "session_count": 6,
+        "session_index": 0,
+        "session_number": 1,
+        "start_time": 1788481772.897,
+        "sync_bin_offset_dev1": 0,
+        "sync_bin_offset_dev2": 0,
+        "sync_time": "2026-09-04T12:28:53.617509",
+        "timestamp_to_start_delay_ms": 200,
+        "total_prompts": 113,
+        "video_left": "L380_L_260904_082931.avi",
+        "video_right": "L380_R_260904_082932.avi",
+        "video_start_timestamp": 1788481772.910005
+      },
+      "objects": {
+        "prompts": {
+          "attrs": {},
+          "entries": {
+            "names": {
+              "shape": [
+                113
+              ],
+              "dtype": "object",
+              "chunks": [
+                1000
+              ],
+              "compression": null,
+              "compression_opts": null,
+              "filters": [],
+              "whole_read": "ok",
+              "fields": {}
+            },
+            "times": {
+              "shape": [
+                113
+              ],
+              "dtype": "float64",
+              "chunks": [
+                1000
+              ],
+              "compression": null,
+              "compression_opts": null,
+              "filters": [],
+              "whole_read": "ok",
+              "fields": {}
+            }
+          }
+        },
+        "video_timing": {
+          "attrs": {},
+          "entries": {
+            "duration": {
+              "shape": [
+                2
+              ],
+              "dtype": "float64",
+              "chunks": null,
+              "compression": null,
+              "compression_opts": null,
+              "filters": [],
+              "whole_read": "ok",
+              "fields": {}
+            },
+            "first_frame_unix": {
+              "shape": [
+                2
+              ],
+              "dtype": "float64",
+              "chunks": null,
+              "compression": null,
+              "compression_opts": null,
+              "filters": [],
+              "whole_read": "ok",
+              "fields": {}
+            },
+            "last_frame_unix": {
+              "shape": [
+                2
+              ],
+              "dtype": "float64",
+              "chunks": null,
+              "compression": null,
+              "compression_opts": null,
+              "filters": [],
+              "whole_read": "ok",
+              "fields": {}
+            },
+            "sides": {
+              "shape": [
+                2
+              ],
+              "dtype": "object",
+              "chunks": null,
+              "compression": null,
+              "compression_opts": null,
+              "filters": [],
+              "whole_read": "ok",
+              "fields": {}
+            }
+          }
+        }
+      }
+    }
+  },
+  "comparison_path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\电脑数据\\L380\\L380-C3\\离散手势采集\\静态采集\\坐姿\\正常状态\\L380\\L380_坐姿_(正向)_站姿_手臂自然下垂-3-4_session1_20260904_082932.h5",
+  "paired_bins": {
+    "dev1_emg": {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_L_260904_084234_emg.bin",
+      "size": 11913102,
+      "sha256": "dea946d849bddc032d6da2e5ed72f28881b5650531acf73fb010a630f919156e",
+      "frame_count": 229095,
+      "first_id": 0,
+      "last_id": 229094,
+      "gap_events": 0,
+      "nonforward_count": 0,
+      "classification": null
+    },
+    "dev1_imu": {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_L_260904_084234_imu.bin",
+      "size": 664610,
+      "sha256": "8d64104652e9df72e28bbf7ee7517aa6c0d67815f6520718d87ba8ae626499d6",
+      "frame_count": 11456,
+      "first_id": 0,
+      "last_id": 11455,
+      "gap_events": 0,
+      "nonforward_count": 0,
+      "classification": null
+    },
+    "dev2_emg": {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_084235_emg.bin",
+      "size": 11827250,
+      "sha256": "614bde0919bff19c2dd8cabddb6a91f9b3eadd927e978de8b1b9d5dee203e4c1",
+      "frame_count": 227444,
+      "first_id": 743197,
+      "last_id": 970640,
+      "gap_events": 0,
+      "nonforward_count": 0,
+      "classification": null
+    },
+    "dev2_imu": {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_084235_imu.bin",
+      "size": 659854,
+      "sha256": "7249d1939bb19e611834ab10964b5b2714634b8ae7836d0e6d9275636c527c97",
+      "frame_count": 11374,
+      "first_id": 0,
+      "last_id": 11373,
+      "gap_events": 0,
+      "nonforward_count": 0,
+      "classification": null
+    }
+  },
+  "safe_recovery_assessment": {
+    "filter_missing_vs_bad_chunk": "compare filter availability and same-filter neighbor chunk reads",
+    "requires_remaining_ble_adc_anchors": true,
+    "original_h5_untouched": true
+  },
+  "assessment": {
+    "gzip_filter_available": true,
+    "same_filter_neighbor_reads_ok": true,
+    "source_emg250_datasets_with_read_failure": [
+      "emg1_250hz_adc",
+      "emg2_250hz_adc"
+    ],
+    "source_readable_emg250_rows": 0,
+    "remaining_ble_adc_anchors_sufficient": false,
+    "diagnosis": "bad_or_corrupt_compressed_chunks_more_likely_than_missing_filter",
+    "safe_recovery": "Use paired BIN only for a separately evidenced bin-driven reconstruction; without readable EMG250 ADC anchors, do not claim exact BLE alignment or full H5 multi-segment 2k recovery."
+  }
+}

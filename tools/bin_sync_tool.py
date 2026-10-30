@@ -38,6 +38,7 @@ import struct
 import argparse
 import numpy as np
 import h5py
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from functools import wraps
@@ -68,6 +69,9 @@ except ImportError:  # pragma: no cover - 取决于运行环境
 # bin文件Magic Word
 EMG_MAGIC = 0xAABBCCDD
 IMU_MAGIC = 0xBBCCDDEE
+
+_PEER_BIN_HEADER_TS_RE = re.compile(
+    r'^(?P<subject>[^_]+)_(?P<side>[LR])_(?P<date>\d{6})_(?P<time>\d{6})$')
 
 # 文件头大小
 HEADER_SIZE = 126
@@ -333,7 +337,7 @@ def validate_frame_ids(frame_ids):
             reason = gap_reason
         report.append(f"[FAIL] {gap_reason}")
 
-    return {
+    result = {
         'total': total, 'unique': unique, 'duplicates': duplicates,
         'duplicate_ratio': duplicate_ratio,
         'non_increasing': int(non_increasing),
@@ -3422,7 +3426,8 @@ def _fit_2khz_time_model(x_anchor, timestamps_250hz, probe_count=200):
 
 def _enumerate_2khz_from_bin(emg_parser, channel_map, x_anchor, bin_base,
                              slope, intercept, anchor_position, label_offset=None,
-                             full_bin=False, anchor_times=None):
+                             full_bin=False, anchor_times=None,
+                             source_frame_bounds=None):
     """按 bin 自己的帧序列连续枚举 2kHz 输出行。
 
     x_anchor: 每个蓝牙锚点对应的会话内 2kHz 帧号（其时间戳为 timestamps_250hz[i]）。
@@ -3462,6 +3467,10 @@ def _enumerate_2khz_from_bin(emg_parser, channel_map, x_anchor, bin_base,
         # BLE is timing evidence, never a mask for a paired SD recording.
         # Include the prefix and suffix even when no BLE packets survived there.
         bin_lo, bin_hi = int(min(frames)), int(max(frames))
+    if source_frame_bounds is not None:
+        bound_lo, bound_hi = map(int, source_frame_bounds)
+        bin_lo = max(bin_lo, bound_lo)
+        bin_hi = min(bin_hi, bound_hi)
     if bin_lo < lower_bound:
         clamped_to_bin_start = lower_bound - bin_lo
         bin_lo = lower_bound
@@ -3597,7 +3606,7 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
                           align_model='pick', align_tier='exact', align_exact_frac=1.0,
                           label_offset=None, align_offset_attr=None, full_bin=True,
                           startup_recovery=False, ble_epoch_warning=None,
-                          ble_imu_time_window=None):
+                          ble_imu_time_window=None, peer_time_reference=None):
     """构建并写入 2kHz 数据 + IMU 100Hz 数据到 H5（共享逻辑）。
 
     sync_match_rate: 成功路径写入 sync_offset_match_rate_dev{device_id} 供 UI 展示
@@ -3630,36 +3639,60 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
     ble_coverage_note = str(ble_epoch_warning.get('note', ''))
     # 250Hz 的 channels 不再参与 2kHz 构建（输出完全来自 bin），只需要时间戳来定基准
     timestamps_250hz = data_250hz['time']
+    peer_time_reference = dict(peer_time_reference or {})
+    is_peer_time_fallback = bool(peer_time_reference)
 
     invalid_negative_sd_frames = 0
 
     # ── Step 1: 以 bin 为主体的连续写入 ──
     # 一对一保留整个配对 bin，一对多仅保留明确会话区间；每个真实样本写一次。
     # BLE 250Hz 只提供坐标和时间锚点，不参与输出采样的筛选或内容填充。
-    if anchor_sd_frame_ids is not None and len(anchor_sd_frame_ids) >= num_frames_250hz:
+    if is_peer_time_fallback:
+        x_anchor = np.asarray(peer_time_reference['selection_positions'], dtype=np.int64)
+        time_model_x = np.asarray(peer_time_reference['positions'], dtype=np.int64)
+        time_model_t = np.asarray(peer_time_reference['times'], dtype=np.float64)
+    elif anchor_sd_frame_ids is not None and len(anchor_sd_frame_ids) >= num_frames_250hz:
         x_anchor = np.asarray(anchor_sd_frame_ids[:num_frames_250hz], dtype=np.int64)
+        time_model_x = x_anchor
+        time_model_t = timestamps_250hz
     else:
         # 无逐帧锚点时退回标称 8 帧/锚点网格；anchor_position 槽位承载该行的时间戳
         x_anchor = (int(bin_offset) + int(anchor_position)
                     + np.arange(num_frames_250hz, dtype=np.int64) * DOWNSAMPLE_RATIO)
+        time_model_x = x_anchor
+        time_model_t = timestamps_250hz
     # 时间模型必须在"写出去的那套帧号"上拟合：写入的是 x_kept = bin_kept - label_offset，
     # 而 x_anchor 是读取网格（bin_kept 侧）的帧号，二者相差 (bin_base - label_offset)。
     # 常规路径 label_offset == bin_base，位移为 0，行为与历史完全一致；
     # 补救路径 label_offset = base + tbb 而 bin_base = 0，必须补上这个位移，
     # 否则整段 2kHz 时间轴会带上 (base + tbb)/2000 秒的常量偏移。
     x_anchor_fit = x_anchor + (int(bin_base) - label_offset)
-    slope, intercept, time_diag = _fit_2khz_time_model(x_anchor_fit, timestamps_250hz)
+    if is_peer_time_fallback:
+        # The peer output supplies the validated clock curve; target-frame
+        # timestamps are assigned from that curve after enumerating real BIN rows.
+        slope, intercept, time_diag = _fit_2khz_time_model(time_model_x, time_model_t)
+    else:
+        slope, intercept, time_diag = _fit_2khz_time_model(x_anchor_fit, time_model_t)
     data_2khz, enum_diag = _enumerate_2khz_from_bin(
         emg_parser, channel_map, x_anchor, bin_base, slope, intercept, anchor_position,
         label_offset=label_offset,
         full_bin=full_bin,
-        anchor_times=timestamps_250hz,
+        anchor_times=None if is_peer_time_fallback else time_model_t,
+        source_frame_bounds=peer_time_reference.get('source_frame_bounds'),
     )
     if data_2khz is None:
         reason = enum_diag.get('reason')
         log(f"  ERROR: 无法按 bin 帧号连续构建 2kHz 数据（{reason}）")
         return {'status': 'failed', 'error': f"2khz_bin_enumerate: {reason}"}
     num_frames_2khz = int(len(data_2khz))
+    if is_peer_time_fallback:
+        positions = np.asarray(peer_time_reference['positions'], dtype=np.float64)
+        times = np.asarray(peer_time_reference['times'], dtype=np.float64)
+        output_positions = np.asarray(data_2khz['sd_frame_id'], dtype=np.float64)
+        mapped_times = _peer_time_at(positions, times, output_positions)
+        if not np.all(np.isfinite(mapped_times)) or np.any(np.diff(mapped_times) <= 0):
+            return {'status': 'failed', 'error': 'peer reference produced invalid target timestamps'}
+        data_2khz['time'] = mapped_times
     filled_frames = num_frames_2khz
     missing_frames = int(enum_diag['bin_gap_frames'])
     invalid_negative_sd_frames = int(enum_diag['clamped_to_bin_start'])
@@ -3672,7 +3705,7 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
 
     # ── Step 2: 仅共享长 bin 按 prompt/session 边界受控延伸 ──
     extension_info = ({'extra_frames': 0, 'extra_filled_frames': 0,
-                       'extra_missing_frames': 0} if full_bin else
+                       'extra_missing_frames': 0} if full_bin or is_peer_time_fallback else
                       _extend_2khz_to_cover_prompts(
                           h5_path, data_2khz, emg_parser, channel_map, resolved_map_name,
                           lookup_base=label_offset))
@@ -3697,8 +3730,14 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
                                                data_2khz, log_fn=log)
         ds_2khz[:] = data_2khz
         for key in list(ds_2khz.attrs):
-            if key.startswith('prompt_coverage_'):
+            if key.startswith('prompt_coverage_') or (
+                    not is_peer_time_fallback and key.startswith('sync_peer_time_')):
                 del ds_2khz.attrs[key]
+        if not is_peer_time_fallback:
+            for key in list(f.attrs):
+                if (key.startswith('sync_peer_time_') and
+                        key.endswith(f'_dev{device_id}')):
+                    del f.attrs[key]
         ds_2khz.attrs["lsb_uv"] = emg_parser.lsb_uv
         ds_2khz.attrs["source_bin"] = os.path.basename(emg_parser.bin_path)
         ds_2khz.attrs["sync_time"] = datetime.now().isoformat()
@@ -3706,7 +3745,9 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         ds_2khz.attrs["missing_frames"] = missing_frames
         ds_2khz.attrs["invalid_negative_sd_frames"] = invalid_negative_sd_frames
         ds_2khz.attrs["sample_rate"] = 2000
-        ds_2khz.attrs["sync_source_mode"] = "full_sd_bin" if full_bin else "ble_anchored_session"
+        ds_2khz.attrs["sync_source_mode"] = (
+            'peer_time_reference_bin' if is_peer_time_fallback else
+            'full_sd_bin' if full_bin else 'ble_anchored_session')
         ds_2khz.attrs["sync_output_contract_version"] = 2
         ds_2khz.attrs["sync_source_frame_count"] = int(enum_diag['source_frame_count'])
         ds_2khz.attrs["sync_output_frame_count"] = int(num_frames_2khz)
@@ -3716,6 +3757,7 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         ds_2khz.attrs["sync_ble_uncovered_count"] = ble_uncovered_rows
         ds_2khz.attrs["sync_ble_coverage_note"] = ble_coverage_note
         ds_2khz.attrs["sync_ble_validation_scope"] = (
+            'peer_time_fallback_no_target_ble' if is_peer_time_fallback else
             'paired_bin_first_ble_epoch' if ble_epoch_warning else 'whole_h5')
         if ble_epoch_warning:
             ds_2khz.attrs["sync_ble_first_epoch_rows"] = int(ble_epoch_warning['first_epoch_rows'])
@@ -3740,7 +3782,22 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         ds_2khz.attrs["sync_time_model_nominal_pairs"] = int(time_diag['nominal_pairs'])
         ds_2khz.attrs["sync_time_model_non_nominal_pairs"] = int(time_diag['non_nominal_pairs'])
         ds_2khz.attrs["sync_time_model_slope_clamped"] = bool(time_diag['slope_clamped'])
-        ds_2khz.attrs["sync_time_source"] = "ble_anchor_interpolation_nominal_extrapolation"
+        ds_2khz.attrs["sync_time_source"] = (
+            'peer_time_fallback' if is_peer_time_fallback else
+            'ble_anchor_interpolation_nominal_extrapolation')
+        ds_2khz.attrs['sync_own_adc_verified'] = bool(verify_passed and not is_peer_time_fallback)
+        if is_peer_time_fallback:
+            for key, value in {
+                'sync_peer_time_reference_device': int(peer_time_reference['reference_device_id']),
+                'sync_peer_time_reference_bin': os.path.basename(peer_time_reference['reference_bin_path']),
+                'sync_peer_time_target_bin': os.path.basename(emg_parser.bin_path),
+                'sync_peer_time_reference_start': peer_time_reference['reference_start'],
+                'sync_peer_time_target_start': peer_time_reference['target_start'],
+                'sync_peer_time_start_delta_seconds': float(peer_time_reference['delta_seconds']),
+                'sync_peer_time_confidence': 'coarse_1s_bin_header_timestamp',
+                'sync_validation_scope': 'peer_time_fallback_import',
+            }.items():
+                ds_2khz.attrs[key] = value
         if len(data_2khz):
             ds_2khz.attrs["sync_2khz_span_seconds"] = float(
                 data_2khz['time'][-1] - data_2khz['time'][0])
@@ -3822,7 +3879,23 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         f.attrs[f"sync_ble_uncovered_count_dev{device_id}"] = ble_uncovered_rows
         f.attrs[f"sync_ble_coverage_note_dev{device_id}"] = ble_coverage_note
         f.attrs[f"sync_ble_validation_scope_dev{device_id}"] = (
+            'peer_time_fallback_no_target_ble' if is_peer_time_fallback else
             'paired_bin_first_ble_epoch' if ble_epoch_warning else 'whole_h5')
+        f.attrs[f'sync_own_adc_verified_dev{device_id}'] = bool(verify_passed and not is_peer_time_fallback)
+        if is_peer_time_fallback:
+            f.attrs[f'sync_time_source_dev{device_id}'] = 'peer_time_fallback'
+            f.attrs[f'sync_peer_time_reference_device_dev{device_id}'] = int(
+                peer_time_reference['reference_device_id'])
+            f.attrs[f'sync_peer_time_reference_bin_dev{device_id}'] = os.path.basename(
+                peer_time_reference['reference_bin_path'])
+            f.attrs[f'sync_peer_time_target_bin_dev{device_id}'] = os.path.basename(
+                emg_parser.bin_path)
+            f.attrs[f'sync_peer_time_reference_start_dev{device_id}'] = peer_time_reference['reference_start']
+            f.attrs[f'sync_peer_time_target_start_dev{device_id}'] = peer_time_reference['target_start']
+            f.attrs[f'sync_peer_time_start_delta_seconds_dev{device_id}'] = float(
+                peer_time_reference['delta_seconds'])
+            f.attrs[f'sync_peer_time_confidence_dev{device_id}'] = (
+                'coarse_1s_bin_header_timestamp')
         if ble_epoch_warning:
             f.attrs[f"sync_ble_first_epoch_rows_dev{device_id}"] = int(ble_epoch_warning['first_epoch_rows'])
             f.attrs[f"sync_ble_whole_h5_rows_dev{device_id}"] = int(ble_epoch_warning['whole_h5_rows'])
@@ -3848,8 +3921,11 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
             # 偏移搜索路径下 match_rate 是带限相关系数，单独记录以免与精确匹配率混淆
             f.attrs[f"sync_filtered_corr_dev{device_id}"] = float(sync_match_rate or 0.0)
         f.attrs["sync_frame_id_mode"] = sync_frame_id_mode
-        f.attrs["sync_bin_offset_mode"] = "none" if bin_offset == 0 else "adc_search"
-        f.attrs["sync_time_alignment"] = "anchor_sample"
+        f.attrs["sync_bin_offset_mode"] = (
+            'peer_time_reference' if is_peer_time_fallback else
+            'none' if bin_offset == 0 else 'adc_search')
+        f.attrs["sync_time_alignment"] = (
+            'peer_ble_reference' if is_peer_time_fallback else 'anchor_sample')
         f.attrs["sync_250hz_anchor_position"] = int(anchor_position)
         f.attrs["sync_2khz_sample_interval"] = 0.0005
         if extension_info['extra_frames'] > 0:
@@ -3857,8 +3933,14 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
             f.attrs[f"sync_prompt_coverage_extra_frames_dev{device_id}"] = int(extension_info['extra_frames'])
         detail = {'device_id': device_id, 'mode': sync_mode, 'offset': bin_offset,
                   'filled': filled_frames, 'missing': missing_frames,
-                  'emg_validation_passed': bool(verify_passed),
+                  'emg_validation_passed': bool(verify_passed and not is_peer_time_fallback),
+                  'own_adc_verified': bool(verify_passed and not is_peer_time_fallback),
                   'imu_verified': bool(imu_result.get('imu_verified', False))}
+        if is_peer_time_fallback:
+            detail['time_source'] = 'peer_time_fallback'
+            detail['peer_device_id'] = int(peer_time_reference['reference_device_id'])
+            detail['peer_start_delta_seconds'] = float(peer_time_reference['delta_seconds'])
+            detail['peer_time_confidence'] = 'coarse_1s_bin_header_timestamp'
         if sync_match_rate is not None:
             detail['match_rate'] = float(sync_match_rate)
         if extension_info['extra_frames'] > 0:
@@ -3882,7 +3964,7 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         imu_cnt = imu_result.get('imu_count', '?')
         imu_info += f" [{active_cnt}/{imu_cnt}活跃]"
     log(f"[{sync_mode}] 同步完成！2kHz: {filled_frames}f{imu_info}")
-    return {
+    result = {
         'status': 'success', 'frames_250hz': num_frames_250hz,
         'frames_2khz': num_frames_2khz, 'filled_frames': filled_frames,
         'missing_frames': missing_frames, 'bin_offset': bin_offset,
@@ -3891,6 +3973,7 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         'sync_ble_coverage_note': ble_coverage_note,
         'sync_ble_source_coverage': float(ble_epoch_warning.get('source_coverage', 1.0)),
         'sync_ble_validation_scope': (
+            'peer_time_fallback_no_target_ble' if is_peer_time_fallback else
             'paired_bin_first_ble_epoch' if ble_epoch_warning else 'whole_h5'),
         'sync_ble_whole_h5_match_rate': float(
             ble_epoch_warning.get('whole_h5_match_rate', 1.0)),
@@ -3907,7 +3990,238 @@ def _build_and_write_2khz(h5_path, emg_parser, imu_parser, device_id,
         'imu_alignment_confidence': imu_result.get('imu_alignment_confidence', 'not_applicable'),
         'imu_missing_frame_ids': imu_result.get('imu_missing_frame_ids', []),
         'imu_sensor_diagnostics': imu_result.get('imu_sensor_diagnostics', {}),
+        'own_adc_verified': bool(verify_passed and not is_peer_time_fallback),
     }
+    if is_peer_time_fallback:
+        result['peer_time_fallback'] = True
+        result['peer_device_id'] = int(peer_time_reference['reference_device_id'])
+        result['peer_start_delta_seconds'] = float(peer_time_reference['delta_seconds'])
+        result['peer_time_confidence'] = 'coarse_1s_bin_header_timestamp'
+        result['time_source'] = 'peer_time_fallback'
+    return result
+
+
+def _parse_peer_bin_start(path):
+    """Read the fixed BIN header and require its second-resolution name stamp."""
+    with open(path, 'rb') as source:
+        header = source.read(HEADER_SIZE)
+    if len(header) != HEADER_SIZE or struct.unpack('<I', header[:4])[0] != EMG_MAGIC:
+        raise ValueError(f'peer time fallback: invalid EMG BIN header: {path}')
+    old_rate = struct.unpack('<H', header[4:6])[0]
+    if 500 <= old_rate <= 5000:
+        sample_rate = old_rate
+        ts_bytes = header[9:41]
+    else:
+        new_rate = struct.unpack('<H', header[5:7])[0]
+        if not 500 <= new_rate <= 5000:
+            raise ValueError(f'peer time fallback: unrecognized BIN header version: {path}')
+        sample_rate = new_rate
+        ts_bytes = header[10:42]
+    if sample_rate != 2000:
+        raise ValueError(f'peer time fallback: expected 2000Hz BIN, got {sample_rate}: {path}')
+    header_stamp = ts_bytes.decode('utf-8').strip('\x00').strip()
+    match = _PEER_BIN_HEADER_TS_RE.fullmatch(header_stamp)
+    if not match:
+        raise ValueError(f'peer time fallback: unusable BIN header timestamp {header_stamp!r}')
+    try:
+        timestamp = datetime.strptime(
+            match.group('date') + match.group('time'), '%y%m%d%H%M%S')
+    except ValueError as exc:
+        raise ValueError(f'peer time fallback: invalid BIN header timestamp {header_stamp!r}') from exc
+    filename = os.path.basename(path)
+    filename_match = re.fullmatch(
+        r'(?P<subject>.+)_(?P<side>[LR])_(?P<date>\d{6})_(?P<time>\d{6})_emg\.bin',
+        filename, flags=re.IGNORECASE)
+    if not filename_match:
+        raise ValueError(f'peer time fallback: BIN filename does not identify EMG session: {filename}')
+    filename_stamp = (filename_match.group('subject'), filename_match.group('side'),
+                      filename_match.group('date'), filename_match.group('time'))
+    header_parts = (match.group('subject'), match.group('side'),
+                    match.group('date'), match.group('time'))
+    if tuple(part.casefold() for part in filename_stamp) != tuple(
+            part.casefold() for part in header_parts):
+        raise ValueError('peer time fallback: BIN header timestamp does not match its filename')
+    return {
+        'subject': match.group('subject'),
+        'side': match.group('side').upper(),
+        'timestamp': timestamp,
+        'stamp': header_stamp,
+        'prefix': filename[:-len('_emg.bin')],
+    }
+
+
+def _peer_time_at(positions, times, target_positions):
+    positions = np.asarray(positions, dtype=np.float64)
+    times = np.asarray(times, dtype=np.float64)
+    target_positions = np.asarray(target_positions, dtype=np.float64)
+    mapped = np.interp(target_positions, positions, times)
+    before = target_positions < positions[0]
+    after = target_positions > positions[-1]
+    mapped[before] = times[0] + (target_positions[before] - positions[0]) / 2000.0
+    mapped[after] = times[-1] + (target_positions[after] - positions[-1]) / 2000.0
+    return mapped
+
+
+@_offline_h5_entrypoint
+def sync_h5_from_peer_time_reference(h5_path, target_emg_bin_path,
+                                     reference_device_id, reference_emg_bin_path,
+                                     target_device_id, imu_bin_path=None,
+                                     full_bin=True, manual_num_imus=None):
+    """Import an empty-BLE device BIN using its validated opposite-hand clock.
+
+    Target EMG/IMU bytes always come from the target parsers. The peer contributes
+    only a time curve and the coarse start-time difference in the BIN headers.
+    """
+    target_device_id = int(target_device_id)
+    reference_device_id = int(reference_device_id)
+    if target_device_id == reference_device_id:
+        return {'status': 'validation_failed', 'reason': 'peer reference must be the opposite device'}
+    if target_device_id not in (1, 2) or reference_device_id not in (1, 2):
+        return {'status': 'validation_failed', 'reason': 'peer time fallback supports device 1 or 2'}
+
+    with h5py.File(h5_path, 'r') as f:
+        target_name = f'emg{target_device_id}_250hz_adc'
+        ref_name = f'emg{reference_device_id}_250hz_adc'
+        target_ble = f.get(target_name)
+        ref_ble = f.get(ref_name)
+        if target_ble is None:
+            return {'status': 'validation_failed', 'reason': f'missing target BLE dataset {target_name}'}
+        if target_ble.shape[0] != 0:
+            return {'status': 'validation_failed', 'reason': 'target BLE dataset is not empty'}
+        if ref_ble is None or ref_ble.shape[0] == 0:
+            return {'status': 'validation_failed', 'reason': 'both target and reference BLE are empty'}
+        target_ble_dtype = target_ble.dtype
+        if not device_sync_record_valid(f, reference_device_id, reference_emg_bin_path):
+            return {'status': 'validation_failed', 'reason': 'reference device has no valid sync record for its current BIN'}
+        ref_ds_name = f'emg{reference_device_id}_2khz_adc'
+        ref_ds = f.get(ref_ds_name)
+        if ref_ds is None or ref_ds.shape[0] < 2:
+            return {'status': 'validation_failed', 'reason': 'reference time output is missing or too short'}
+        ref_time_source = ref_ds.attrs.get('sync_time_source', '')
+        if isinstance(ref_time_source, bytes):
+            ref_time_source = ref_time_source.decode('utf-8', errors='replace')
+        if ref_time_source != 'ble_anchor_interpolation_nominal_extrapolation':
+            return {'status': 'validation_failed', 'reason': 'reference clock is not its own BLE time axis'}
+        if not bool(ref_ds.attrs.get('sync_own_adc_verified', True)):
+            return {'status': 'validation_failed', 'reason': 'reference output is not independently ADC verified'}
+        if 'sd_frame_id' not in (ref_ds.dtype.names or ()) or 'time' not in (ref_ds.dtype.names or ()):
+            return {'status': 'validation_failed', 'reason': 'reference output lacks frame/time coordinates'}
+        try:
+            ref_fid0 = int(ref_ds.attrs['sync_bin_fid0'])
+            ref_align_offset = int(ref_ds.attrs['sync_bin_align_offset'])
+        except (KeyError, TypeError, ValueError):
+            return {'status': 'validation_failed', 'reason': 'reference output lacks scalar BIN coordinate metadata'}
+        ref_output = ref_ds[:]
+        ref_positions = (ref_output['sd_frame_id'].astype(np.int64) +
+                         ref_align_offset - ref_fid0)
+        ref_times = ref_output['time'].astype(np.float64)
+        if (len(ref_positions) < 2 or np.any(np.diff(ref_positions) <= 0) or
+                not np.all(np.isfinite(ref_times)) or np.any(np.diff(ref_times) <= 0)):
+            return {'status': 'validation_failed', 'reason': 'reference output coordinates/time are not strictly increasing'}
+
+        def bound_bin_path(device_id, path):
+            raw = f.attrs.get(f'sd_bin_dev{device_id}', '')
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', errors='replace')
+            expected_prefix = str(raw).strip()
+            basename = os.path.basename(path)
+            if (not expected_prefix or not basename.casefold().endswith('_emg.bin') or
+                    basename[:-len('_emg.bin')].casefold() != expected_prefix.casefold()):
+                raise ValueError(f'device {device_id} BIN path does not match sd_bin_dev{device_id}')
+
+        try:
+            bound_bin_path(reference_device_id, reference_emg_bin_path)
+            bound_bin_path(target_device_id, target_emg_bin_path)
+        except ValueError as exc:
+            return {'status': 'validation_failed', 'reason': str(exc)}
+        emg_kwargs = _resolve_emg_parser_kwargs(f, target_device_id)
+        channel_map, resolved_map_name = _resolve_channel_map(
+            f, target_name, 'V2')
+        _ni = _resolve_num_imus(
+            f, target_device_id, imu_bin_path, manual_num_imus=manual_num_imus)
+
+    try:
+        reference_start = _parse_peer_bin_start(reference_emg_bin_path)
+        target_start = _parse_peer_bin_start(target_emg_bin_path)
+    except (OSError, ValueError) as exc:
+        return {'status': 'validation_failed', 'reason': str(exc)}
+    if reference_start['subject'].casefold() != target_start['subject'].casefold():
+        return {'status': 'validation_failed', 'reason': 'peer BIN headers belong to different subjects'}
+    if reference_start['side'] == target_start['side']:
+        return {'status': 'validation_failed', 'reason': 'peer BIN headers must be opposite sides'}
+    delta_seconds = (target_start['timestamp'] - reference_start['timestamp']).total_seconds()
+    try:
+        target_parser = EMGBinParser(target_emg_bin_path, **emg_kwargs).parse()
+    except Exception as exc:
+        return {'status': 'validation_failed', 'reason': f'target EMG BIN parse failed: {exc}'}
+    if target_parser.frame_count <= 0:
+        return {'status': 'validation_failed', 'reason': 'target EMG BIN has no frames'}
+    try:
+        imu_parser = (IMUBinParser(imu_bin_path, num_imus=_ni).parse()
+                      if imu_bin_path else None)
+    except Exception as exc:
+        return {'status': 'validation_failed', 'reason': f'target IMU BIN parse failed: {exc}'}
+
+    # Header stamps are whole-second acquisition labels, not a device RTC.
+    # Apply that verified coarse delta to the reference's real BLE curve.
+    peer_times = ref_times + delta_seconds
+    target_relative = np.asarray(sorted(target_parser.frames), dtype=np.int64) - int(target_parser.fid0)
+    source_frame_bounds = None
+    if full_bin:
+        selection_positions = np.array(
+            [int(target_relative[0]), int(target_relative[-1])], dtype=np.int64)
+        if selection_positions[0] == selection_positions[1]:
+            selection_positions = selection_positions[:1]
+    else:
+        allowed_ref_start = float(ref_times[0] - delta_seconds)
+        allowed_ref_end = float(ref_times[-1] - delta_seconds)
+        # Invert the piecewise monotone reference time axis, retaining nominal
+        # 2 kHz extrapolation only where an edge extends beyond the output.
+        if allowed_ref_start <= ref_times[0]:
+            x_lo = ref_positions[0] + (allowed_ref_start - ref_times[0]) * 2000.0
+        elif allowed_ref_start >= ref_times[-1]:
+            x_lo = ref_positions[-1] + (allowed_ref_start - ref_times[-1]) * 2000.0
+        else:
+            x_lo = np.interp(allowed_ref_start, ref_times, ref_positions)
+        if allowed_ref_end <= ref_times[0]:
+            x_hi = ref_positions[0] + (allowed_ref_end - ref_times[0]) * 2000.0
+        elif allowed_ref_end >= ref_times[-1]:
+            x_hi = ref_positions[-1] + (allowed_ref_end - ref_times[-1]) * 2000.0
+        else:
+            x_hi = np.interp(allowed_ref_end, ref_times, ref_positions)
+        rel_lo = max(int(target_relative[0]), int(np.ceil(x_lo)))
+        rel_hi = min(int(target_relative[-1]), int(np.floor(x_hi)))
+        if rel_lo > rel_hi:
+            return {'status': 'validation_failed', 'reason': 'target BIN has no frames inside the verified reference time range'}
+        selection_positions = np.array([rel_lo, rel_hi], dtype=np.int64)
+        if rel_lo == rel_hi:
+            selection_positions = selection_positions[:1]
+        source_frame_bounds = (int(target_parser.fid0 + rel_lo),
+                               int(target_parser.fid0 + rel_hi))
+
+    peer_reference = {
+        'positions': ref_positions,
+        'times': peer_times,
+        'selection_positions': selection_positions,
+        'source_frame_bounds': source_frame_bounds,
+        'reference_device_id': reference_device_id,
+        'reference_bin_path': reference_emg_bin_path,
+        'reference_start': reference_start['stamp'],
+        'target_start': target_start['stamp'],
+        'delta_seconds': delta_seconds,
+    }
+    log(f"[peer_time_fallback] dev{target_device_id} 借用 dev{reference_device_id} BLE时间锚，"
+        f"BIN启动差={delta_seconds:+.0f}s (头时间精度1s)")
+    return _build_and_write_2khz(
+        h5_path, target_parser, imu_parser, target_device_id, channel_map,
+        resolved_map_name, np.empty(0, dtype=target_ble_dtype), 0, 0, True,
+        sync_mode='peer_time_fallback', sync_match_rate=None, verify_passed=True,
+        sync_frame_id_mode='peer_time_reference',
+        anchor_position=0, bin_base=int(target_parser.fid0),
+        firmware_mode='peer_time_fallback', align_model='peer_time_reference',
+        align_tier='peer_time_fallback', align_exact_frac=0.0,
+        label_offset=int(target_parser.fid0), align_offset_attr=int(target_parser.fid0),
+        full_bin=bool(full_bin), peer_time_reference=peer_reference)
 
 
 def _iter_imu_ble_anchor_rows(h5_file, device_id, time_window=None):

@@ -18,6 +18,7 @@
     "zeromq": "^6.5.0"
   },
   "devDependencies": {
+    "electron": "^45.0.0",
     "nodemon": "^3.1.4"
   }
 }

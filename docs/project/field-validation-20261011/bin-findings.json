@@ -1,0 +1,142 @@
+{
+  "audited_files": 648,
+  "confirmed_missing_emg": [
+    {
+      "path": "D:\\Master\\华为横向数据\\第一批\\L164_L_260804_102752_emg.bin",
+      "confirmed_missing_samples": 1267,
+      "gap_events": 1
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0719\\手环数据\\L057\\L057_R_260718_214646_emg.bin",
+      "confirmed_missing_samples": 1270,
+      "gap_events": 1
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L367_L_260903_194153_emg.bin",
+      "confirmed_missing_samples": 194,
+      "gap_events": 1
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L367_L_260903_194451_emg.bin",
+      "confirmed_missing_samples": 259,
+      "gap_events": 1
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_082932_emg.bin",
+      "confirmed_missing_samples": 42,
+      "gap_events": 1
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_083613_emg.bin",
+      "confirmed_missing_samples": 426,
+      "gap_events": 2
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_085802_emg.bin",
+      "confirmed_missing_samples": 1192,
+      "gap_events": 3
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_090519_emg.bin",
+      "confirmed_missing_samples": 399,
+      "gap_events": 1
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_091138_emg.bin",
+      "confirmed_missing_samples": 261,
+      "gap_events": 1
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_091750_emg.bin",
+      "confirmed_missing_samples": 381,
+      "gap_events": 1
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_103605_emg.bin",
+      "confirmed_missing_samples": 908,
+      "gap_events": 3
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_R_260904_104606_emg.bin",
+      "confirmed_missing_samples": 535,
+      "gap_events": 4
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L385\\L385_R_260904_133340_emg.bin",
+      "confirmed_missing_samples": 1265,
+      "gap_events": 1
+    }
+  ],
+  "footer_count_off_by_one_uncertain": [
+    {
+      "path": "D:\\Master\\华为横向数据\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0719\\手环数据\\L057\\L057_L_260718_220333_imu.bin",
+      "frame_count": 28661,
+      "declared_total": 28662
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0720\\手环数据\\L062\\L062_R_260720_100237_imu.bin",
+      "frame_count": 16611,
+      "declared_total": 16612
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0720\\手环数据\\L062\\L065_R_260720_174926_imu.bin",
+      "frame_count": 28187,
+      "declared_total": 28188
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_L_260904_083612_imu.bin",
+      "frame_count": 36511,
+      "declared_total": 36512
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L380\\L380_L_260904_090518_imu.bin",
+      "frame_count": 35869,
+      "declared_total": 35870
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L385\\L385_R_260904_142342_imu.bin",
+      "frame_count": 17582,
+      "declared_total": 17583
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L388\\L388_L_260904_183256_imu.bin",
+      "frame_count": 54825,
+      "declared_total": 54826
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L388\\L388_L_260904_192048_imu.bin",
+      "frame_count": 16285,
+      "declared_total": 16286
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L388\\L388_L_260904_193756_imu.bin",
+      "frame_count": 14044,
+      "declared_total": 14045
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L388\\L388_L_260904_194307_imu.bin",
+      "frame_count": 13958,
+      "declared_total": 13959
+    },
+    {
+      "path": "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L388\\L388_R_260904_193700_imu.bin",
+      "frame_count": 3990,
+      "declared_total": 3991
+    }
+  ],
+  "source_structure_error": [
+    "D:\\Master\\华为横向数据\\第一批\\L164_L_260804_102752_imu.bin",
+    "D:\\Master\\华为横向数据\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0719\\手环数据\\L057\\L057_R_260718_214646_imu.bin",
+    "D:\\Master\\华为横向数据\\第二批\\离散L380 L385 L388\\离散L380 L385 L388\\0904\\手环数据\\L385\\L385_R_260904_133340_imu.bin"
+  ],
+  "startup_reset_supported_emg": [
+    "D:\\Master\\华为横向数据\\第一批\\L062_L_260720_084913_emg.bin",
+    "D:\\Master\\华为横向数据\\第一批\\L062_L_260720_092953_emg.bin",
+    "D:\\Master\\华为横向数据\\第一批\\L062_L_260720_101724_emg.bin",
+    "D:\\Master\\华为横向数据\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0720\\手环数据\\L062\\L062_L_260720_084913_emg.bin",
+    "D:\\Master\\华为横向数据\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0720\\手环数据\\L062\\L062_L_260720_092953_emg.bin",
+    "D:\\Master\\华为横向数据\\第三批\\离散L057 L062 L065\\离散L057 L062 L065\\0720\\手环数据\\L062\\L062_L_260720_101724_emg.bin"
+  ],
+  "unclassified_paths": [],
+  "declared_count_mismatch_count": 17
+}
