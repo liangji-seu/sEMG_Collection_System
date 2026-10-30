@@ -1192,7 +1192,7 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                         ? window.BleControl.getExpectedDeviceIds() : [];
                     console.log('[Collection] ★ 期望设备:', expectedDevices);
                     switchResponse = await window.BleControl.sendAndWait(
-                        'switch_preview_to_collection', { expected_devices: expectedDevices });
+                        'switch_preview_to_collection', { expected_devices: expectedDevices }, 60000);
                     if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     console.log('[Collection] ★ switch_preview_to_collection 完成:', switchResponse);
 

@@ -13,6 +13,33 @@ from unittest.mock import patch
 import ble_server
 
 
+class ControlWriteModeTests(unittest.IsolatedAsyncioTestCase):
+    """STOP/START 必须用 without-response，否则设备忙时会卡住切流。"""
+
+    class _FakeClient:
+        def __init__(self):
+            self.is_connected = True
+            self.modes = []
+
+        async def write_gatt_char(self, _uuid, _payload, response=True):
+            self.modes.append(response)
+
+    async def test_expect_response_false_skips_att_ack(self):
+        dev = ble_server.DeviceState(1)
+        dev.hw_version = "V2"
+        dev.client = self._FakeClient()
+        await ble_server.send_control_command(
+            dev, bytes([ble_server.CMD_MAP['STOP']]), expect_response=False)
+        self.assertEqual(dev.client.modes, [False])
+
+    async def test_default_keeps_write_with_response(self):
+        dev = ble_server.DeviceState(1)
+        dev.hw_version = "V2"
+        dev.client = self._FakeClient()
+        await ble_server.send_control_command(dev, bytes([ble_server.CMD_MAP['CONFIG']]))
+        self.assertEqual(dev.client.modes, [True])
+
+
 class SwitchAllOrNothingTests(unittest.IsolatedAsyncioTestCase):
     """切流核心：只要缺任何一台期望设备，就回滚已启动的流并报失败。"""
 

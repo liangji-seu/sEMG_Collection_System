@@ -1506,21 +1506,21 @@ async def scan_devices(ws):
         })
 
 
-async def send_control_command(dev: DeviceState, payload: bytes, timeout: float = 3.0):
+async def send_control_command(dev: DeviceState, payload: bytes, timeout: float = 3.0,
+                               expect_response: bool = True):
     """V1/V2 统一的控制命令写入封装
 
-    V2 设备使用 Write with Response + 超时保护（与 main_windows 原始逻辑一致）。
-    V1 设备使用 Write without Response。
+    V2 设备默认使用 Write with Response（与 main_windows 原始逻辑一致）；
+    STOP/START 这类"发完就走"的命令用 expect_response=False，避免设备忙于
+    关闭 SD 文件时 ATT 响应迟迟不回，把事件循环卡住（实测 STOP 卡 30s，
+    前端 12s 超时 → 切流失败但后台仍在切，状态错位）。
 
-    注意：response=True 会阻塞事件循环最多 timeout 秒。V2 设备仅在连接后的
-    初始配置（connect_device）和启停流（_do_start_stream）时调用，总共 2-4 次。
-    这个阻塞量级在 04-55 工作日志中验证正常，不会导致 BLE 参数协商失败。
-    真正导致 70% 丢包的是后来叠加上去的 retry+fallback 逻辑（每次 13s+）。
+    V1 设备始终使用 Write without Response。
     """
     if dev.client is None or not dev.is_connected():
         raise RuntimeError(f"Dev{dev.device_id} not connected")
 
-    if dev.hw_version != "V2":
+    if dev.hw_version != "V2" or not expect_response:
         await dev.client.write_gatt_char(CONTROL_CHAR_UUID, payload, response=False)
         return
 
@@ -1874,7 +1874,8 @@ async def start_stream(ws, device_id: int):
         if dev.hw_version == "V2":
             await asyncio.sleep(0.25)  # V2 START_NOTIFY_SETTLE_DELAY_S
 
-        await send_control_command(dev, bytes([CMD_MAP['START']]))
+        # START 用 without-response：设备刚开流时写响应可能迟迟不回，别卡事件循环
+        await send_control_command(dev, bytes([CMD_MAP['START']]), expect_response=False)
         log(f"[Dev{device_id}] 已发送 START 命令")
 
         dev.is_streaming = True
@@ -1918,7 +1919,7 @@ async def stop_stream(ws, device_id: int, silent=False):
     
     try:
         if dev.client and dev.is_connected():
-            await send_control_command(dev, bytes([CMD_MAP['STOP']]))
+            await send_control_command(dev, bytes([CMD_MAP['STOP']]), expect_response=False)
             log(f"[Dev{device_id}] 已发送 STOP")
             
             await dev.client.stop_notify(EMG_DATA_CHAR_UUID)
@@ -2108,8 +2109,8 @@ async def _do_start_stream_for_device(dev, filename_str):
         if dev.hw_version == "V2":
             await asyncio.sleep(0.25)
 
-        # 5. 发送 START 命令
-        await send_control_command(dev, bytes([CMD_MAP['START']]))
+        # 5. 发送 START 命令（without-response，避免设备忙时卡住事件循环）
+        await send_control_command(dev, bytes([CMD_MAP['START']]), expect_response=False)
         log(f"[Dev{dev.device_id}] START 命令已发送")
 
         dev.sd_filename = filename_str
@@ -2135,7 +2136,7 @@ async def _do_stop_stream_for_device(dev):
         if dev.is_streaming:
             if dev.client and dev.is_connected():
                 try:
-                    await send_control_command(dev, bytes([CMD_MAP['STOP']]))
+                    await send_control_command(dev, bytes([CMD_MAP['STOP']]), expect_response=False)
                     stop_result['stop_command_sent'] = True
                     log(f"[Dev{dev.device_id}] STOP 命令已发送")
                 except Exception as e:

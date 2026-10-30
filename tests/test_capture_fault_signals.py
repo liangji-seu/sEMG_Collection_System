@@ -148,7 +148,8 @@ class BleStopResultTests(unittest.IsolatedAsyncioTestCase):
                 patch("ble_server.log"):
             await ble_server.stop_collection_stream(object())
 
-        send.assert_awaited_once_with(dev, bytes([ble_server.CMD_MAP["STOP"]]))
+        send.assert_awaited_once_with(dev, bytes([ble_server.CMD_MAP["STOP"]]),
+                                      expect_response=False)
         sent_action, response = send_response.await_args.args[1:]
         self.assertEqual(sent_action, "stop_collection_stream")
         self.assertTrue(response["success"])
