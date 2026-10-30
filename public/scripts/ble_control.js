@@ -39,6 +39,10 @@
             1: false,
             2: false,
         },
+        // 【新增】本次任务期望参与的手（连接即记账；只有显式断开才移除）。
+        // 采集中某只手意外掉线时它仍留在期望集合里，切流会因此失败并提示重连，
+        // 避免静默写出"单手/缺侧"的 H5。
+        expectedDevices: null,
         connectingDevices: {
             1: { active: false, startedAt: 0, timer: null, mac: null },
             2: { active: false, startedAt: 0, timer: null, mac: null },
@@ -53,6 +57,25 @@
         onScanResult: null,
         onError: null,
     };
+
+    // ================= 期望设备记账 =================
+    // 连接成功即把该手记入期望集合；只有操作员显式断开才移除。
+    // 采集中意外掉线不会移除，因此下一次切流会失败并提示重连。
+    function rememberExpectedDevice(deviceId) {
+        const id = Number(deviceId);
+        if (id !== 1 && id !== 2) return;
+        if (!Array.isArray(BleState.expectedDevices)) BleState.expectedDevices = [];
+        if (!BleState.expectedDevices.includes(id)) {
+            BleState.expectedDevices.push(id);
+            BleState.expectedDevices.sort((a, b) => a - b);
+        }
+    }
+
+    function forgetExpectedDevice(deviceId) {
+        const id = Number(deviceId);
+        if (!Array.isArray(BleState.expectedDevices)) return;
+        BleState.expectedDevices = BleState.expectedDevices.filter(item => item !== id);
+    }
 
     let requestSequence = 0;
     const commandQueue = [];
@@ -357,6 +380,7 @@ async function decodeData(buffer) {
                     num_imus: Number.isFinite(msg.num_imus) ? msg.num_imus : null,
                     hw_version: msg.hw_version || null,
                 };
+                rememberExpectedDevice(deviceId);
                 updateDeviceStatusWidget(deviceId, BleState.devices[deviceId]);
                 checkImuCount(deviceId, BleState.devices[deviceId]);
                 if (BleState.onDeviceChange) {
@@ -487,6 +511,9 @@ async function decodeData(buffer) {
             firmware_version: data.firmware_version || null,
             hardware_version: data.hardware_version || null,
         };
+
+        // 轮询到设备在线也记入期望集合；掉线时故意不移除（等操作员决定）。
+        if (data.connected) rememberExpectedDevice(deviceId);
 
         // 更新设备状态悬浮窗口
         updateDeviceStatusWidget(deviceId, BleState.devices[deviceId]);
@@ -840,8 +867,9 @@ async function decodeData(buffer) {
             return ok;
         },
         
-        // 断开设备
+        // 断开设备（显式断开 = 明确不再需要这只手，从期望集合移除）
         disconnectDevice: (deviceId) => {
+            forgetExpectedDevice(deviceId);
             updateConnectButton(deviceId, false);
             return send({ action: `disconnect${deviceId}` });
         },
@@ -875,7 +903,11 @@ async function decodeData(buffer) {
         // 停止 preview stream
         stopPreviewStream: () => send({ action: 'stop_preview_stream' }),
         // 核心：preview → collection 切流（开始采集前使用）
-        switchPreviewToCollection: () => send({ action: 'switch_preview_to_collection' }),
+        // options.expected_devices: 本次任务应参与的手（缺任何一台后端会回滚并返回失败）
+        switchPreviewToCollection: (options = {}) =>
+            send({ action: 'switch_preview_to_collection', ...(options || {}) }),
+        // 【新增】当前任务期望参与的手（连接即记账，显式断开才移除）
+        getExpectedDeviceIds: () => (Array.isArray(BleState.expectedDevices) ? BleState.expectedDevices.slice() : []),
         // 核心：collection → preview 切流（采集完成后使用）
         switchCollectionToPreview: () => send({ action: 'switch_collection_to_preview' }),
         // 停止 collection stream

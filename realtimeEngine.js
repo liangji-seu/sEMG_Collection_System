@@ -142,6 +142,7 @@ class RealtimeEngine extends EventEmitter {
         this.streamMode = 'idle';  // 'idle' | 'preview' | 'collection'
         this.collectionStreamId = null;  // collection stream 的唯一标识（ISO timestamp）
         this.collectionBinFilenames = { dev1: null, dev2: null };  // collection stream 产生的 bin
+        this.collectionExpectedDeviceIds = null;  // 本任务期望参与的手（写入 H5 physical_device_ids）
         this.collectionDataStartTs = 0;
         this.collectionDroppedStaleBlePackets = 0;
         this.streamSwitchDelayMs = 3000;  // STOP→START 延迟（与 ble_server.py 保持一致）
@@ -344,6 +345,16 @@ class RealtimeEngine extends EventEmitter {
         const { taskId, stageName, userId, config, sessionIndex, sessionNumber, sessionCount, isTestMode, recordingSessionId, isMultiSession } = data;
         const effectiveTaskId = taskId || config?.task_id || this.currentTaskId || 'discrete_gesture';
 
+        // 【新增】本次任务期望参与的手：来自切流响应的 expected_devices。
+        // 缺侧时 H5 仍能关闭，但 physical_device_ids 会记录"应到未到"的设备，
+        // 离线同步据此把文件判为 partial，而不是 synced。
+        this.collectionExpectedDeviceIds = Array.isArray(data.collectionDeviceIds)
+            ? [...new Set(data.collectionDeviceIds.map(Number).filter(id => id === 1 || id === 2))].sort((a, b) => a - b)
+            : null;
+        if (this.collectionExpectedDeviceIds) {
+            console.log('[realtimeEngine] 期望参与设备:', this.collectionExpectedDeviceIds);
+        }
+
         this.currentTaskId = effectiveTaskId;
         this.currentUser = { id: userId, ...config?.subject };
         this.collectionConfig = config ? { ...config, task_id: effectiveTaskId } : { task_id: effectiveTaskId };
@@ -532,6 +543,7 @@ class RealtimeEngine extends EventEmitter {
         this.pendingAbortFreeze = null;
         this.collectionStreamId = null;
         this.collectionBinFilenames = { dev1: null, dev2: null };
+        this.collectionExpectedDeviceIds = null;
         this.collectionBins = null;
         this.collectionDataStartTs = 0;
         this.stageFileCreateFailed = false;
@@ -1415,6 +1427,8 @@ class RealtimeEngine extends EventEmitter {
                 // 【新增】传递BLE设备名称，用于追溯数据来源
                 ble_dev1: this.device_names.dev1,  // 例如 "WristBand_3A76"
                 ble_dev2: this.device_names.dev2,  // 例如 "WristBand_5B12"
+                // 【新增】本任务期望参与的手：同步工具据此要求双侧，缺侧判 partial
+                physical_device_ids: this.collectionExpectedDeviceIds,
                 // 【新增】stream mode 元数据（preview/collection 切流方案）
                 stream_mode: this.streamMode,  // "collection" | "preview" | "idle"
                 collection_stream_id: this.collectionStreamId,
@@ -1811,14 +1825,15 @@ class RealtimeEngine extends EventEmitter {
         this._startCollectionHealthTimer();
     }
 
-    notifyCollectionHealthWarning(message) {
+    notifyCollectionHealthWarning(message, blocking = false) {
         this.broadcastToClients({
-            type: 'h5_storage_warning', level: 'warning', nonBlocking: true, message,
+            type: 'h5_storage_warning', level: blocking ? 'error' : 'warning',
+            nonBlocking: !blocking, blocking: !!blocking, message,
             stageName: this.currentStageName, sessionNumber: this.currentSessionNumber, timestamp: Date.now()
         });
     }
 
-    _reportCaptureWarnings(response) {
+    _reportCaptureWarnings(response, blocking = true) {
         const warnings = Array.isArray(response.capture_warnings) ? response.capture_warnings : [];
         if (!warnings.length) return;
         const health = response.data_health || {};
@@ -1836,7 +1851,9 @@ class RealtimeEngine extends EventEmitter {
         const fileContext = `${basename ? `文件 ${basename}` : '本轮文件'}，第${sessionNumber}轮`;
         const message = `${reason.join('；') || '数据完整性提示'}。${fileContext}已关闭：${leftName} ${rows.dev1 ?? 0}行，${rightName} ${rows.dev2 ?? 0}行；${validation}。`;
         console.log(`[采集健康] ${JSON.stringify({ event: 'python_close_warning', filename: actualPath, file_token: health.file_token || this.storageFileToken, session_id: health.session_id || this.collectionStreamId, capture_warnings: warnings, data_health: health })}`);
-        this.notifyCollectionHealthWarning(message);
+        // 缺侧/空侧属于整轮作废级的问题：必须阻塞提示，让操作员当场决定重采，
+        // 而不是一条几秒后消失的 toast。故障收尾(incomplete)时已有故障弹窗，避免叠加。
+        this.notifyCollectionHealthWarning(message, blocking);
     }
 
     async closeStageFile(extraParams = {}, incomplete = false) {
@@ -1891,7 +1908,7 @@ class RealtimeEngine extends EventEmitter {
                 this.stageFileOpen = false;
                 const status = params.collection_status || 'completed';
                 console.log(`[realtimeEngine] ✅ 文件已关闭 (collection_status: ${status})`);
-                this._reportCaptureWarnings(response);
+                this._reportCaptureWarnings(response, !incomplete);
             } else {
                 console.error('[realtimeEngine] ❌ Storage拒绝关闭文件:', response);
             }

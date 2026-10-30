@@ -36,7 +36,7 @@ import io
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Set
-from queue import PriorityQueue
+from queue import PriorityQueue, Empty
 from datetime import datetime
 import threading
 import itertools
@@ -1178,13 +1178,42 @@ def _report_transport_drop_locked(error):
         _schedule_queue_locked()
 
 
+def _drop_oldest_low_priority_locked() -> bool:
+    """移除队列中序号最小的低优先级（采集数据）消息。
+
+    队列溢出时优先丢"最旧的数据"而不是最新到达的数据：采集数据的时间连续性
+    依赖最新样本，丢新数据会直接把当前时刻挖空。仅在持有 queue_lock 时调用。
+    """
+    retained = []
+    dropped = False
+    try:
+        while True:
+            try:
+                item = state.msg_queue.get_nowait()
+            except Empty:
+                break
+            if not dropped and item[0] == PRIORITY_LOW:
+                dropped = True
+                continue
+            retained.append(item)
+    finally:
+        for item in retained:
+            state.msg_queue.put(item)
+    return dropped
+
+
 def add_to_queue(priority: int, msg_type: str, data: dict, target_ws=None):
     """Bound both the message queue and cross-thread loop wakeups."""
     with state.queue_lock:
         size = state.msg_queue.qsize()
         if priority == PRIORITY_LOW and size >= state.queue_low_limit:
-            _report_transport_drop_locked('BLE发送队列数据溢出')
-            return False
+            # 丢最旧的一条低优先级数据，给刚产生的样本让位；不再整批丢弃新数据。
+            if _drop_oldest_low_priority_locked():
+                _report_transport_drop_locked('BLE发送队列数据溢出(丢弃最旧数据)')
+            else:
+                _report_transport_drop_locked('BLE发送队列数据溢出(无低优先级消息可丢)')
+                return False
+            size = state.msg_queue.qsize()
         if size >= state.queue_limit:
             log(f'发送队列已满，拒绝 {msg_type} 消息')
             if target_ws is not None and state.main_loop:
@@ -2116,7 +2145,48 @@ async def stop_collection_stream(ws, device_id=None, silent=False):
     })
 
 
-async def switch_preview_to_collection(ws):
+def _normalize_expected_devices(values) -> list:
+    """把前端传入的期望设备列表规范成 [1, 2] 的子集（顺序稳定）。"""
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes, int)):
+        values = [values]
+    normalized = []
+    for value in values:
+        try:
+            device_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if device_id in (1, 2) and device_id not in normalized:
+            normalized.append(device_id)
+    return sorted(normalized)
+
+
+def _switch_device_status() -> dict:
+    """切流失败时回给前端的逐设备状态快照（便于操作员判断是哪一台）。"""
+    status = {}
+    for did in (1, 2):
+        dev = state.get_device(did)
+        status[f'dev{did}'] = {
+            'connected': bool(dev.is_connected()),
+            'streaming': bool(dev.is_streaming),
+            'stream_mode': getattr(dev, 'stream_mode', 'idle'),
+            'name': getattr(dev, 'name', None),
+        }
+    return status
+
+
+def _missing_devices_message(missing_ids) -> str:
+    parts = []
+    for did in missing_ids:
+        dev = state.get_device(did)
+        side = '左手' if did == 1 else '右手'
+        identity = getattr(dev, 'name', None)
+        parts.append(f"{side} dev{did}" + (f"（{identity}）" if identity else ""))
+    return '切流失败：以下设备未就绪，请检查连接/电量后重试 -> ' + '、'.join(parts)
+
+
+async def switch_preview_to_collection(ws, expected_devices=None):
     """核心：将 preview stream 切换为 collection stream。
 
     时序:
@@ -2135,11 +2205,22 @@ async def switch_preview_to_collection(ws):
     log(f"[switch] === preview → collection 切换开始 ===")
     log("=" * 50)
 
+    # 期望设备：由前端按"本次任务应参与的手"传入；未传时退回当前已连接设备。
+    expected = _normalize_expected_devices(expected_devices)
     connected_ids = state.get_connected_devices()
+    if not expected:
+        expected = list(connected_ids)
+    log(f"[switch] 期望设备: {expected}，当前已连接: {connected_ids}")
     if not connected_ids:
         await send_to_control(ws, action, {
             'success': False,
             'error': '没有已连接的设备',
+            'missing_devices': expected,
+            'expected_devices': expected,
+            'started': [],
+            'collection_bins': {},
+            'device_status': _switch_device_status(),
+            'stream_mode': 'idle',
         })
         return
 
@@ -2190,10 +2271,28 @@ async def switch_preview_to_collection(ws):
                 device_names[f'dev{did}'] = dev.name
             log(f"[switch] Dev{did} collection stream 已启动: {filename_str}")
 
-    if not started_ids:
+    missing_ids = [did for did in expected if did not in started_ids]
+    if missing_ids:
+        # 全有或全无：只要缺任何一台期望设备就回滚，绝不让"单手/缺侧"的 H5 静默产生。
+        log(f"[switch] 期望设备 {expected} 中缺少 {missing_ids}，回滚已启动: {started_ids}")
+        for did in list(started_ids):
+            dev = state.get_device(did)
+            try:
+                await _do_stop_stream_for_device(dev)
+                log(f"[switch] 已回滚 Dev{did} collection stream")
+            except Exception as rollback_error:
+                log(f"[switch] 回滚 Dev{did} 失败: {rollback_error}")
+            finally:
+                dev.stream_mode = "idle"
         await send_to_control(ws, action, {
             'success': False,
-            'error': '所有设备启动 collection stream 失败',
+            'error': _missing_devices_message(missing_ids),
+            'missing_devices': missing_ids,
+            'expected_devices': expected,
+            'started': [],
+            'collection_bins': {},
+            'device_status': _switch_device_status(),
+            'stream_mode': 'idle',
         })
         return
 
@@ -2209,6 +2308,9 @@ async def switch_preview_to_collection(ws):
     await send_to_control(ws, action, {
         'success': True,
         'started': started_ids,
+        'expected_devices': expected,
+        'missing_devices': [],
+        'device_status': _switch_device_status(),
         'collection_bins': collection_bins,
         'device_names': device_names,
         'device_configs': collect_device_configs(),
@@ -2505,7 +2607,8 @@ async def handle_control_client(websocket):
 
                 elif action == 'switch_preview_to_collection':
                     # 核心：preview → collection 切流
-                    await switch_preview_to_collection(websocket)
+                    await switch_preview_to_collection(
+                        websocket, expected_devices=data.get('expected_devices'))
 
                 elif action == 'switch_collection_to_preview':
                     # 核心：collection → preview 切流

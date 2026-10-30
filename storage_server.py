@@ -159,6 +159,23 @@ def debug_log(message):
     print(f"[storage_server] {message}", file=sys.stderr, flush=True)
 
 
+def normalize_physical_device_ids(values):
+    """把期望参与设备规范成 [1, 2] 的有序子集；非法输入返回空列表。"""
+    if values is None:
+        return []
+    if isinstance(values, (int, str, bytes)):
+        values = [values]
+    normalized = []
+    for value in values:
+        try:
+            device_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if device_id in (1, 2) and device_id not in normalized:
+            normalized.append(device_id)
+    return sorted(normalized)
+
+
 class HDF5StorageServer:
     def __init__(self, host="127.0.0.1", port=5555, storage_dir="./storage"):
         # ZeroMQ配置
@@ -536,6 +553,10 @@ class HDF5StorageServer:
             # 【新增】提取BLE设备名称（用于追溯数据来源）
             ble_dev1 = params.get("ble_dev1")  # 例如 "WristBand_3A76"
             ble_dev2 = params.get("ble_dev2")  # 例如 "WristBand_5B12"
+
+            # 【新增】本任务期望参与的手（切流响应传入）。用于离线同步判定缺侧，
+            # 不能由"实际有数据的一侧"反推，否则单手文件会被当成完整文件。
+            physical_device_ids = normalize_physical_device_ids(params.get("physical_device_ids"))
             
             # 保存当前信息
             self.current_task_id = task_id
@@ -627,6 +648,13 @@ class HDF5StorageServer:
             if sd_bin_dev2:
                 self.f.attrs["sd_bin_dev2"] = sd_bin_dev2
                 debug_log(f"   SD卡源文件(设备2/右手): {sd_bin_dev2}_emg.bin, {sd_bin_dev2}_imu.bin")
+
+            # 【新增】期望参与设备（切流阶段确定）。同步工具要求这些设备都有 2kHz 输出，
+            # 缺任何一侧都会把文件判为 partial，而不是 synced。
+            if physical_device_ids:
+                self.f.attrs["physical_device_ids"] = json.dumps(physical_device_ids)
+                self.f.attrs["physical_device_ids_source"] = "collection_switch_expected"
+                debug_log(f"   期望参与设备(physical_device_ids): {physical_device_ids}")
 
             # 【新增】stream 模式元数据（preview/collection 切流方案）
             stream_mode = params.get("stream_mode", "unknown")

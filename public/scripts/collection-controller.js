@@ -1183,11 +1183,28 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                     console.log('[Collection] ★ set_session_id 完成');
 
                     // Step 2: preview → collection 切流
+                    // 期望设备 = 本次任务已连接过的手（显式断开才会移除）。
+                    // 后端会按"全有或全无"校验：缺任何一台就回滚并返回失败，
+                    // 避免静默写出单手/缺侧的 H5。
                     console.log('[Collection] ★ Step 2: preview → collection 切换...');
-                    switchResponse = await window.BleControl.sendAndWait('switch_preview_to_collection');
+                    const expectedDevices = (window.BleControl &&
+                        typeof window.BleControl.getExpectedDeviceIds === 'function')
+                        ? window.BleControl.getExpectedDeviceIds() : [];
+                    console.log('[Collection] ★ 期望设备:', expectedDevices);
+                    switchResponse = await window.BleControl.sendAndWait(
+                        'switch_preview_to_collection', { expected_devices: expectedDevices });
                     if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     console.log('[Collection] ★ switch_preview_to_collection 完成:', switchResponse);
 
+                    if (switchResponse && switchResponse.success === false) {
+                        throw new Error(switchResponse.error || '切换采集流失败');
+                    }
+                    const missingDevices = Array.isArray(switchResponse && switchResponse.missing_devices)
+                        ? switchResponse.missing_devices : [];
+                    if (missingDevices.length) {
+                        throw new Error('缺少设备 ' + missingDevices.map(id => `设备${id}`).join('、') +
+                            '，请连接后重试');
+                    }
                     if (switchResponse.collection_bins) {
                         console.log('[Collection] Collection bins:', switchResponse.collection_bins);
                     }
@@ -1195,6 +1212,14 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                     if (!this._isCurrentCollectionSession(sessionGeneration)) return;
                     console.error('[Collection] ★ 切换采集流失败:', err);
                     this.showToast('切换采集流失败: ' + err.message, 'error');
+                    // 后端失败时会回滚已启动的流，这里把 preview 拉回来，避免界面停在无流状态
+                    try {
+                        if (window.BleControl && typeof window.BleControl.startPreviewStream === 'function') {
+                            window.BleControl.startPreviewStream();
+                        }
+                    } catch (previewError) {
+                        console.warn('[Collection] 切流失败后恢复 preview 失败:', previewError);
+                    }
                     this._setAllButtonsDisabled(false);
                     this._switchInProgress = false;
                     this.updateControlButtons(false);
@@ -1286,6 +1311,9 @@ console.log('[Collection] ====== 脚本开始加载 (v3-fixed-v3) ======');
                 // 【修复 Issue 3】直接传递 switch 响应中的 collection_bins，不依赖 600ms 竞态
                 collectionBins: switchResponse?.collection_bins || null,
                 collectionDeviceNames: switchResponse?.device_names || null,
+                // 【新增】本次任务期望参与的手（用于 H5 落盘 physical_device_ids，同步时强制双侧）
+                collectionDeviceIds: Array.isArray(switchResponse?.expected_devices)
+                    ? switchResponse.expected_devices : null,
                 streamMode: 'collection',
                 collectionStreamId: switchResponse?.collection_stream_id || null,
             };

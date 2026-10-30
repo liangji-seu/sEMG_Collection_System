@@ -59,15 +59,18 @@ class DeviceServiceTests(unittest.TestCase):
         ble_server.state.control_clients = self.old_clients
         ble_server.state.data_clients = self.old_data_clients
 
-    def test_ble_low_overflow_does_not_pop_control(self):
+    def test_ble_low_overflow_drops_oldest_data_but_never_control(self):
         control = FakeClient()
         ble_server.state.msg_queue.put((ble_server.PRIORITY_CONTROL, 0, 'control', {'x': 1}, control))
         for i in range(ble_server.state.queue_low_limit - 1):
             ble_server.state.msg_queue.put((ble_server.PRIORITY_LOW, i + 1, 'data', {'i': i}, None))
         ble_server.state.main_loop = None
-        self.assertFalse(ble_server.add_to_queue(ble_server.PRIORITY_LOW, 'data', {'i': 'overflow'}))
+        # 队列满时丢"最旧的数据"，新到样本仍入队；控制消息永远不动。
+        self.assertTrue(ble_server.add_to_queue(ble_server.PRIORITY_LOW, 'data', {'i': 'overflow'}))
         self.assertEqual(ble_server.state.msg_queue.get_nowait()[2], 'control')
-        self.assertEqual(ble_server.state.msg_queue.qsize(), ble_server.state.queue_low_limit)
+        remaining = [item[3].get('i') for item in ble_server.state.msg_queue.queue if item[2] == 'data']
+        self.assertNotIn(0, remaining)
+        self.assertIn('overflow', remaining)
         faults = [item[3] for item in ble_server.state.msg_queue.queue if item[2] == 'broadcast']
         self.assertEqual(len(faults), 1)
         self.assertEqual(faults[0]['type'], 'transport_fault')

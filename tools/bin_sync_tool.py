@@ -1464,14 +1464,29 @@ def _format_validation_report(validation_report):
 
 
 def derive_required_sync_devices(h5_file):
-    """Physical configuration and actual source data outrank cached sync state."""
+    """Physical configuration and actual source data outrank cached sync state.
+
+    `physical_device_ids` 由采集端在切流时写入（本任务期望参与的手）。它优先于
+    "哪一侧有数据"的推断：否则某只手整段 0 行时不会被当成必需设备，文件会被
+    误判为 synced。历史文件没有该属性时仍退回到非空数据集推断。
+    """
     required = set()
     raw = h5_file.attrs.get('physical_device_ids')
     if raw is not None:
         try:
-            if isinstance(raw, bytes): raw = raw.decode('utf-8')
-            required.update(int(v) for v in (json.loads(raw) if isinstance(raw, str) else raw))
-        except (TypeError, ValueError):
+            if isinstance(raw, bytes):
+                raw = raw.decode('utf-8', errors='replace')
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(parsed, (int, str)):
+                parsed = [parsed]
+            for value in parsed or []:
+                try:
+                    device_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if device_id in (1, 2):
+                    required.add(device_id)
+        except (TypeError, ValueError, json.JSONDecodeError):
             pass
     for device_id in (1, 2):
         name = f'emg{device_id}_250hz_adc'

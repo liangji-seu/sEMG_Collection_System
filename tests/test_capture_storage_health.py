@@ -60,6 +60,25 @@ class CaptureStorageHealthTests(unittest.TestCase):
                 self.assertEqual(stored["save_validation"], "pending")
             self.server.finalized_files.clear()
 
+    def test_expected_devices_are_persisted_for_offline_sync_requirement(self):
+        # 切流时声明期望双手；右手整段没数据，H5 仍可正常关闭，但必须留下
+        # "应到未到"的设备清单，供离线同步判 partial（而不是 synced）。
+        created = self.server.create_file({
+            "_storage_file_token": "expected-dev", "user_id": "health-test",
+            "physical_device_ids": [2, 1, 2],
+            "sd_bin_dev1": "S_L_test", "sd_bin_dev2": "S_R_test",
+            "ble_dev1": "Band-L", "ble_dev2": "Band-R",
+        })
+        self.assertEqual(created["status"], "success")
+        self._append_side(1)
+        result = self._close("expected-dev")
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["capture_warnings"], ["emg_dev2_empty"])
+        with h5py.File(result["file_path"], "r") as saved:
+            self.assertEqual(json.loads(saved.attrs["physical_device_ids"]), [1, 2])
+            self.assertEqual(saved.attrs["physical_device_ids_source"],
+                             "collection_switch_expected")
+
     def test_row_counter_mismatch_refuses_to_report_success(self):
         self._create("mismatch")
         self._append_side(1)

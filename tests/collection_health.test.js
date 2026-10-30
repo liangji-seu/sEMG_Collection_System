@@ -245,7 +245,7 @@ test('failure bursts retain one complete pre-stop health snapshot and every shor
     assert.equal(e.collectionState, 'fault_stopping');
 });
 
-test('Python close warnings stay nonblocking, localized, and do not prevent the next collection', async () => {
+test('Python close warnings are blocking, localized, and still allow the next collection', async () => {
     const e = loadEngine();
     const sent = [];
     e.clients.add({ readyState: 1, send: value => sent.push(JSON.parse(value)) });
@@ -265,8 +265,9 @@ test('Python close warnings stay nonblocking, localized, and do not prevent the 
     assert.equal(result.status, 'success');
     assert.equal(e.collectionState, 'idle');
     const warning = sent.find(packet => packet.type === 'h5_storage_warning');
-    assert.equal(warning.level, 'warning');
-    assert.equal(warning.nonBlocking, true);
+    assert.equal(warning.level, 'error');
+    assert.equal(warning.nonBlocking, false);
+    assert.equal(warning.blocking, true);
     assert.match(warning.message, /右手没有有效肌电行/);
     assert.match(warning.message, /左手 12行，右手 0行/);
     assert.match(warning.message, /actual_trial\.h5/);
@@ -293,6 +294,32 @@ test('successful create adopts Python file_path while retaining requested filena
     const opened = healthLogs.find(item => item.event === 'file_opened');
     assert.equal(opened.filename, 'C:\\captures\\python_actual_name.h5');
     assert.equal(opened.requested_filename, e.collectionHealth.requestedFilename);
+    e._releaseCollection();
+});
+
+test('expected device ids from collection_start reach the H5 create params', async () => {
+    const e = loadEngine();
+    e.storage_connected = true;
+    e.camera_connected = false;
+    e._markVideoRecordingStart = async () => { e.videoRecordingStarted = false; };
+    let createParams = null;
+    e.sendStorageCommand = async (cmd, params) => {
+        if (cmd === 'create') {
+            createParams = params;
+            return { status: 'success', file_path: 'C:\\captures\\two_hands.h5' };
+        }
+        return { status: 'success' };
+    };
+    await e.onCollectionStart({
+        taskId: 'discrete_gesture', stageName: 'stage-a', userId: 'subject-a',
+        config: { task_id: 'discrete_gesture' },
+        collectionBins: { dev1: 'L-bin', dev2: 'R-bin' },
+        collectionDeviceIds: [2, 1, 2]
+    });
+    // 引擎在 vm 沙箱里运行，数组原型与宿主不同，用 JSON 比较避免 deepStrictEqual 误报。
+    assert.equal(JSON.stringify(e.collectionExpectedDeviceIds), '[1,2]');
+    await e._openStageFile('stage-a', 0);
+    assert.equal(JSON.stringify(createParams.physical_device_ids), '[1,2]');
     e._releaseCollection();
 });
 

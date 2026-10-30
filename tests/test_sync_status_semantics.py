@@ -21,11 +21,12 @@ class SyncStatusSemanticsTests(unittest.TestCase):
         self.temp.cleanup()
 
     def _create(self, *, validation=True, imu_output=False, imu_status=None,
-                imu_count=None, legacy_alignment=False, with_imu_verified=False):
+                imu_count=None, legacy_alignment=False, with_imu_verified=False,
+                physical_device_ids=(1,)):
         emg_dtype = np.dtype([('channels', '<i2', (16,)), ('sd_frame_id', '<i8'), ('time', '<f8')])
         imu_dtype = np.dtype([('time', '<f8'), ('valid', '<?')])
         with h5py.File(self.path, 'w') as handle:
-            handle.attrs['physical_device_ids'] = json.dumps([1])
+            handle.attrs['physical_device_ids'] = json.dumps(list(physical_device_ids))
             handle.create_dataset('emg1_250hz_adc', data=np.zeros(1, dtype=emg_dtype))
             handle.create_dataset('emg1_2khz_adc', data=np.zeros(1, dtype=emg_dtype))
             handle.attrs['sync_device_status_dev1'] = 'synced'
@@ -109,6 +110,18 @@ class SyncStatusSemanticsTests(unittest.TestCase):
             self.assertEqual(handle.attrs['sync_device_imu_status_dev1'], 'skipped')
             self.assertEqual(summary['status'], 'partial')
             self.assertEqual(summary['imu_missing_devices'], [1])
+
+
+    def test_missing_expected_side_stays_partial_after_the_other_side_is_synced(self):
+        # 采集端在切流时声明期望双手（physical_device_ids=[1,2]），但只有左手有数据并同步成功。
+        # 右手整段 0 行时不能被"非空数据集推断"排除掉，否则单手文件会被标成 synced。
+        self._create(imu_output=True, imu_status='success', imu_count=1,
+                     with_imu_verified=True, physical_device_ids=(1, 2))
+        with h5py.File(self.path, 'r') as handle:
+            summary = sync.sync_status_summary(handle)
+        self.assertEqual(summary['required_devices'], [1, 2])
+        self.assertFalse(summary['emg_complete'])
+        self.assertEqual(summary['status'], 'partial')
 
 
 if __name__ == '__main__':
