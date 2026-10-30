@@ -889,6 +889,8 @@ def parse_packet(data: bytearray, dev: DeviceState) -> Optional[dict]:
 _last_callback_time = {}
 _callback_interval_warning_printed = {}
 _callback_interval_last_log = {}
+# 最近通知到达间隔（用于推断 Windows 实际协商的连接间隔）
+_notify_intervals = {}
 
 # 【修复】高精度时间基准 — 解决 Windows time.time() 15ms 精度导致 BLE 帧时间戳回退
 # time.time() 在 Windows 上分辨率约 15.6ms，而 BLE 通知每 4ms 到达一次，
@@ -1107,6 +1109,8 @@ def create_notification_handler(dev: DeviceState):
 
             if device_key in _last_callback_time:
                 interval = ts - _last_callback_time[device_key]
+                if 0 < interval < 1.0:
+                    _notify_intervals.setdefault(device_key, deque(maxlen=600)).append(interval)
                 if interval > 0.1:
                     last_log = _callback_interval_last_log.get(device_key, 0)
                     if ts - last_log >= 1.0:
@@ -1555,6 +1559,114 @@ async def send_control_command(dev: DeviceState, payload: bytes, timeout: float 
         raise
 
 
+async def request_high_throughput_connection(dev: DeviceState) -> bool:
+    """请求 Windows 使用高吞吐连接参数（12ms 间隔）。
+
+    Windows 对 BLE 连接默认用 balanced（24–48ms 间隔）。两个手环同时以
+    250Hz 推流时，被分配到较长间隔的那条链路每 ~1.3 秒就会因设备发送缓冲
+    写满而整批丢包（实测丢 12–14 个包）。这里通过 WinRT
+    `RequestPreferredConnectionParameters(ThroughputOptimized)` 显式请求 12ms，
+    对所有连接一视同仁，避免"先连接的那条被冷落"。
+
+    注意：必须**保留** BluetoothLEDevice 句柄（dev.winrt_handle），关闭句柄
+    可能让参数请求失效；断开连接时再统一关闭。
+    """
+    if not dev.mac:
+        return False
+    try:
+        from winrt.windows.devices.bluetooth import (
+            BluetoothLEDevice,
+            BluetoothLEPreferredConnectionParameters,
+        )
+    except ImportError:
+        log(f"[Dev{dev.device_id}] 当前环境不支持 WinRT 连接参数请求，跳过")
+        return False
+
+    try:
+        address = int(dev.mac.replace(':', ''), 16)
+        winrt_device = await BluetoothLEDevice.from_bluetooth_address_async(address)
+        if winrt_device is None:
+            log(f"[Dev{dev.device_id}] 连接参数请求失败: 无法获取设备句柄")
+            return False
+
+        previous = getattr(dev, 'winrt_handle', None)
+        if previous is not None and previous is not winrt_device:
+            try:
+                previous.close()
+            except Exception:
+                pass
+        dev.winrt_handle = winrt_device
+
+        request = winrt_device.request_preferred_connection_parameters(
+            BluetoothLEPreferredConnectionParameters.throughput_optimized)
+        try:
+            status = request.status
+        finally:
+            request.close()
+        ok = int(status) == 1  # SUCCESS
+        log(f"[Dev{dev.device_id}] 高吞吐连接参数请求: status={int(status)} "
+            f"{'成功' if ok else '未生效'}")
+        return ok
+    except Exception as error:
+        log(f"[Dev{dev.device_id}] 高吞吐连接参数请求异常: {error}")
+        return False
+
+
+def close_winrt_handle(dev: DeviceState):
+    handle = getattr(dev, 'winrt_handle', None)
+    dev.winrt_handle = None
+    if handle is not None:
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+
+def _notification_interval_stats(dev: DeviceState):
+    """返回最近通知间隔的 (p50_ms, >20ms 占比)，用于判断实际连接间隔。"""
+    samples = list(_notify_intervals.get(dev.device_id, ()))
+    if not samples:
+        return None, None
+    ordered = sorted(samples)
+    p50 = ordered[len(ordered) // 2] * 1000
+    slow_ratio = sum(1 for value in samples if value > 0.02) / len(samples)
+    return p50, slow_ratio
+
+
+async def connection_quality_watchdog(interval: float = 5.0, retry_cooldown: float = 30.0):
+    """监控连接质量：丢帧增长或通知间隔变长就重新请求高吞吐参数。
+
+    每台设备最多每 retry_cooldown 秒重试一次，避免刷屏/反复打扰控制器。
+    """
+    last_lost = {}
+    last_attempt = {}
+    while not state.stop_thread:
+        await asyncio.sleep(interval)
+        try:
+            for dev in (state.dev1, state.dev2):
+                if not (dev.is_connected() and dev.is_streaming):
+                    last_lost[dev.device_id] = dev.lost_frames
+                    continue
+                lost = dev.lost_frames
+                previous = last_lost.get(dev.device_id, lost)
+                if lost < previous:
+                    previous = lost
+                new_lost = lost - previous
+                last_lost[dev.device_id] = lost
+                p50_ms, slow_ratio = _notification_interval_stats(dev)
+                degraded = new_lost > 20 or (p50_ms is not None and p50_ms > 20 and slow_ratio > 0.5)
+                now = time.monotonic()
+                if degraded and now - last_attempt.get(dev.device_id, 0.0) >= retry_cooldown:
+                    last_attempt[dev.device_id] = now
+                    log(f"[Dev{dev.device_id}] 连接质量下降: 新增丢帧={new_lost} "
+                        f"通知间隔p50={p50_ms if p50_ms is None else round(p50_ms, 1)}ms "
+                        f"慢间隔占比={'-' if slow_ratio is None else round(slow_ratio, 2)} "
+                        f"→ 重新请求高吞吐参数")
+                    await request_high_throughput_connection(dev)
+        except Exception as error:
+            log(f"[连接看门狗] 异常: {error}")
+
+
 async def refresh_device_for_connect(mac: str, fallback_device=None):
     """连接前刷新目标 BLEDevice，避免 Windows 使用旧扫描对象卡住。"""
     target = mac.upper()
@@ -1711,6 +1823,10 @@ async def connect_device(ws, device_id: int, mac_or_name: str):
                         log(f"[Dev{device_id}] 配置命令发送失败: {e}")
                     # ===================== 配置命令结束 =====================
 
+                    # 请求高吞吐连接参数（12ms 间隔），避免双设备同时推流时
+                    # 某条链路被 Windows 默认的 balanced(24–48ms) 拖到丢包
+                    await request_high_throughput_connection(dev)
+
                     await send_to_control(ws, action, {
                         'success': True,
                         'device_id': device_id,
@@ -1783,6 +1899,7 @@ async def disconnect_device(ws, device_id: int, silent=False):
             except:
                 pass
             dev.client = None
+        close_winrt_handle(dev)
 
         dev.device = None
         dev.mac = None
@@ -2131,6 +2248,10 @@ async def _do_start_stream_for_device(dev, filename_str):
         await send_control_command(dev, bytes([CMD_MAP['START']]), expect_response=False)
         log(f"[Dev{dev.device_id}] START 命令已发送")
 
+        # 6. 每次启流都重申高吞吐连接参数：设备重启流/切换 mode 后，
+        # Windows 可能把连接退回默认 balanced(24–48ms)，导致周期性整批丢包。
+        await request_high_throughput_connection(dev)
+
         dev.sd_filename = filename_str
         return True
 
@@ -2170,6 +2291,14 @@ async def _do_stop_stream_for_device(dev):
         dev.is_streaming = False
         clear_stream_buffers(dev)
         stop_result['local_stopped'] = True
+
+    # 停流后链路空闲，是重新协商连接参数的最佳窗口（切流时正好有 3 秒等待）。
+    # 设备/Windows 在 START 之后往往会忽略参数请求，所以在 STOP 后补一次。
+    if dev.client and dev.is_connected():
+        try:
+            await request_high_throughput_connection(dev)
+        except Exception:
+            pass
     return stop_result
 
 
@@ -2915,6 +3044,11 @@ async def main():
     state.stop_thread = False
     state.data_thread = threading.Thread(target=data_sender_thread, daemon=True)
     state.data_thread.start()
+
+    # 连接质量看门狗：设备/Windows 可能在某次启流后把参数退回默认的
+    # balanced(24–48ms)，导致周期性整批丢包。发现丢帧持续增长就重新请求
+    # 一次高吞吐参数（自愈），避免现场需要手动重连。
+    asyncio.create_task(connection_quality_watchdog())
     
     log("=" * 60)
     log("BLE Server (Dual Device + Dual WebSocket) 已启动")

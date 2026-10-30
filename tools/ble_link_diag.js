@@ -2,7 +2,7 @@
 // 每 5 秒打印每个槽位的帧数/丢帧/丢包率/MTU/RSSI。
 //
 // 用法:
-//   node tools/ble_link_diag.js --slot1 <MAC1> --slot2 <MAC2> --seconds 60
+//   node tools/ble_link_diag.js --slot1 <MAC1> --slot2 <MAC2> --seconds 60 [--order 2,1]
 //   （只给一个槽位即单设备测试）
 const WebSocket = require('ws');
 
@@ -25,7 +25,7 @@ function makeClient(url) {
         let msg;
         try { msg = JSON.parse(raw.toString('utf8')); } catch (_) { return; }
         if (msg.type === 'response' && msg.request_id && pending.has(msg.request_id)
-            && typeof msg.success === 'boolean') {
+            && (typeof msg.success === 'boolean' || msg.action === 'status')) {
             const { resolve } = pending.get(msg.request_id);
             pending.delete(msg.request_id);
             resolve(msg);
@@ -48,7 +48,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await ctl.ready;
 
     const slots = [];
-    for (const [slot, mac] of [[1, args.slot1], [2, args.slot2]]) {
+    if (args.scan === '1' || args.scan === 'true') {
+        const scanReply = await ctl.call('scan', {}, 40000);
+        console.log('scan:', scanReply.success, 'devices=', (scanReply.devices || []).length);
+    }
+    const order = (args.order || '1,2').split(',').map(Number).filter(slot => slot === 1 || slot === 2);
+    for (const slot of order) {
+        const mac = slot === 1 ? args.slot1 : args.slot2;
         if (!mac) continue;
         const reply = await ctl.call(`connect${slot}`, { mac }, 40000);
         console.log(`connect${slot} ${mac}: success=${reply.success} name=${reply.name || '-'} mtu=${reply.mtu ?? '?'} rssi=${reply.rssi ?? '?'}`);
@@ -60,6 +66,13 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     await ctl.call('set_session_id', { session_id: `DIAG${Date.now() % 100000}` }, 8000);
     const preview = await ctl.call('start_preview_stream', {}, 30000);
     console.log('preview:', preview.success, JSON.stringify(preview.started));
+
+    const switching = args.switch === '1' || args.switch === 'true';
+    if (switching) {
+        await sleep(10000);
+        const sw = await ctl.call('switch_preview_to_collection', { expected_devices: slots }, 90000);
+        console.log('switch:', sw.success, JSON.stringify(sw.bins || {}), sw.error || '');
+    }
 
     const seconds = Number(args.seconds) || 60;
     const startedAt = Date.now();
@@ -76,7 +89,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
         console.log(`t=${Math.round((Date.now() - startedAt) / 1000)}s  ${line}`);
     }
 
-    await ctl.call('stop_preview_stream', {}, 15000).catch(() => {});
+    await ctl.call(switching ? 'stop_collection_stream' : 'stop_preview_stream', {}, 15000).catch(() => {});
     for (const slot of slots) {
         await ctl.call(`disconnect${slot}`, {}, 15000).catch(() => {});
     }
