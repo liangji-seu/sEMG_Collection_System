@@ -1,12 +1,14 @@
 import unittest
 import os
 import tempfile
+import time
 from unittest.mock import patch
 
 import h5py
 import zmq
 from threading import Lock
 
+import storage_server
 from storage_server import EMG_250HZ_ADC_DTYPE, HDF5StorageServer
 
 
@@ -226,6 +228,51 @@ class StorageIdentityTests(unittest.TestCase):
         self.assertEqual(self.server.handle_control("append", {"data": {}})["status"], "success")
         self.assertEqual(self.server.handle_control("append", {"_storage_file_token": "x", "data": {}})["status"], "error")
         self.assertEqual(self.server.handle_control("close", {})["status"], "success")
+
+
+class BarrierProgressTests(unittest.TestCase):
+    """现场 2026-11-03：关闭时 storage 落后 1172 个批次，旧逻辑固定等 5 秒就判失败。"""
+
+    def test_keeps_waiting_while_sequence_advances(self):
+        state = {"value": 0}
+
+        def pump(_timeout):
+            state["value"] += 1
+            time.sleep(0.05)
+            return True
+
+        started = time.monotonic()
+        ok = storage_server._wait_until_acknowledged(
+            12, lambda: state["value"], pump, no_progress_s=0.3, max_wait_s=10)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(state["value"], 12)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_fails_after_no_progress_window(self):
+        started = time.monotonic()
+        ok = storage_server._wait_until_acknowledged(
+            100, lambda: 5, lambda _timeout: True, no_progress_s=0.3, max_wait_s=10)
+        self.assertFalse(ok)
+        self.assertLess(time.monotonic() - started, 3)
+
+    def test_fails_when_pump_aborts(self):
+        ok = storage_server._wait_until_acknowledged(
+            100, lambda: 0, lambda _timeout: False, no_progress_s=5, max_wait_s=10)
+        self.assertFalse(ok)
+
+    def test_respects_overall_max_wait(self):
+        state = {"value": 0}
+
+        def pump(_timeout):
+            state["value"] += 1
+            time.sleep(0.02)
+            return True
+
+        started = time.monotonic()
+        ok = storage_server._wait_until_acknowledged(
+            100000, lambda: state["value"], pump, no_progress_s=10, max_wait_s=0.4)
+        self.assertFalse(ok)
+        self.assertLess(time.monotonic() - started, 3)
 
 
 if __name__ == "__main__":

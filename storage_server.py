@@ -159,6 +159,32 @@ def debug_log(message):
     print(f"[storage_server] {message}", file=sys.stderr, flush=True)
 
 
+def _wait_until_acknowledged(target_sequence, acknowledged, pump,
+                             no_progress_s=5.0, max_wait_s=180.0):
+    """等待数据序号推进到 target。
+
+    只要序号还在推进就继续等；连续 no_progress_s 秒没有进展，或总时长超过
+    max_wait_s，才判定失败。这样"存储只是排队慢一点"不会被误判成写失败，
+    而真正的卡死仍能在十几秒内报错。
+    """
+    started = time.monotonic()
+    last_progress_at = started
+    last_value = acknowledged()
+    while acknowledged() < target_sequence:
+        now = time.monotonic()
+        if now - started >= max_wait_s:
+            return False
+        if now - last_progress_at >= no_progress_s:
+            return False
+        if not pump(0.1):
+            return False
+        value = acknowledged()
+        if value > last_value:
+            last_value = value
+            last_progress_at = time.monotonic()
+    return True
+
+
 def normalize_physical_device_ids(values):
     """把期望参与设备规范成 [1, 2] 的有序子集；非法输入返回空列表。"""
     if values is None:
@@ -201,6 +227,9 @@ class HDF5StorageServer:
         self._pending_close_validation = None
         self.create_failed = False
         self.data_barrier_timeout_ms = 5000
+        # 只要仍在持续收到数据就继续等，避免"存储只是排队略慢"被误判成写失败；
+        # 真正卡死（迟迟没有新序号）时由 data_barrier_timeout_ms 兜底。
+        self.data_barrier_max_wait_ms = 180000
         
         # 存储根目录
         self.storage_dir = os.path.abspath(storage_dir)
@@ -1080,14 +1109,18 @@ class HDF5StorageServer:
                     self._append_imu_all("imu2_all", data["imu2_all"], data["imu2_t"], frame_id, hw_version)
 
                 # 【新增】存储 V1/V2 元数据到 HDF5 attrs
-                if data.get("imu1_hw_version"):
-                    self.f.attrs["imu1_hw_version"] = data["imu1_hw_version"]
-                if data.get("imu2_hw_version"):
-                    self.f.attrs["imu2_hw_version"] = data["imu2_hw_version"]
-                if data.get("imu1_num_imus") is not None:
-                    self.f.attrs["imu1_num_imus"] = data["imu1_num_imus"]
-                if data.get("imu2_num_imus") is not None:
-                    self.f.attrs["imu2_num_imus"] = data["imu2_num_imus"]
+                # 只在值变化时写：每批数据都写 attr 会持续触发 HDF5 元数据更新，
+                # 实测两路 250Hz 时会把写入吞吐拖到跟不上（见 2026-11-03 现场日志）。
+                for attr_key, attr_value in (
+                    ("imu1_hw_version", data.get("imu1_hw_version")),
+                    ("imu2_hw_version", data.get("imu2_hw_version")),
+                    ("imu1_num_imus", data.get("imu1_num_imus")),
+                    ("imu2_num_imus", data.get("imu2_num_imus")),
+                ):
+                    if attr_value is None:
+                        continue
+                    if self.f.attrs.get(attr_key) != attr_value:
+                        self.f.attrs[attr_key] = attr_value
 
                 # 【修改】批量追加MOCAP（左右手分开）
                 if data.get("mocap_frames"):
@@ -1178,29 +1211,38 @@ class HDF5StorageServer:
             return False
         if getattr(self, "data_write_error", None) and not allow_errors:
             return False
+
         def acknowledged():
             return getattr(self, "last_received_sequence", 0) if allow_errors else self.last_data_sequence
-        deadline = time.monotonic() + (self.data_barrier_timeout_ms / 1000.0)
-        while acknowledged() < target_sequence:
+
+        def pump(wait_s):
             try:
                 request = self.data_socket.recv_json(zmq.NOBLOCK)
             except zmq.Again:
-                remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-                if remaining_ms == 0:
-                    return False
                 poller = zmq.Poller()
                 poller.register(self.data_socket, zmq.POLLIN)
-                poller.poll(min(remaining_ms, 100))
-                continue
+                poller.poll(max(0, min(int(wait_s * 1000), 100)))
+                return True
             except Exception as error:
                 debug_log(f"数据栅栏读取失败: {error}")
                 return False
             self._process_data_request(request)
             if getattr(self, "data_write_error", None) and not allow_errors:
                 return False
-            if time.monotonic() > deadline and acknowledged() < target_sequence:
-                return False
-        return True
+            return True
+
+        ok = _wait_until_acknowledged(
+            target_sequence,
+            acknowledged,
+            pump,
+            no_progress_s=self.data_barrier_timeout_ms / 1000.0,
+            max_wait_s=getattr(self, "data_barrier_max_wait_ms", 180000) / 1000.0,
+        )
+        if not ok:
+            received = acknowledged()
+            debug_log(f"数据栅栏未完成: target={target_sequence} received={received} "
+                      f"backlog={max(0, target_sequence - received)}")
+        return ok
 
     def finalize_file(self, params, incomplete=False):
         token = params.get("_storage_file_token")
