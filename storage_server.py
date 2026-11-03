@@ -231,10 +231,10 @@ class HDF5StorageServer:
         self.finalized_files = {}
         self._pending_close_validation = None
         self.create_failed = False
-        self.data_barrier_timeout_ms = 5000
+        self.data_barrier_timeout_ms = 15000
         # 只要仍在持续收到数据就继续等，避免"存储只是排队略慢"被误判成写失败；
         # 真正卡死（迟迟没有新序号）时由 data_barrier_timeout_ms 兜底。
-        self.data_barrier_max_wait_ms = 180000
+        self.data_barrier_max_wait_ms = 240000
         
         # 存储根目录
         self.storage_dir = os.path.abspath(storage_dir)
