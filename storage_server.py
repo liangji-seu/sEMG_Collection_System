@@ -169,6 +169,7 @@ def _wait_until_acknowledged(target_sequence, acknowledged, pump,
     """
     started = time.monotonic()
     last_progress_at = started
+    last_log_at = started
     last_value = acknowledged()
     while acknowledged() < target_sequence:
         now = time.monotonic()
@@ -176,6 +177,10 @@ def _wait_until_acknowledged(target_sequence, acknowledged, pump,
             return False
         if now - last_progress_at >= no_progress_s:
             return False
+        if now - last_log_at >= 10.0:
+            last_log_at = now
+            debug_log(f"数据栅栏等待中: {acknowledged()}/{target_sequence} "
+                      f"(积压 {max(0, target_sequence - acknowledged())})")
         if not pump(0.1):
             return False
         value = acknowledged()
