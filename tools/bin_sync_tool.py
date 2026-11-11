@@ -4081,11 +4081,18 @@ def _peer_time_at(positions, times, target_positions):
 def sync_h5_from_peer_time_reference(h5_path, target_emg_bin_path,
                                      reference_device_id, reference_emg_bin_path,
                                      target_device_id, imu_bin_path=None,
-                                     full_bin=True, manual_num_imus=None):
+                                     full_bin=True, manual_num_imus=None,
+                                     allow_unreliable_target=False):
     """Import an empty-BLE device BIN using its validated opposite-hand clock.
 
     Target EMG/IMU bytes always come from the target parsers. The peer contributes
     only a time curve and the coarse start-time difference in the BIN headers.
+
+    ``allow_unreliable_target=True`` relaxes the "target BLE must be empty" guard:
+    when the target hand's BLE data is present but cannot be verified against its
+    own BIN (e.g. the radio link was corrupted for that hand), the caller can
+    still anchor it on the opposite hand's verified clock and fill 2 kHz directly
+    from the target BIN. The existing BLE rows are left untouched as evidence.
     """
     target_device_id = int(target_device_id)
     reference_device_id = int(reference_device_id)
@@ -4101,7 +4108,7 @@ def sync_h5_from_peer_time_reference(h5_path, target_emg_bin_path,
         ref_ble = f.get(ref_name)
         if target_ble is None:
             return {'status': 'validation_failed', 'reason': f'missing target BLE dataset {target_name}'}
-        if target_ble.shape[0] != 0:
+        if target_ble.shape[0] != 0 and not allow_unreliable_target:
             return {'status': 'validation_failed', 'reason': 'target BLE dataset is not empty'}
         if ref_ble is None or ref_ble.shape[0] == 0:
             return {'status': 'validation_failed', 'reason': 'both target and reference BLE are empty'}

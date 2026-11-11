@@ -190,6 +190,53 @@ def _sync_output_is_valid(h5_path, device_id, result, require_imu=False):
     return False, result.get('reason', '同步结果未通过') if isinstance(result, dict) else '同步结果无效'
 
 
+def _apply_peer_time_fallback(work_path, specs, device_results, log_emit, full_bin=True):
+    """让"与 bin 校验失败"的手借用对侧已铆定的时间轴，从自己的 bin 直接取 2kHz。
+
+    现场两路 BLE 里可能一直只有一只手正常：该手 H5 的 250Hz 数据不可信（无法通过
+    ADC 校验），但它自己的 SD bin 是完整的。只要另一只手校验通过，就用对侧已经
+    验证过的时间轴（bin 头时间差 + 对侧真实 BLE 曲线）套到本手 bin 上，直接填充
+    2kHz；本手原有的 BLE 250Hz 行保持不动，作为原始证据。
+    """
+    for index, (device_id, result, require_imu) in enumerate(device_results):
+        if not isinstance(result, dict) or result.get('status') == 'success':
+            continue
+        peer_device, peer_bin = _peer_reference_for_target(
+            device_id, device_results, specs, work_path)
+        if not peer_device:
+            continue
+        peer_entry = next((entry for entry in device_results if entry[0] == peer_device), None)
+        if peer_entry is None:
+            continue
+        peer_valid, _peer_reason = _sync_output_is_valid(
+            work_path, peer_device, peer_entry[1], peer_entry[2])
+        if not peer_valid:
+            continue
+
+        emg_bin = imu_bin = None
+        for spec in specs:
+            if spec[0] == device_id:
+                emg_bin = spec[1]
+                imu_bin = spec[2] if len(spec) > 2 else None
+                break
+        if not emg_bin:
+            continue
+
+        log_emit(f"    D{device_id}: 与自己 bin 的 ADC 校验未通过，改用 D{peer_device} "
+                 f"已铆定的时间轴，直接从 D{device_id} 的 bin 填充 2kHz")
+        # peer 的同步记录通常在本事务最后才写入；先落盘一次，借用校验才能通过。
+        with h5py.File(work_path, 'a') as h5_file:
+            update_sync_status(h5_file, peer_device, source_path=peer_bin,
+                               imu_result=peer_entry[1], validation_passed=True)
+        fallback = sync_h5_from_peer_time_reference(
+            work_path, emg_bin, peer_device, peer_bin, device_id,
+            imu_bin_path=imu_bin, full_bin=full_bin, allow_unreliable_target=True)
+        device_results[index] = (device_id, fallback, require_imu)
+        log_emit(f"    {device_id}: {fallback.get('status', 'error')} "
+                 f"{fallback.get('reason', '')}")
+    return device_results
+
+
 def _aggregate_sync_devices(h5_path, device_results):
     """Return aggregate success and per-device diagnostics for a staged H5."""
     details = []
@@ -843,6 +890,11 @@ class SyncWorker(QThread):
                         self.log.emit(
                             f"    {device_id}: {result.get('status', 'error')} "
                             f"{result.get('reason', '')}")
+                    # 某只手与自己的 bin 校验失败时，借用已校验通过的对侧手时间轴，
+                    # 直接从该手自己的 bin 填充 2kHz（BLE 250Hz 原样保留）。
+                    device_results = _apply_peer_time_fallback(
+                        work_path, specs, device_results, self.log.emit,
+                        full_bin=self.sync_mode != 'one_to_many')
                     aggregate_ok, details = _aggregate_sync_devices(
                         work_path, device_results)
                     if not aggregate_ok:
@@ -5753,6 +5805,10 @@ class OneToManySyncWorker(QThread):
                         except Exception as exc:
                             result = {'status': 'error', 'reason': str(exc)}
                         device_results.append((device_id, result, self.imu))
+                    # 与另一只手的 bin 校验失败时，借用对侧已铆定的时间轴，
+                    # 直接从本手自己的 bin 填充 2kHz（BLE 250Hz 原样保留）。
+                    device_results = _apply_peer_time_fallback(
+                        work_path, specs, device_results, self.log.emit, full_bin=False)
                     aggregate_ok, details = _aggregate_sync_devices(
                         work_path, device_results)
                     if not aggregate_ok:
