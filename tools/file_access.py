@@ -108,6 +108,12 @@ def _validate_h5(path):
         file.visititems(lambda _name, _obj: None)
 
 
+def transaction_active(path):
+    """Return True when ``path`` already belongs to an open h5_transaction."""
+    active = getattr(_active, 'files', None) or {}
+    return _key(path) in active
+
+
 @contextmanager
 def h5_transaction(path, validate=None):
     """Yield a same-directory working copy; commit once on normal exit.

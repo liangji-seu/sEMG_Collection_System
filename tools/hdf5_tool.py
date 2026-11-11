@@ -199,7 +199,7 @@ def _apply_peer_time_fallback(work_path, specs, device_results, log_emit, full_b
     2kHz；本手原有的 BLE 250Hz 行保持不动，作为原始证据。
     """
     for index, (device_id, result, require_imu) in enumerate(device_results):
-        if not isinstance(result, dict) or result.get('status') == 'success':
+        if not isinstance(result, dict) or result.get('status') != 'validation_failed':
             continue
         peer_device, peer_bin = _peer_reference_for_target(
             device_id, device_results, specs, work_path)

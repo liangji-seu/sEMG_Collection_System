@@ -55,3 +55,29 @@ emg1_250hz rows 保持 39402
 D1: 与自己 bin 的 ADC 校验未通过，改用 D2 已铆定的时间轴，直接从 D1 的 bin 填充 2kHz
 D1: success
 ```
+
+## 事务嵌套问题（2026-11-11 补充）
+
+GUI 是在一个外层 `h5_transaction` 里逐设备调用同步的。旧逻辑中，被装饰的
+`sync_h5_one_to_one` 一旦返回 `validation_failed`，`__offline_h5_entrypoint`
+会抛出回滚标记，`file_access` 便把整个文件记为失败——即使随后对侧时间锚回填
+成功，外层提交仍会以“嵌套离线事务失败，已取消整个文件的提交”回滚。
+
+修复：
+
+- `file_access.transaction_active(path)`：判断当前路径是否已在事务中；
+- `bin_sync_tool._offline_h5_entrypoint`：**嵌套调用**遇到 `validation_failed`
+  时只返回结果、不抛回滚标记，由外层聚合逻辑决定是否回填/提交；顶层调用行为不变；
+- 真正的异常仍然会标记失败并阻止提交。
+
+## 批量处理结果（A050-01，2026-11-11）
+
+7 个未同步文件（session1 + C1原文件 6 份）全部同步成功：
+
+| 文件 | 结果 |
+|---|---|
+| C1 session1（`A050-01_...110506.h5`） | D2 正常；D1 借用 D2 时间锚，2kHz 322338 行 |
+| C1原文件 session1–6 | D1/D2 均 `corr=1.000` 正常同步 |
+
+同步前原件已备份到 `现场问题派擦和\_sync_before_20261111\`。
+最终 30 个 H5 全部 `sync_status=synced`，无 pending。

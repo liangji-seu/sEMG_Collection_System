@@ -48,13 +48,14 @@ except ImportError:
     from alignment import counter_transition
 
 try:
-    from .file_access import h5_transaction, logical_h5_path
+    from .file_access import h5_transaction, logical_h5_path, transaction_active
 except ImportError:
     try:
-        from file_access import h5_transaction, logical_h5_path
+        from file_access import h5_transaction, logical_h5_path, transaction_active
     except ImportError:  # pragma: no cover - source-only fallback
         h5_transaction = None
         logical_h5_path = os.path.realpath
+        transaction_active = lambda _path: False
 
 # scipy 仅用于"新固件滤波型 BLE"的带限相关校验；缺失时该回退路径自动禁用，
 # 旧固件的精确匹配路径不受影响。
@@ -1077,18 +1078,29 @@ class _RollbackResult(Exception):
 
 
 def _offline_h5_entrypoint(function):
-    """Run a public H5 writer copy-on-write, preserving failure return values."""
+    """Run a public H5 writer copy-on-write, preserving failure return values.
+
+    When called inside an outer transaction (GUI batch sync), a ``validation_failed``
+    result must NOT mark the whole file as failed: the caller may recover the device
+    via another path (e.g. the opposite hand's time anchor) and still commit. Only
+    genuine exceptions keep the failure flag.
+    """
     @wraps(function)
     def wrapped(h5_path, *args, **kwargs):
         if h5_transaction is None:
             return function(h5_path, *args, **kwargs)
+        nested = bool(transaction_active(h5_path))
         try:
             with h5_transaction(h5_path) as staged:
                 result = function(staged, *args, **kwargs)
+                status = result.get('status') if isinstance(result, dict) else None
                 failed = result is False or (isinstance(result, dict) and (
-                    result.get('success') is False or result.get('status') in
+                    result.get('success') is False or status in
                     ('error', 'failed', 'sync_failed', 'validation_failed')))
-                if failed:
+                # 只有“设备校验未通过”是可恢复的：外层可能改用对侧时间锚回填。
+                # 其它嵌套失败（解析异常、写失败等）仍要让整个文件回滚。
+                recoverable = nested and status == 'validation_failed'
+                if failed and not recoverable:
                     raise _RollbackResult(result)
                 return result
         except _RollbackResult as rollback:
